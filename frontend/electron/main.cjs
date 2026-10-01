@@ -71,9 +71,29 @@ function startBackend() {
       : path.join(process.resourcesPath, "models", "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"),
   };
   for (const command of [backendCommand(), backendCommand(true)]) {
-    const child = spawn(command.executable, command.args, { cwd: command.cwd, env, windowsHide: true });
+    const child = spawn(command.executable, command.args, {
+      cwd: command.cwd,
+      env,
+      windowsHide: true,
+    });
+
     backendProcesses.push(child);
-    child.stderr.on("data", (data) => console.error(data.toString()));
+
+    child.stdout.on("data", (data) => {
+      console.log(`[backend stdout] ${data.toString()}`);
+    });
+
+    child.stderr.on("data", (data) => {
+      console.error(`[backend stderr] ${data.toString()}`);
+    });
+
+    child.on("exit", (code, signal) => {
+      console.error(`[backend exit] code=${code} signal=${signal}`);
+    });
+
+    child.on("error", (error) => {
+      console.error("[backend process error]", error);
+    });
   }
 }
 

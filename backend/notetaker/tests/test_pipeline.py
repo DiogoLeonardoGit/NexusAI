@@ -140,6 +140,7 @@ class PipelineTests(TestCase):
         process_job(job)
         task = Task.objects.get()
         self.assertEqual(task.due_at.hour, 17)
+        self.assertEqual(task.creation_source, Task.CreationSource.SYSTEM)
         self.assertTrue(Reminder.objects.filter(task=task).exists())
 
     @patch("notetaker.services.diarization.generate_json")

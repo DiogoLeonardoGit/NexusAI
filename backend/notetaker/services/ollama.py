@@ -10,10 +10,10 @@ class OllamaError(RuntimeError):
 
 
 EXTRACTION_SYSTEM_PROMPT = """You are a private offline meeting assistant. Return only JSON.
-Extract tasks, decisions and open questions from the transcript. Never invent facts.
+Extract at most 12 actionable tasks from the transcript. Never invent facts.
 For each task include title, owner (self, other, unknown), owner_name, date_phrase,
 confidence from 0 to 1, evidence copied from the supplied transcript, and
-due_is_ambiguous. Use the language of the transcript.
+due_is_ambiguous. Keep evidence under 160 characters. Use the language of the transcript.
 """
 
 ACTIVE_LISTENING_SYSTEM_PROMPT = """You are a private offline personal assistant. Return only JSON.
@@ -37,7 +37,7 @@ Keep citation segment identifiers exact and write in the language of the questio
 """
 
 
-def _request(path: str, payload: dict, timeout: int = 300) -> dict:
+def _request(path: str, payload: dict, timeout: int = 600) -> dict:
     request = Request(
         f"{settings.OLLAMA_URL.rstrip('/')}{path}",
         data=json.dumps(payload).encode("utf-8"),
@@ -110,6 +110,7 @@ def generate_json(
         "model": settings.OLLAMA_MODEL,
         "keep_alive": "30m",
         "stream": False,
+        "think": False,
         "format": schema or "json",
         "messages": [
             {"role": "system", "content": system_prompt},

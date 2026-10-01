@@ -32,6 +32,7 @@ from .transcription import detect_language, transcribe
 logger = logging.getLogger(__name__)
 
 OLLAMA_INPUT_CHARS = 8000
+ACTIVE_LISTENING_EXTRACTION_DELAY = timedelta(minutes=2)
 
 
 class JobCancelled(Exception):
@@ -97,25 +98,38 @@ TASK_SCHEMA = {
     "properties": {
         "tasks": {
             "type": "array",
+            "maxItems": 12,
             "items": {
                 "type": "object",
                 "properties": {
                     "title": {"type": "string"},
                     "description": {"type": "string"},
-                    "owner": {"enum": ["self", "other", "unknown"]},
+                    "owner": {
+                        "type": "string",
+                        "enum": ["self", "other", "unknown"],
+                    },
                     "owner_name": {"type": "string"},
                     "date_phrase": {"type": "string"},
                     "confidence": {"type": "number"},
                     "evidence": {"type": "string"},
                     "due_is_ambiguous": {"type": "boolean"},
                 },
-                "required": ["title", "owner", "date_phrase", "confidence", "evidence"],
+                "required": [
+                    "title",
+                    "description",
+                    "owner",
+                    "owner_name",
+                    "date_phrase",
+                    "confidence",
+                    "evidence",
+                    "due_is_ambiguous",
+                ],
+                "additionalProperties": False,
             },
         },
-        "decisions": {"type": "array", "items": {"type": "string"}},
-        "open_questions": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["tasks", "decisions", "open_questions"],
+    "required": ["tasks"],
+    "additionalProperties": False,
 }
 
 
@@ -161,8 +175,14 @@ def next_pending_job():
         default=Value(5),
         output_field=IntegerField(),
     )
+    delayed_active_extraction = Q(
+        kind=ProcessingJob.Kind.EXTRACT,
+        session__isnull=True,
+        created_at__gt=timezone.now() - ACTIVE_LISTENING_EXTRACTION_DELAY,
+    )
     return (
         ProcessingJob.objects.filter(status=ProcessingJob.Status.PENDING)
+        .exclude(delayed_active_extraction)
         .annotate(queue_priority=priority)
         .order_by("queue_priority", "created_at")
         .first()
@@ -303,10 +323,11 @@ def process_extraction_job(job: ProcessingJob):
     for index, piece in enumerate(pieces):
         _ensure_job_active(job.pk)
         results.append(generate_json(
-            f"Extract actionable information from part {index + 1} of {len(pieces)}. "
+            f"Extract actionable tasks from part {index + 1} of {len(pieces)}. "
             f"Write in {requested_language}.\n{piece}",
             TASK_SCHEMA,
             system_prompt=EXTRACTION_SYSTEM_PROMPT,
+            max_output_tokens=1024,
         ))
         _set_job_progress(
             job.pk,
@@ -330,19 +351,25 @@ def process_extraction_job(job: ProcessingJob):
             phrase = str(item.get("date_phrase", "")).strip()
             parsed = parse_spoken_date(phrase, job.session.started_at) if phrase else None
             ambiguous = bool(item.get("due_is_ambiguous", False)) or (parsed.ambiguous if parsed else False)
+            owner = item.get("owner", Task.Owner.UNKNOWN)
+            owner = owner if owner in Task.Owner.values else Task.Owner.UNKNOWN
+            confidence = item.get("confidence")
+            if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+                confidence = None
             task, _ = Task.objects.get_or_create(
                 session=job.session,
                 title=title,
                 defaults={
                     "description": str(item.get("description", "")).strip(),
-                    "owner": item.get("owner", Task.Owner.UNKNOWN),
+                    "owner": owner,
                     "owner_name": str(item.get("owner_name", ""))[:120],
                     "date_phrase": phrase[:240],
                     "due_at": parsed.value if parsed else None,
                     "due_is_ambiguous": ambiguous,
                     "status": Task.Status.PENDING_CONFIRMATION if ambiguous else Task.Status.TODO,
-                    "confidence": item.get("confidence"),
+                    "confidence": confidence,
                     "evidence": str(item.get("evidence", ""))[:2000],
+                    "creation_source": Task.CreationSource.SYSTEM,
                 },
             )
             if task.due_at and not task.due_is_ambiguous:
@@ -350,10 +377,15 @@ def process_extraction_job(job: ProcessingJob):
 
 
 def process_active_listening_job(job: ProcessingJob):
-    """Persist the transcript, extract personal tasks, and discard active-listening audio."""
+    """Persist an active-listening transcript before its deferred task analysis."""
     path = Path(job.temporary_audio_path)
     if not path.is_file():
         raise RuntimeError("Temporary active-listening audio is no longer available.")
+    ProcessingJob.objects.get_or_create(
+        kind=ProcessingJob.Kind.EXTRACT,
+        session__isnull=True,
+        status=ProcessingJob.Status.PENDING,
+    )
     language = AppSetting.objects.filter(key="default_language").values_list("value", flat=True).first()
     language = language if language in CaptureSession.Language.values else CaptureSession.Language.PORTUGUESE
     glossary = AppSetting.objects.filter(key="transcription_glossary").values_list("value", flat=True).first()
@@ -366,7 +398,33 @@ def process_active_listening_job(job: ProcessingJob):
         language=detected_language or language,
         recorded_at=job.created_at,
     )
-    requested_language = "Portuguese" if detected_language == "pt" else "English"
+
+
+def process_active_listening_extraction_job(job: ProcessingJob):
+    """Evaluate newly persisted active-listening logs together for personal tasks."""
+    previous = (
+        ProcessingJob.objects.filter(
+            kind=ProcessingJob.Kind.EXTRACT,
+            session__isnull=True,
+            status=ProcessingJob.Status.COMPLETE,
+        )
+        .exclude(pk=job.pk)
+        .order_by("-updated_at")
+        .first()
+    )
+    logs = ActiveListeningLog.objects.all()
+    if previous:
+        logs = logs.filter(created_at__gt=previous.updated_at)
+    else:
+        logs = logs.filter(created_at__gte=job.created_at)
+    logs = list(logs.order_by("created_at"))
+    if not logs:
+        return
+    transcript = "\n".join(log.text for log in logs).strip()
+    if not transcript:
+        return
+    language = logs[-1].language or CaptureSession.Language.PORTUGUESE
+    requested_language = "Portuguese" if language == "pt" else "English"
     result = generate_json(
         f"Extract only explicit personal tasks or reminders. Write in {requested_language}.\n{transcript}",
         TASK_SCHEMA,
@@ -382,7 +440,7 @@ def process_active_listening_job(job: ProcessingJob):
             ).exists():
                 continue
             phrase = str(item.get("date_phrase", "")).strip()
-            parsed = parse_spoken_date(phrase, job.created_at) if phrase else None
+            parsed = parse_spoken_date(phrase, logs[-1].recorded_at) if phrase else None
             ambiguous = bool(item.get("due_is_ambiguous", False)) or (parsed.ambiguous if parsed else False)
             task = Task.objects.create(
                 title=title,
@@ -588,13 +646,15 @@ def process_summary_job(job: ProcessingJob):
 
 
 def process_job(job: ProcessingJob):
+    now = timezone.now()
     claimed = ProcessingJob.objects.filter(
         pk=job.pk,
         status=ProcessingJob.Status.PENDING,
     ).update(
         status=ProcessingJob.Status.RUNNING,
         attempts=F("attempts") + 1,
-        updated_at=timezone.now(),
+        progress_started_at=now,
+        updated_at=now,
     )
     if not claimed:
         return
@@ -608,7 +668,7 @@ def process_job(job: ProcessingJob):
     )
     heartbeat.start()
     try:
-        if job.kind == ProcessingJob.Kind.EXTRACT:
+        if job.kind == ProcessingJob.Kind.EXTRACT and job.session_id:
             ProcessingJob.objects.filter(
                 kind=job.kind,
                 status=ProcessingJob.Status.PENDING,
@@ -626,7 +686,10 @@ def process_job(job: ProcessingJob):
         elif job.kind == ProcessingJob.Kind.ACTIVE_LISTEN:
             process_active_listening_job(job)
         elif job.kind == ProcessingJob.Kind.EXTRACT:
-            process_extraction_job(job)
+            if job.session_id:
+                process_extraction_job(job)
+            else:
+                process_active_listening_extraction_job(job)
         elif job.kind == ProcessingJob.Kind.DIARIZE:
             diarize_session(
                 job.session_id,

@@ -52,12 +52,13 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 .text-button.secondary-text { margin-left: 10px; color: #98a4b5; }
 .task-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
 .task-card-header > div { flex: 0 0 auto; }
-.task-title-input, .task-description-input, .task-meta input, .task-meta select { padding: 7px 9px; border: 1px solid #3d5729; border-radius: 7px; color: #e8edf4; background: #0f141c; }
+.task-title-input, .task-description-input, .task-meta input, .task-meta select { padding: 7px 9px; border: 0; outline: none; border-radius: 0; color: #e8edf4; background: transparent; }
 .task-title-input { width: min(620px, 100%); font-weight: 700; }
 .task-description { margin: 2px 0 6px; color: #cbd4df; white-space: pre-wrap; }
 .task-description-input { display: block; width: 100%; min-height: 38px; margin: 2px 0 6px; resize: vertical; }
 .task-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; color: #94a0b1; line-height: 1.5; }
 .task-meta input, .task-meta select { padding: 4px 7px; }
+.task-meta select { border: 1px solid #303949; border-radius: 7px; background: #0f141c; }
 .schedule-editor { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .schedule-editor input, .schedule-editor select { padding: 8px; border: 1px solid #303949; border-radius: 7px; color: #e8edf4; background: #0f141c; }
 .schedule-editor button { padding: 8px 11px; border: 0; border-radius: 7px; background: #c9f27b; font-weight: 700; }
@@ -101,8 +102,7 @@ button.search-result:hover { border-color: #526f35; }
 .meeting-title > div { display: flex; gap: 8px; }
 .title-editor { display: block !important; flex: 1; align-items: center; }
 .title-editor h2 { margin: 0; padding: 8px 10px; font-size: 24px; }
-.title-editor input { width: min(680px, 100%); padding: 8px 10px; border: 1px solid transparent; border-radius: 8px; color: #e8edf4; background: transparent; font-size: 24px; font-weight: 750; }
-.title-editor input:focus { border-color: #3d5729; outline: none; background: #10161d; }
+.title-editor input { width: min(680px, 100%); padding: 8px 10px; border: 0; outline: none; border-radius: 0; color: #e8edf4; background: transparent; font-size: 24px; font-weight: 750; }
 .title-editor p { padding-left: 10px; font-size: 13px; }
 .meeting-actions { position: relative; align-items: flex-start; }
 .meeting-actions details { position: relative; }

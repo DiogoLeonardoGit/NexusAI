@@ -16,6 +16,14 @@ function formatTranscriptTime(milliseconds) {
     .join(":");
 }
 
+function formatElapsedTime(startedAt) {
+  if (!startedAt) return "";
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000));
+  return [Math.floor(seconds / 3600), Math.floor((seconds % 3600) / 60), seconds % 60]
+    .map((value) => String(value).padStart(2, "0"))
+    .join(":");
+}
+
 function localDateValue(date = new Date()) {
   const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
   return local.toISOString().slice(0, 10);
@@ -127,11 +135,14 @@ function SummaryCard({ summary, title = "Resumo" }) {
 function ProcessingBadge({ processing, onRetry, onCancel, retrying = false, cancelling = false }) {
   if (!processing || processing.state === "idle") return null;
   const active = ["pending", "processing"].includes(processing.state);
-  const activityMinutes = processing.running && processing.last_updated_at
-    ? Math.max(0, Math.floor((Date.now() - new Date(processing.last_updated_at).getTime()) / 60000))
-    : null;
-  const activity = activityMinutes === null ? "" : activityMinutes < 1 ? " · atividade agora" : ` · atividade há ${activityMinutes} min`;
-  return <span className={`status-badge ${processing.state}`}>{active && <Spinner/>}{processing.message}{activity} · {processing.completed_chunks}/{processing.total_chunks} chunks{active && onCancel && <button onClick={onCancel} disabled={cancelling}>{cancelling && <Spinner/>}Cancelar</button>}{processing.retryable && onRetry && <button onClick={onRetry} disabled={retrying}>{retrying && <Spinner/>}Repetir</button>}</span>;
+  const transcribing = processing.phase === "transcription";
+  const counters = [
+    processing.microphone_total_chunks > 0 && `${processing.microphone_completed_chunks}/${processing.microphone_total_chunks} microfone`,
+    processing.system_total_chunks > 0 && `${processing.system_completed_chunks}/${processing.system_total_chunks} áudio do PC`,
+  ].filter(Boolean).join(" · ");
+  const elapsed = active ? formatElapsedTime(processing.processing_started_at) : "";
+  const progress = active && !transcribing ? ` · ${processing.progress_percent}%` : "";
+  return <span className={`status-badge ${processing.state}`}>{active && <Spinner/>}{processing.message}{transcribing && counters && ` · ${counters}`}{progress}{elapsed && ` · ${elapsed}`}{active && onCancel && <button onClick={onCancel} disabled={cancelling}>{cancelling && <Spinner/>}Cancelar</button>}{processing.retryable && onRetry && <button onClick={onRetry} disabled={retrying}>{retrying && <Spinner/>}Repetir</button>}</span>;
 }
 
 function Meetings({ sessions, refresh, onError, target, onTargetHandled, onNotice }) {
@@ -150,6 +161,7 @@ function Meetings({ sessions, refresh, onError, target, onTargetHandled, onNotic
     if (!target?.meetingId) return;
     open(target.meetingId).then(() => onTargetHandled?.());
   }, [target?.meetingId, target?.segmentId]);
+  useEffect(() => { if (selected?.title) setTitle(selected.title); }, [selected?.title]);
   useEffect(() => {
     if (!selected?.id) return undefined;
     const timer = setInterval(() => {
@@ -267,7 +279,7 @@ export default function App() {
   const notificationState = useRef({ initialized: false, taskIds: new Set(), summaryIds: new Set() });
   const refresh = useCallback(async () => {
     try {
-      const [nextTasks, nextSessions, nextSummaries] = await Promise.all([api("/tasks/"), api("/sessions/"), api("/summaries/")]);
+      const [nextTasks, nextSessions, nextSummaries, nextLogs] = await Promise.all([api("/tasks/"), api("/sessions/"), api("/summaries/"), api("/active-listening-logs/")]);
       const tracked = notificationState.current;
       const nextTaskIds = new Set(nextTasks.map((task) => task.id));
       const nextSummaryIds = new Set(nextSummaries.map((summary) => summary.id));
@@ -291,6 +303,7 @@ export default function App() {
       setTasks(nextTasks);
       setSessions(nextSessions);
       setSummaries(nextSummaries);
+      setLogs(nextLogs);
     } catch (nextError) { setError(nextError.message); }
   }, []);  useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { const timer = setInterval(refresh, 5000); return () => clearInterval(timer); }, [refresh]);

@@ -75,6 +75,7 @@ class ProcessingStatusSerializer(serializers.Serializer):
     progress_percent = serializers.IntegerField()
     progress_phase = serializers.CharField(allow_blank=True)
     progress_started_at = serializers.DateTimeField(allow_null=True)
+    processing_started_at = serializers.DateTimeField(allow_null=True)
 
 
 class CaptureSessionSerializer(serializers.ModelSerializer):
@@ -109,6 +110,10 @@ class CaptureSessionSerializer(serializers.ModelSerializer):
         active_chunks = instance.audio_chunks.filter(
             status__in=[AudioChunk.Status.PENDING, AudioChunk.Status.PROCESSING]
         ).count()
+        transcription_job = jobs.filter(
+            kind=ProcessingJob.Kind.TRANSCRIBE,
+            status__in=[ProcessingJob.Status.PENDING, ProcessingJob.Status.RUNNING],
+        ).order_by("created_at").first()
         failed_chunks = instance.audio_chunks.filter(status=AudioChunk.Status.FAILED).count()
         cancelled_chunks = instance.audio_chunks.filter(status=AudioChunk.Status.CANCELLED).count()
         chunks_finished = bool(total_chunks) and completed_chunks == total_chunks
@@ -154,7 +159,7 @@ class CaptureSessionSerializer(serializers.ModelSerializer):
                 and job.updated_at > summary_job.updated_at
                 for job in post_jobs
             )
-        current_job = active_job or queued_job
+        current_job = transcription_job if active_chunks and transcription_job else active_job or queued_job
         job_messages = {
             ProcessingJob.Kind.SUMMARIZE: "A gerar resumo",
             ProcessingJob.Kind.EXTRACT: "A criar tarefas",
@@ -214,6 +219,7 @@ class CaptureSessionSerializer(serializers.ModelSerializer):
                 "progress_percent": current_job.progress_percent if current_job else 0,
                 "progress_phase": current_job.progress_phase if current_job else "",
                 "progress_started_at": current_job.progress_started_at if current_job else None,
+                "processing_started_at": current_job.progress_started_at if current_job else None,
             }
         ).data
 
