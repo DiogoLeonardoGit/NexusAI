@@ -1,0 +1,25 @@
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+
+from . import views
+
+
+router = DefaultRouter()
+router.register("sessions", views.CaptureSessionViewSet)
+router.register("tasks", views.TaskViewSet)
+router.register("notes", views.NoteViewSet)
+router.register("segments", views.TranscriptSegmentViewSet)
+router.register("summaries", views.SummaryViewSet)
+router.register("jobs", views.ProcessingJobViewSet)
+router.register("reminders", views.ReminderViewSet)
+router.register("speakers", views.SpeakerViewSet)
+router.register("settings", views.AppSettingViewSet)
+router.register("active-listening-logs", views.ActiveListeningLogViewSet, basename="active-listening-log")
+
+urlpatterns = [
+    path("health/", views.health),
+    path("active-listening/", views.active_listening),
+    path("search/", views.search),
+    path("chat/", views.chat),
+    path("", include(router.urls)),
+]

@@ -1,0 +1,76 @@
+data/
+models/
+frontend/node_modules/
+frontend/dist/
+frontend/release/
+
+# Python
+*.egg-info
+*.pot
+.tox/
+__pycache__
+/static/
+/protected/
+*.pylintrc
+.tmp/*
+*.py[cod]
+
+# SQLite3
+*.sqlite3
+*.sqlite
+
+# Pycharm
+.idea/
+/backup/
+/docs_html/
+
+# Pytest
+.pytest-tmp*
+.pytest_cache/
+
+# Visual Studio SFTP
+/.vscode/
+
+# Venv and Env
+/venv/
+.venv/
+env.txt
+.env
+
+# certificado do registry
+registry.gitlab.warpcom.com.crt
+
+# formatters config file
+.prettierrc
+pyproject.toml
+
+# Logs
+/logs/
+
+# Ficheiros de configuração kubernetes
+kubernetes/
+
+# Media
+media/files/
+
+# commands:
+
+# claude:
+.claude/
+claude.md
+
+#coverage report
+.coverage
+.coverage.*
+htmlcov/
+
+# Temps e Benchmark
+.tmp/
+
+# Codex e agents
+.codex/
+.agents/
+AGENTS.md
+.github/
+
+backend/dist/

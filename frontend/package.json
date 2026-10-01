@@ -1,0 +1,43 @@
+{
+  "name": "my-notetaker",
+  "version": "0.1.0",
+  "description": "Assistente pessoal offline para reuniões, notas, tarefas e lembretes.",
+  "author": "Diogo Leonardo",
+  "private": true,
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite\" \"wait-on http://127.0.0.1:5173 && node electron/launch.cjs\"",
+    "build": "vite build",
+    "test": "vitest run",
+    "electron:pack": "npm run build && electron-builder --dir",
+    "electron:dist": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "6.1.1",
+    "vite": "8.3.1",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "concurrently": "10.0.5",
+    "electron": "44.4.5",
+    "electron-builder": "26.15.3",
+    "jsdom": "30.1.1",
+    "vitest": "5.0.2",
+    "wait-on": "9.1.0"
+  },
+  "build": {
+    "appId": "local.mynotetaker.app",
+    "productName": "My AI Notetaker",
+    "files": ["dist/**/*", "electron/**/*", "build/icon.ico", "package.json"],
+    "extraResources": [
+      {"from": "../backend/dist/notetaker-backend", "to": "backend"},
+      {"from": "../backend/template/notetaker.sqlite3", "to": "backend-template/notetaker.sqlite3"},
+      {"from": "../models/faster-whisper-medium", "to": "models/faster-whisper-medium"},
+      {"from": "../models/sherpa-onnx-pyannote-segmentation-3-0", "to": "models/sherpa-onnx-pyannote-segmentation-3-0"},
+      {"from": "../models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx", "to": "models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"}
+    ],
+    "win": {"target": "nsis", "icon": "build/icon.ico"},
+    "directories": {"output": "release"}
+  }
+}
