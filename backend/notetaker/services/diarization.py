@@ -120,7 +120,7 @@ def identify_speaker_names(session_id: int, check_active=None, set_progress=None
             f"Valid labels: {', '.join(labels)}.\nTranscript part {index + 1} of {len(chunks)}:\n{chunk}"
         )
         try:
-            result = generate_json(prompt, SPEAKER_NAMES_SCHEMA, max_output_tokens=256)
+            result = generate_json(prompt, SPEAKER_NAMES_SCHEMA, max_output_tokens=512)
         except OllamaError:
             # Naming is optional: diarization itself remains useful if a part cannot be interpreted.
             continue
@@ -252,4 +252,3 @@ def diarize_session(session_id: int, check_active=None, set_progress=None):
             segment.speaker = speakers.get(best.speaker, others)
             changed.append(segment)
         TranscriptSegment.objects.bulk_update(changed, ["speaker"])
-    identify_speaker_names(session_id, check_active=check_active, set_progress=set_progress)

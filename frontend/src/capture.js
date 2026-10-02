@@ -1,7 +1,7 @@
 import { api } from "./api";
 
 
-const CHUNK_INTERVAL_MS = 30_000;
+const CHUNK_INTERVAL_MS = 60_000;
 
 function supportedMimeType() {
   return ["audio/webm;codecs=opus", "audio/webm"].find((type) => MediaRecorder.isTypeSupported(type)) || "";

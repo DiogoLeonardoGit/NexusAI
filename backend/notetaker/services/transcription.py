@@ -51,7 +51,7 @@ def transcribe(
     segments, info = get_model().transcribe(
         path,
         language=language,
-        beam_size=5,
+        beam_size=8,
         temperature=0.0,
         condition_on_previous_text=False,
         initial_prompt=initial_prompt or None,

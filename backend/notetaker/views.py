@@ -105,7 +105,7 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
         session.save(update_fields=["status", "ended_at"])
         finalize_session_language(session)
         for kind in (
-            ProcessingJob.Kind.DIARIZE,
+            # ProcessingJob.Kind.DIARIZE, # comentado temporariamente para testar se fica mais rapido
             ProcessingJob.Kind.SUMMARIZE,
             ProcessingJob.Kind.EXTRACT,
         ):
@@ -126,7 +126,7 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_409_CONFLICT,
             )
         phases = [
-            ProcessingJob.Kind.DIARIZE,
+            # ProcessingJob.Kind.DIARIZE, # comentado temporariamente para testar se fica mais rapido
             ProcessingJob.Kind.SUMMARIZE,
             ProcessingJob.Kind.EXTRACT,
         ]

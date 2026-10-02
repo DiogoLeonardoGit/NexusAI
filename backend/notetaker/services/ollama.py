@@ -10,10 +10,11 @@ class OllamaError(RuntimeError):
 
 
 EXTRACTION_SYSTEM_PROMPT = """You are a private offline meeting assistant. Return only JSON.
-Extract at most 12 actionable tasks from the transcript. Never invent facts.
-For each task include title, owner (self, other, unknown), owner_name, date_phrase,
-confidence from 0 to 1, evidence copied from the supplied transcript, and
-due_is_ambiguous. Keep evidence under 160 characters. Use the language of the transcript.
+Extract at most 8 explicit actionable tasks from the transcript. Never invent facts.
+Keep titles concise. Keep descriptions under 20 words and use an empty description when unnecessary.
+For each task include title, description, owner, owner_name, date_phrase, confidence, evidence and
+due_is_ambiguous. Keep evidence under 100 characters. Return no task without explicit transcript evidence.
+Use the language of the transcript.
 """
 
 ACTIVE_LISTENING_SYSTEM_PROMPT = """You are a private offline personal assistant. Return only JSON.
@@ -26,9 +27,12 @@ Use the language of the transcript.
 """
 
 SUMMARY_SYSTEM_PROMPT = """You are a private offline meeting assistant. Return only JSON.
-Create a useful factual summary from the supplied material. Never invent facts. Write in
-the requested language. The summary must contain substantive information, not a title or
-date label. Decisions and open questions must be concise and empty entries are forbidden.
+Create a factual summary using only information explicitly supported by the supplied material.
+Never infer causes, intentions, owners, dates, outcomes or conclusions that were not stated.
+If information is uncertain or contradictory, omit it instead of resolving it yourself.
+Write in the requested language. Decisions must only contain explicit decisions already made.
+Open questions must only contain questions or unresolved issues explicitly present in the material.
+The summary must contain substantive information, not a title or date label. Empty entries are forbidden.
 """
 
 CHAT_SYSTEM_PROMPT = """You are a private offline meeting assistant. Return only JSON.
@@ -105,7 +109,7 @@ def generate_json(
     system_prompt: str = EXTRACTION_SYSTEM_PROMPT,
     max_output_tokens: int | None = None,
 ) -> dict:
-    options = {"temperature": 0.1, "num_predict": max_output_tokens or 768}
+    options = {"temperature": 0.0, "num_predict": max_output_tokens or 1024, "num_ctx": 8192}
     payload = {
         "model": settings.OLLAMA_MODEL,
         "keep_alive": "30m",
@@ -118,11 +122,16 @@ def generate_json(
         ],
         "options": options,
     }
-    result = _request("/api/chat", payload)
-    content = str(result.get("message", {}).get("content", "")).strip()
-    decoded = _decode_json_object(content, schema)
-    if decoded is not None:
-        return decoded
+    for attempt in range(2):
+        result = _request("/api/chat", payload)
+        content = str(result.get("message", {}).get("content", "")).strip()
+        decoded = _decode_json_object(content, schema)
+        if decoded is not None:
+            return decoded
+        payload["options"]["num_predict"] = min((max_output_tokens or 512) * 2, 1024)
+        payload["messages"][-1]["content"] = (
+            prompt + "\nReturn valid JSON matching the required schema. Do not add explanatory text."
+        )
     raise OllamaError("Ollama returned invalid structured output.")
 
 

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, Notification, Tray, desktopCapturer, dialog, ipcMain, nativeImage, session } = require("electron");
+const { app, BrowserWindow, Menu, Notification, Tray, desktopCapturer, dialog, ipcMain, nativeImage, session, powerSaveBlocker } = require("electron");
 const { randomBytes } = require("crypto");
 const { spawn } = require("child_process");
 const path = require("path");
@@ -13,6 +13,17 @@ const backendProcesses = [];
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 const appDisplayName = "My AI Notetaker";
 const existingUserDataPath = path.join(app.getPath("appData"), "My Notetaker");
+let powerSaveBlockerId = null;
+
+function updatePowerSaveBlocker(state) {
+  const shouldBlock = state === "meeting" || state === "active-listening";
+  if (shouldBlock && powerSaveBlockerId === null) {
+    powerSaveBlockerId = powerSaveBlocker.start("prevent-display-sleep");
+  } else if (!shouldBlock && powerSaveBlockerId !== null) {
+    powerSaveBlocker.stop(powerSaveBlockerId);
+    powerSaveBlockerId = null;
+  }
+}
 
 app.setPath("userData", existingUserDataPath);
 app.setName(appDisplayName);
@@ -190,6 +201,7 @@ ipcMain.handle("export:text", async (_event, { content, defaultPath }) => {
 });
 ipcMain.on("capture:state", (_event, state) => {
   captureState = ["active-listening", "meeting"].includes(state) ? state : "paused";
+  updatePowerSaveBlocker(captureState);
   tray?.rebuild();
 });
 ipcMain.handle("login:get", () => app.getLoginItemSettings().openAtLogin);

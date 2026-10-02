@@ -31,7 +31,7 @@ from .transcription import detect_language, transcribe
 
 logger = logging.getLogger(__name__)
 
-OLLAMA_INPUT_CHARS = 8000
+OLLAMA_INPUT_CHARS = 16000
 ACTIVE_LISTENING_EXTRACTION_DELAY = timedelta(minutes=2)
 
 
@@ -98,7 +98,7 @@ TASK_SCHEMA = {
     "properties": {
         "tasks": {
             "type": "array",
-            "maxItems": 12,
+            "maxItems": 8,
             "items": {
                 "type": "object",
                 "properties": {
@@ -165,7 +165,7 @@ def _job_heartbeat(job_id, stop_event):
 
 
 def next_pending_job():
-    """Prioritize transcription so summaries never run over an incomplete day."""
+    """Prioritize transcription and diarization before meeting analysis."""
     priority = Case(
         When(kind=ProcessingJob.Kind.ACTIVE_LISTEN, then=Value(0)),
         When(kind=ProcessingJob.Kind.TRANSCRIBE, then=Value(1)),
@@ -318,7 +318,7 @@ def process_extraction_job(job: ProcessingJob):
         return
     language = job.session.language or CaptureSession.Language.PORTUGUESE
     requested_language = "Portuguese" if language == "pt" else "English"
-    pieces = _analysis_chunks(transcript)
+    pieces = _analysis_chunks(transcript, limit=8000)
     results = []
     for index, piece in enumerate(pieces):
         _ensure_job_active(job.pk)
@@ -327,7 +327,7 @@ def process_extraction_job(job: ProcessingJob):
             f"Write in {requested_language}.\n{piece}",
             TASK_SCHEMA,
             system_prompt=EXTRACTION_SYSTEM_PROMPT,
-            max_output_tokens=1024,
+            max_output_tokens=512,
         ))
         _set_job_progress(
             job.pk,
@@ -345,7 +345,8 @@ def process_extraction_job(job: ProcessingJob):
         for item in (task for result in results for task in result.get("tasks", [])):
             title = str(item.get("title", "")).strip()
             normalized_title = title.casefold()
-            if not title or normalized_title in known_titles:
+            evidence = str(item.get("evidence", "")).strip()
+            if not title or normalized_title in known_titles or not evidence or evidence not in transcript:
                 continue
             known_titles.add(normalized_title)
             phrase = str(item.get("date_phrase", "")).strip()
@@ -356,6 +357,10 @@ def process_extraction_job(job: ProcessingJob):
             confidence = item.get("confidence")
             if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
                 confidence = None
+            source_segment = next(
+                (segment for segment in segments if evidence in segment.text or segment.text in evidence),
+                None,
+            )            
             task, _ = Task.objects.get_or_create(
                 session=job.session,
                 title=title,
@@ -363,12 +368,13 @@ def process_extraction_job(job: ProcessingJob):
                     "description": str(item.get("description", "")).strip(),
                     "owner": owner,
                     "owner_name": str(item.get("owner_name", ""))[:120],
+                    "source_segment": source_segment,
                     "date_phrase": phrase[:240],
                     "due_at": parsed.value if parsed else None,
                     "due_is_ambiguous": ambiguous,
                     "status": Task.Status.PENDING_CONFIRMATION if ambiguous else Task.Status.TODO,
                     "confidence": confidence,
-                    "evidence": str(item.get("evidence", ""))[:2000],
+                    "evidence": evidence[:2000],
                     "creation_source": Task.CreationSource.SYSTEM,
                 },
             )
@@ -487,21 +493,25 @@ def _keyword_title(transcript):
     return ""
 
 
-def _summarize_material(material: str, label: str, language: str, heartbeat=None):
+def _summarize_material(material: str, label: str, language: str, heartbeat=None, compact=False):
     requested_language = "Portuguese" if language == "pt" else "English"
     chunk_size = OLLAMA_INPUT_CHARS
     pieces = [material[index : index + chunk_size] for index in range(0, len(material), chunk_size)]
     partials = []
+    instruction = (
+        "Extract compact factual notes, decisions and open questions. Set title to an empty string."
+        if compact else
+        "Create a factual summary and a descriptive title with at most 10 words."
+    )
     for index, piece in enumerate(pieces, start=1):
         if heartbeat:
             heartbeat()
         partials.append(
             generate_json(
-                f"Summarize part {index}/{len(pieces)} of {label} in {requested_language}. "
-                f"Create a descriptive title with at most 10 words:\n{piece}",
+                f"{instruction} Part {index}/{len(pieces)} of {label}. Write in {requested_language}:\n{piece}",
                 SUMMARY_SCHEMA,
                 system_prompt=SUMMARY_SYSTEM_PROMPT,
-                max_output_tokens=512 if len(pieces) > 1 else 768,
+                max_output_tokens=384 if compact else 768,
             )
         )
         if heartbeat:
@@ -516,11 +526,10 @@ def _summarize_material(material: str, label: str, language: str, heartbeat=None
             for item in partials
         )
         result = generate_json(
-            f"Create one final {label} summary in {requested_language}, including a descriptive "
-            f"title with at most 10 words:\n{combined}",
+            f"Create one final {label} summary in {requested_language}:\n{combined}",
             SUMMARY_SCHEMA,
             system_prompt=SUMMARY_SYSTEM_PROMPT,
-            max_output_tokens=768,
+            max_output_tokens=1024,
         )
         if heartbeat:
             heartbeat()
@@ -551,6 +560,7 @@ def _summarize_complete_transcript(job, transcript, prompt_label, language):
             f"part {index + 1} of {len(pieces)} of the {prompt_label}",
             language,
             heartbeat=lambda: _ensure_job_active(job.pk, touch=True),
+            compact=True,
         ))
 
     consolidated = "\n\n".join(
@@ -653,11 +663,11 @@ def process_job(job: ProcessingJob):
     ).update(
         status=ProcessingJob.Status.RUNNING,
         attempts=F("attempts") + 1,
-        progress_started_at=now,
         updated_at=now,
     )
     if not claimed:
         return
+    ProcessingJob.objects.filter(pk=job.pk, progress_started_at__isnull=True).update(progress_started_at=now)
     job.refresh_from_db()
     heartbeat_stop = threading.Event()
     heartbeat = threading.Thread(
@@ -704,7 +714,9 @@ def process_job(job: ProcessingJob):
         job.status = ProcessingJob.Status.CANCELLED
         job.error = "Cancelado pelo utilizador."
     except Exception as exc:
-        job.status = ProcessingJob.Status.FAILED if isinstance(exc, OllamaError) or job.kind == ProcessingJob.Kind.ACTIVE_LISTEN else (
+        job.status = ProcessingJob.Status.FAILED if isinstance(exc, OllamaError) or (
+            job.kind == ProcessingJob.Kind.ACTIVE_LISTEN
+        ) else (
             ProcessingJob.Status.FAILED if job.attempts >= 3 else ProcessingJob.Status.PENDING
         )
         job.error = str(exc)[:4000]
