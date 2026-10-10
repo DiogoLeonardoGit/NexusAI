@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { api, apiText } from "./api";
 import { startActiveListening, startCapture } from "./capture";
@@ -6,8 +6,46 @@ import { startActiveListening, startCapture } from "./capture";
 
 const VIEWS = ["Hoje", "Tarefas", "Reuniões", "Pesquisa", "Definições", "Logs"];
 const REMINDER_OPTIONS = [[0, "Na hora"], [5, "5 minutos antes"], [15, "15 minutos antes"], [30, "30 minutos antes"], [60, "1 hora antes"], [1440, "1 dia antes"]];
+const TASK_PRIORITIES = [["high", "P1"], ["normal", "P2"], ["low", "P3"]];
+
+// Explicit date orders override the default; missing deadlines always stay last.
+function compareTasks(left, right, order = "default") {
+  if (order === "created-asc" || order === "created-desc") {
+    const direction = order === "created-asc" ? 1 : -1;
+    return direction * (new Date(left.created_at) - new Date(right.created_at)) || right.id - left.id;
+  }
+  if (left.due_at && !right.due_at) return -1;
+  if (!left.due_at && right.due_at) return 1;
+  if (left.due_at && right.due_at) {
+    const difference = new Date(left.due_at) - new Date(right.due_at);
+    if (difference) return order === "due-desc" ? -difference : difference;
+  }
+  return new Date(right.created_at) - new Date(left.created_at) || right.id - left.id;
+}
 
 function Spinner() { return <span className="spinner" aria-hidden="true" />; }
+
+function AutoSizeTextarea({ value, ...props }) {
+  const input = useRef(null);
+  // Measure rendered lines so both explicit breaks and wrapped text fit.
+  useLayoutEffect(() => {
+    const element = input.current;
+    const resize = () => {
+      element.style.height = "auto";
+      const border = element.offsetHeight - element.clientHeight;
+      element.style.height = `${element.scrollHeight + border}px`;
+    };
+    resize();
+    let width = element.getBoundingClientRect().width;
+    const observer = new ResizeObserver(() => {
+      const nextWidth = element.getBoundingClientRect().width;
+      if (nextWidth !== width) { width = nextWidth; resize(); }
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [value]);
+  return <textarea {...props} ref={input} rows={1} value={value}/>;
+}
 
 function formatTranscriptTime(milliseconds) {
   const seconds = Math.max(0, Math.floor((milliseconds || 0) / 1000));
@@ -33,21 +71,53 @@ function formatCalendarDate(value) {
   return new Date(`${value}T12:00:00`).toLocaleDateString("pt-PT", { dateStyle: "long" });
 }
 
-function TaskList({ tasks, refresh, onError }) {
+function TaskList({ tasks, sections, showSections, refresh, onError }) {
   const [title, setTitle] = useState(""), [description, setDescription] = useState("");
+  const [priority, setPriority] = useState("normal"), [sectionName, setSectionName] = useState("");
+  const [taskSearch, setTaskSearch] = useState(""), [priorityFilter, setPriorityFilter] = useState("all"), [taskOrder, setTaskOrder] = useState("default");
+  const [unassignedCollapsed, setUnassignedCollapsed] = useState(false), [dropTarget, setDropTarget] = useState(null);
+  const draggedTask = useRef(null);
   const [filter, setFilter] = useState("todo"), [editingTask, setEditingTask] = useState(null), [scheduleTask, setScheduleTask] = useState(null);
   const [dueAt, setDueAt] = useState(""), [minutesBefore, setMinutesBefore] = useState(15), [busy, setBusy] = useState(null);
   const run = async (key, operation) => {
     setBusy(key);
-    try { await operation(); await refresh(); }
-    catch (error) { onError(error.message); }
+    try { await operation(); await refresh(); return true; }
+    catch (error) { onError(error.message); return false; }
     finally { setBusy(null); }
   };
   const createTask = async (event) => {
     event.preventDefault();
     if (!title.trim()) return;
-    await run("new", () => api("/tasks/", { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim(), owner: "self", status: "todo" }) }));
-    setTitle(""); setDescription("");
+    const saved = await run("new", () => api("/tasks/", { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim(), priority, owner: "self", status: "todo" }) }));
+    if (saved) { setTitle(""); setDescription(""); setPriority("normal"); }
+  };
+  // Persist section changes through the same API/refresh flow as task edits.
+  const createSection = async (event) => {
+    event.preventDefault();
+    if (!sectionName.trim() || busy) return;
+    const saved = await run("new-section", () => api("/task-sections/", {
+      method: "POST", body: JSON.stringify({ name: sectionName.trim() }),
+    }));
+    if (saved) setSectionName("");
+  };
+  const toggleSection = (section) => {
+    if (section.id === null) { setUnassignedCollapsed((value) => !value); return; }
+    return run(`section-${section.id}`, () => api(`/task-sections/${section.id}/`, {
+      method: "PATCH", body: JSON.stringify({ collapsed: !section.collapsed }),
+    }));
+  };
+  // Dropping on the whole section also supports empty and collapsed groups.
+  const moveTask = async (event, sectionId) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setDropTarget(null);
+    const taskId = draggedTask.current;
+    draggedTask.current = null;
+    const task = tasks.find((item) => item.id === taskId);
+    if (!task || busy || (task.section ?? null) === sectionId) return;
+    await run(`move-${task.id}`, () => api(`/tasks/${task.id}/`, {
+      method: "PATCH", body: JSON.stringify({ section: sectionId }),
+    }));
   };
   const editSchedule = (task) => {
     setScheduleTask(task.id);
@@ -60,54 +130,88 @@ function TaskList({ tasks, refresh, onError }) {
   };
   const saveSchedule = async (task) => {
     if (!dueAt) return;
-    await run(`schedule-${task.id}`, () => api(`/tasks/${task.id}/schedule/`, {
+    const saved = await run(`schedule-${task.id}`, () => api(`/tasks/${task.id}/schedule/`, {
       method: "POST",
       body: JSON.stringify({ due_at: new Date(dueAt).toISOString(), minutes_before: Number(minutesBefore) }),
     }));
-    setScheduleTask(null);
+    if (saved) setScheduleTask(null);
   };
-  const beginTaskEdit = (task) => setEditingTask({ id: task.id, title: task.title, description: task.description || "", owner: task.owner, owner_name: task.owner_name || "" });
+  const beginTaskEdit = (task) => setEditingTask({ id: task.id, title: task.title, description: task.description || "", owner: task.owner, owner_name: task.owner_name || "", priority: task.priority });
   const saveTask = async () => {
     if (!editingTask?.title.trim()) return;
-    await run(`edit-${editingTask.id}`, () => api(`/tasks/${editingTask.id}/`, { method: "PATCH", body: JSON.stringify({
+    const saved = await run(`edit-${editingTask.id}`, () => api(`/tasks/${editingTask.id}/`, { method: "PATCH", body: JSON.stringify({
       title: editingTask.title.trim(), description: editingTask.description.trim(), owner: editingTask.owner,
       owner_name: editingTask.owner === "other" ? editingTask.owner_name.trim() : "",
+      priority: editingTask.priority,
     }) }));
-    setEditingTask(null);
+    if (saved) setEditingTask(null);
   };
   const deleteTask = async (task) => {
     if (!window.confirm(`Eliminar a tarefa “${task.title}”?`)) return;
     await run(`delete-${task.id}`, () => api(`/tasks/${task.id}/`, { method: "DELETE" }));
   };
+  // Search and priority narrow the selected status/owner view before sorting.
+  const searchTerm = taskSearch.trim().toLocaleLowerCase("pt-PT");
   const visible = tasks.filter((task) => {
+    if (priorityFilter !== "all" && task.priority !== priorityFilter) return false;
+    if (searchTerm && !`${task.title}\n${task.description || ""}`.toLocaleLowerCase("pt-PT").includes(searchTerm)) return false;
     if (filter === "all") return true;
     if (filter === "done") return task.status === "done";
     if (filter === "mine") return task.owner === "self" && !["done", "cancelled"].includes(task.status);
     if (filter === "others") return task.owner === "other" && !["done", "cancelled"].includes(task.status);
     return !["done", "cancelled"].includes(task.status);
-  });
-  return <>
-    <form className="quick-task" onSubmit={createTask}><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><textarea rows={1} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><button disabled={busy === "new"}>{busy === "new" && <Spinner/>}Adicionar</button></form>
-    <div className="filters">{[["todo", "A fazer"], ["mine", "Minhas tarefas"], ["others", "Pendentes de outros intervenientes"], ["done", "Concluídas"], ["all", "Todas"]].map(([value, label]) => <button type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div>
-    <div className="card-list">
-      {visible.length === 0 && <div className="empty">Não existem tarefas nesta vista.</div>}
-      {visible.map((task) => {
+  }).sort((left, right) => compareTasks(left, right, taskOrder));
+  const renderTask = (task) => {
         const overdue = task.status !== "done" && task.due_at && new Date(task.due_at).getTime() < Date.now();
         const reminderFired = task.status !== "done" && task.reminder_status === "notified";
         const alertClass = overdue ? "overdue" : reminderFired ? "reminder-fired" : "";
         const isEditing = editingTask?.id === task.id;
         return <article className={`card task ${alertClass}`} key={task.id}>
+        {showSections && <button type="button" className="task-drag-handle" aria-label={`Arrastar tarefa ${task.title}`} title="Arrastar para outro separador" disabled={Boolean(busy) || isEditing} draggable={!busy && !isEditing}
+          onDragStart={(event) => { draggedTask.current = task.id; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", String(task.id)); }}
+          onDragEnd={() => { draggedTask.current = null; setDropTarget(null); }}>⠿</button>}
         {(overdue || reminderFired) && <span className="task-alert" title={overdue ? "Prazo ultrapassado" : "Lembrete emitido"}>!</span>}
         <button className={`check ${task.status === "done" ? "done" : ""}`} title={task.status === "done" ? "Reabrir tarefa" : "Concluir tarefa"} disabled={busy === `status-${task.id}`} onClick={() => run(`status-${task.id}`, () => api(`/tasks/${task.id}/${task.status === "done" ? "reopen" : "complete"}/`, { method: "POST" }))}>✓</button>
         <div className="task-body">
-          <div className="task-card-header">{isEditing ? <input className="task-title-input" value={editingTask.title} onChange={(event) => setEditingTask({ ...editingTask, title: event.target.value })}/> : <h3>{task.title}</h3>}<div>{isEditing ? <><button className="text-button" onClick={saveTask} disabled={!editingTask.title.trim() || busy === `edit-${task.id}`}>{busy === `edit-${task.id}` && <Spinner/>}Concluir</button><button className="text-button secondary-text" onClick={() => setEditingTask(null)}>Cancelar</button></> : <><button className="text-button" onClick={() => beginTaskEdit(task)}>Editar</button><button className="text-button danger" onClick={() => deleteTask(task)} disabled={busy === `delete-${task.id}`}>{busy === `delete-${task.id}` && <Spinner/>}Eliminar</button></>}</div></div>
-          {isEditing ? <textarea className="task-description-input" rows={1} value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <p className="task-description">{task.description}</p>}
-          <div className="task-meta">{isEditing ? <><select value={editingTask.owner} onChange={(event) => setEditingTask({ ...editingTask, owner: event.target.value })}><option value="self">Eu</option><option value="other">Outro interveniente</option><option value="unknown">Por definir</option></select>{editingTask.owner === "other" && <input value={editingTask.owner_name} onChange={(event) => setEditingTask({ ...editingTask, owner_name: event.target.value })} placeholder="Nome do responsável"/>}</> : <span>{task.owner === "self" ? "Eu" : task.owner_name || "Outro interveniente"}</span>}<span> · Criada a {new Date(task.created_at).toLocaleString()} {task.creation_source === "system" ? "pelo Sistema" : "por ti"}{task.due_at ? ` · Limite: ${new Date(task.due_at).toLocaleString()}` : ""}{task.reminder_at ? ` · Lembrete: ${new Date(task.reminder_at).toLocaleString()}` : ""}</span></div>
-          <div className="task-actions"><button className="text-button" onClick={() => editSchedule(task)}>Definir data e lembrete</button>{task.due_is_ambiguous && <span className="warning">Data por confirmar</span>}</div>
-          {scheduleTask === task.id && <div className="schedule-editor"><input type="datetime-local" value={dueAt} onChange={(event) => setDueAt(event.target.value)}/><select value={minutesBefore} onChange={(event) => setMinutesBefore(event.target.value)}>{REMINDER_OPTIONS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><button onClick={() => saveSchedule(task)} disabled={!dueAt || busy === `schedule-${task.id}`}>{busy === `schedule-${task.id}` && <Spinner/>}Guardar</button><button className="secondary" onClick={() => setScheduleTask(null)}>Cancelar</button></div>}
+          <div className="task-card-header">
+            {isEditing ? <input className="task-title-input" value={editingTask.title} onChange={(event) => setEditingTask({ ...editingTask, title: event.target.value })}/> : <h3>{task.title}</h3>}
+            <div>{isEditing ? <><button className="text-button" onClick={saveTask} disabled={!editingTask.title.trim() || busy === `edit-${task.id}`}>{busy === `edit-${task.id}` && <Spinner/>}Concluir</button><button className="text-button secondary-text" onClick={() => setEditingTask(null)}>Cancelar</button></> : <><button className="text-button" onClick={() => beginTaskEdit(task)}>Editar</button><button className="text-button danger" onClick={() => deleteTask(task)} disabled={busy === `delete-${task.id}`}>{busy === `delete-${task.id}` && <Spinner/>}Eliminar</button></>}</div>
+          </div>
+          {isEditing ? <AutoSizeTextarea className="task-description-input" value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <p className="task-description">{task.description}</p>}
+          <div className={`task-meta ${isEditing ? "editing" : ""}`}>
+            {isEditing ? <><select aria-label="Responsável da tarefa" value={editingTask.owner} onChange={(event) => setEditingTask({ ...editingTask, owner: event.target.value })}><option value="self">Eu</option><option value="other">Outro interveniente</option><option value="unknown">Por definir</option></select>{editingTask.owner === "other" && <input value={editingTask.owner_name} onChange={(event) => setEditingTask({ ...editingTask, owner_name: event.target.value })} placeholder="Nome do responsável"/>}</> : <span>{task.owner === "self" ? "Eu" : task.owner_name || "Outro interveniente"}</span>}
+            {isEditing ? <select className="task-priority-select" aria-label="Prioridade da tarefa" value={editingTask.priority} onChange={(event) => setEditingTask({ ...editingTask, priority: event.target.value })}>{TASK_PRIORITIES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select> : <span className={`task-priority priority-${task.priority}`}>{TASK_PRIORITIES.find(([value]) => value === task.priority)?.[1] || "P2"}</span>}
+            {!isEditing && <span>· Criada a {new Date(task.created_at).toLocaleString()} {task.creation_source === "system" ? "pelo Sistema" : "por ti"}</span>}
+            {task.due_at && <span>· Limite: {new Date(task.due_at).toLocaleString()}</span>}
+            {task.reminder_at && <span>· Lembrete: {new Date(task.reminder_at).toLocaleString()}</span>}
+            <button className="text-button" onClick={() => editSchedule(task)}>{task.due_at || task.reminder_at ? "Alterar" : "Definir data e lembrete"}</button>
+            {task.due_is_ambiguous && <span className="warning">Data por confirmar</span>}
+            {scheduleTask === task.id && <div className="schedule-editor"><input type="datetime-local" value={dueAt} onChange={(event) => setDueAt(event.target.value)}/><select value={minutesBefore} onChange={(event) => setMinutesBefore(event.target.value)}>{REMINDER_OPTIONS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><button onClick={() => saveSchedule(task)} disabled={!dueAt || busy === `schedule-${task.id}`}>{busy === `schedule-${task.id}` && <Spinner/>}Guardar</button><button className="secondary" onClick={() => setScheduleTask(null)}>Cancelar</button></div>}
+          </div>
         </div>
-      </article>; })}
+      </article>;
+  };
+  const groups = [{ id: null, name: "Sem separador", collapsed: unassignedCollapsed }, ...sections];
+  return <>
+    <form className="quick-task" onSubmit={createTask}><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><AutoSizeTextarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><select aria-label="Prioridade da nova tarefa" value={priority} onChange={(event) => setPriority(event.target.value)}>{TASK_PRIORITIES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><button disabled={Boolean(busy)}>{busy === "new" && <Spinner/>}Adicionar</button></form>
+    <div className="filters">{[["todo", "A fazer"], ["mine", "Minhas tarefas"], ["others", "Pendentes de outros intervenientes"], ["done", "Concluídas"], ["all", "Todas"]].map(([value, label]) => <button type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div>
+    <div className="task-search-filters">
+      <label className="task-search-field">Pesquisar tarefas<input type="search" placeholder="Pesquisar no título ou descrição…" value={taskSearch} onChange={(event) => setTaskSearch(event.target.value)}/></label>
+      <label>Prioridade<select value={priorityFilter} onChange={(event) => setPriorityFilter(event.target.value)}><option value="all">Todas</option>{TASK_PRIORITIES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+      <label>Ordenar por<select value={taskOrder} onChange={(event) => setTaskOrder(event.target.value)}><option value="default">Predefinido</option><option value="created-asc">Data de criação: crescente</option><option value="created-desc">Data de criação: decrescente</option><option value="due-asc">Data limite: crescente</option><option value="due-desc">Data limite: decrescente</option></select></label>
     </div>
+    {showSections && <form className="new-task-section" onSubmit={createSection}><input aria-label="Nome do novo separador" placeholder="Nome do separador…" maxLength={120} value={sectionName} onChange={(event) => setSectionName(event.target.value)}/><button disabled={!sectionName.trim() || Boolean(busy)}>{busy === "new-section" && <Spinner/>}Criar separador</button></form>}
+    {showSections ? <div className="task-sections">{groups.map((section) => {
+      const key = section.id ?? "unassigned";
+      const sectionTasks = visible.filter((task) => (task.section ?? null) === section.id);
+      return <section className={`task-section ${dropTarget === key ? "drop-target" : ""}`} key={key}
+        onDragOver={(event) => { if (draggedTask.current === null || busy) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropTarget(key); }}
+        onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDropTarget((current) => current === key ? null : current); }}
+        onDrop={(event) => moveTask(event, section.id)}>
+        <button type="button" className="task-section-heading" aria-expanded={!section.collapsed} aria-controls={`task-section-${key}`} disabled={Boolean(busy)} onClick={() => toggleSection(section)}><span aria-hidden="true">{section.collapsed ? "▸" : "▾"}</span><strong>{section.name}</strong><span className="task-section-count">{sectionTasks.length}</span></button>
+        <div id={`task-section-${key}`} className="card-list task-section-body" hidden={section.collapsed}>{sectionTasks.length ? sectionTasks.map(renderTask) : <div className="empty">Sem tarefas nesta vista. Arrasta uma tarefa para aqui.</div>}</div>
+      </section>;
+    })}</div> : <div className="card-list">{visible.length ? visible.map(renderTask) : <div className="empty">Não existem tarefas nesta vista.</div>}</div>}
   </>;
 }
 
@@ -200,7 +304,12 @@ function Meetings({ sessions, refresh, onError, target, onTargetHandled, onNotic
   const retryProcessing = () => run("retry", () => api(`/sessions/${selected.id}/retry_processing/`, { method: "POST" }));
   const cancelProcessing = () => run("cancel", () => api(`/sessions/${selected.id}/cancel_processing/`, { method: "POST" }));
   const regenerateSummary = () => run("summary", () => api(`/sessions/${selected.id}/regenerate_summary/`, { method: "POST" }));
-  const retranscribe = () => window.confirm("Voltar a transcrever substituirá a transcrição e o resumo atuais. Continuar?") && run("retranscribe", () => api(`/sessions/${selected.id}/retranscribe/`, { method: "POST" }));
+  const regenerateTasks = () => run("tasks", () => api(
+    `/sessions/${selected.id}/regenerate_tasks/`, { method: "POST" }
+  ));
+    const retranscribe = () => window.confirm(
+    "Voltar a transcrever substituirá apenas a transcrição. O resumo e as tarefas não serão recalculados. Continuar?"
+  ) && run("retranscribe", () => api(`/sessions/${selected.id}/retranscribe/`, { method: "POST" }));
   const deleteMeeting = async () => {
     if (!window.confirm("Eliminar esta reunião, a transcrição e o resumo? Esta ação não pode ser anulada.")) return;
     setBusy("delete");
@@ -237,7 +346,23 @@ function Meetings({ sessions, refresh, onError, target, onTargetHandled, onNotic
   if (selected) return <div>
     <button className="back" onClick={() => setSelected(null)}>← Todas as reuniões</button>
     <div className="meeting-title"><div className="title-editor">{editingTitle ? <input value={title} onChange={(event) => setTitle(event.target.value)} autoFocus/> : <h2>{selected.title || "Reunião sem título"}</h2>}<p>{new Date(selected.started_at).toLocaleString()}</p></div><div className="meeting-actions">{editingTitle ? <><button onClick={saveTitle} disabled={!title.trim() || busy === "rename"}>{busy === "rename" && <Spinner/>}Concluir</button><button onClick={() => { setTitle(selected.title); setEditingTitle(false); }}>Cancelar</button></> : <button onClick={() => setEditingTitle(true)}>Editar</button>}<details><summary>Exportar</summary><div className="export-menu"><button onClick={exportMarkdown} disabled={busy === "markdown"}>Markdown</button><button onClick={exportHtml} disabled={busy === "html"}>HTML</button><button onClick={exportPdf} disabled={busy === "pdf"}>PDF</button></div></details><button className="danger" onClick={deleteMeeting} disabled={busy === "delete"}>{busy === "delete" && <Spinner/>}Eliminar</button></div></div>
-    <div className="meeting-meta"><div className="processing-actions"><ProcessingBadge processing={selected.processing} onRetry={retryProcessing} onCancel={cancelProcessing} retrying={busy === "retry"} cancelling={busy === "cancel"}/><button onClick={regenerateSummary} disabled={busy === "summary" || ["pending", "processing"].includes(selected.processing.state)}>{busy === "summary" && <Spinner/>}Voltar a gerar resumo</button><button onClick={retranscribe} disabled={busy === "retranscribe" || !selected.processing.retranscription_available}>{busy === "retranscribe" && <Spinner/>}Voltar a transcrever</button></div><label>Idioma <select value={selected.language || ""} onChange={(event) => setLanguage(event.target.value)} disabled={busy === "language"}><option value="" disabled>Deteção automática</option><option value="pt">Português</option><option value="en">English</option></select></label></div>
+    <div className="meeting-meta"><div className="processing-actions"><ProcessingBadge processing={selected.processing} onRetry={retryProcessing} onCancel={cancelProcessing} retrying={busy === "retry"} cancelling={busy === "cancel"}/><details className="processing-menu">
+  <summary>Reprocessar</summary>
+  <div className="export-menu">
+    <button onClick={retranscribe}
+      disabled={busy === "retranscribe" || !selected.processing.retranscription_available}>
+      {busy === "retranscribe" && <Spinner/>}Voltar a transcrever
+    </button>
+    <button onClick={regenerateSummary}
+      disabled={busy === "summary" || ["pending", "processing"].includes(selected.processing.state)}>
+      {busy === "summary" && <Spinner/>}Voltar a resumir
+    </button>
+    <button onClick={regenerateTasks}
+      disabled={busy === "tasks" || ["pending", "processing"].includes(selected.processing.state)}>
+      {busy === "tasks" && <Spinner/>}Voltar a criar tarefas
+    </button>
+  </div>
+</details></div><label>Idioma <select value={selected.language || ""} onChange={(event) => setLanguage(event.target.value)} disabled={busy === "language"}><option value="" disabled>Deteção automática</option><option value="pt">Português</option><option value="en">English</option></select></label></div>
     {selected.summaries.length === 0 && <article className="card summary pending-summary">{!["failed", "cancelled"].includes(selected.processing.state) && <Spinner/>}<p>{selected.processing.state === "failed" ? "Não foi possível gerar o resumo. Usa Repetir para tentar novamente." : selected.processing.state === "cancelled" ? "O processamento desta reunião foi cancelado." : "O resumo aparecerá quando o processamento terminar."}</p></article>}
     {selected.summaries.map((summary) => <SummaryCard summary={summary} key={summary.id}/>)}
     {selected.speakers.length > 0 && <article className="card participants"><h3>Participantes</h3>{selected.speakers.map((speaker) => { const isEditing = editingSpeaker?.id === speaker.id; return <div className="participant-row" key={speaker.id}><div className="participant-field"><span>{speaker.kind === "self" ? "A minha voz" : "Participante"}</span>{isEditing ? <input value={editingSpeaker.label} onChange={(event) => setEditingSpeaker({ ...editingSpeaker, label: event.target.value })} autoFocus/> : <strong>{speaker.label}</strong>}</div><div className="participant-actions">{isEditing ? <><button className="text-button" onClick={() => saveSpeaker(speaker)} disabled={!editingSpeaker.label.trim() || busy === `speaker-${speaker.id}`}>Concluir</button><button className="text-button secondary-text" onClick={() => setEditingSpeaker(null)}>Cancelar</button></> : <button className="text-button" onClick={() => setEditingSpeaker({ id: speaker.id, label: speaker.label })}>Editar</button>}{speaker.kind !== "self" && speaker.label !== "Outros" && !isEditing && <button className="text-button" onClick={() => mergeSpeaker(speaker)} disabled={busy === `merge-${speaker.id}`}>{busy === `merge-${speaker.id}` && <Spinner/>}Fundir em Outros</button>}</div></div>; })}</article>}
@@ -255,7 +380,7 @@ function Meetings({ sessions, refresh, onError, target, onTargetHandled, onNotic
   return <div className="card-list">{sessions.map((session) => <button className="card meeting-card" onClick={() => open(session.id)} key={session.id}><div><h3>{session.title || "Reunião sem título"}</h3><p>{new Date(session.started_at).toLocaleString()} · {session.status} · {session.language?.toUpperCase() || "A detetar idioma"}</p></div><ProcessingBadge processing={session.processing}/></button>)}</div>;
 }
 
-function Settings({ microphoneId, setMicrophoneId, onError }) {
+function Settings({ microphoneId, setMicrophoneId, keepDisplayAwake, setKeepDisplayAwake, onError }) {
   const [devices, setDevices] = useState([]), [launchAtLogin, setLaunchAtLogin] = useState(false), [retentionDays, setRetentionDays] = useState(7), [maxGb, setMaxGb] = useState(5), [logHours, setLogHours] = useState(24), [defaultLanguage, setDefaultLanguage] = useState("pt"), [glossary, setGlossary] = useState(""), [aiModel, setAiModel] = useState(""), [ollamaAvailable, setOllamaAvailable] = useState(false), [busy, setBusy] = useState(false);
   useEffect(() => {
     navigator.mediaDevices?.enumerateDevices().then((items) => setDevices(items.filter((item) => item.kind === "audioinput"))).catch(console.error);
@@ -270,16 +395,27 @@ function Settings({ microphoneId, setMicrophoneId, onError }) {
       default_language: defaultLanguage, transcription_glossary: glossary,
     } }) }); } catch (error) { onError(error.message); } finally { setBusy(false); }
   };
-  return <article className="settings-grid card"><div><label>Modelo para resumos, tarefas e perguntas à IA</label><strong>{aiModel || "A carregar…"} · {ollamaAvailable ? "Disponível" : "Indisponível"}</strong></div><div><label>Modelo de transcrição</label><strong>Faster Whisper Medium · PT/EN</strong></div><div><label>Microfone</label><select value={microphoneId} onChange={(event) => setMicrophoneId(event.target.value)}><option value="">Predefinido do Windows</option>{devices.map((device) => <option value={device.deviceId} key={device.deviceId}>{device.label || "Microfone"}</option>)}</select></div><div><label>Idioma para reuniões curtas</label><select value={defaultLanguage} onChange={(event) => setDefaultLanguage(event.target.value)}><option value="pt">Português</option><option value="en">English</option></select></div><div className="settings-limits wide"><label>Retenção máxima (dias)<input type="number" min="1" max="7" value={retentionDays} onChange={(event) => setRetentionDays(event.target.value)}/></label><label>Limite de áudio (GB)<input type="number" min="1" value={maxGb} onChange={(event) => setMaxGb(event.target.value)}/></label><label>Janela dos logs (horas)<input type="number" min="1" value={logHours} onChange={(event) => setLogHours(event.target.value)}/></label></div><div className="wide"><label>Glossário de nomes, empresas e siglas</label><textarea value={glossary} onChange={(event) => setGlossary(event.target.value)} placeholder="Warpcom, SecureNet, onboarding, Oracle…"/></div><label className="toggle"><input type="checkbox" checked={launchAtLogin} onChange={(event) => setLaunchAtLogin(event.target.checked)}/> Iniciar com o Windows</label><button className="save" onClick={save} disabled={busy}>{busy && <Spinner/>}Guardar definições</button></article>;
+  return <article className="settings-grid card"><div><label>Modelo para resumos, tarefas e perguntas à IA</label><strong>{aiModel || "A carregar…"} · {ollamaAvailable ? "Disponível" : "Indisponível"}</strong></div><div><label>Modelo de transcrição</label><strong>Faster Whisper Medium · PT/EN</strong></div><div><label>Microfone</label><select value={microphoneId} onChange={(event) => setMicrophoneId(event.target.value)}><option value="">Predefinido do Windows</option>{devices.map((device) => <option value={device.deviceId} key={device.deviceId}>{device.label || "Microfone"}</option>)}</select></div><div><label>Idioma para reuniões curtas</label><select value={defaultLanguage} onChange={(event) => setDefaultLanguage(event.target.value)}><option value="pt">Português</option><option value="en">English</option></select></div><div className="settings-limits wide"><label>Retenção máxima (dias)<input type="number" min="1" max="7" value={retentionDays} onChange={(event) => setRetentionDays(event.target.value)}/></label><label>Limite de áudio (GB)<input type="number" min="1" value={maxGb} onChange={(event) => setMaxGb(event.target.value)}/></label><label>Janela dos logs (horas)<input type="number" min="1" value={logHours} onChange={(event) => setLogHours(event.target.value)}/></label></div><div className="wide"><label>Glossário de nomes, empresas e siglas</label><textarea value={glossary} onChange={(event) => setGlossary(event.target.value)} placeholder="Warpcom, SecureNet, onboarding, Oracle…"/></div><label className="toggle"><input type="checkbox" checked={launchAtLogin} onChange={(event) => setLaunchAtLogin(event.target.checked)}/> Iniciar com o Windows</label><label className="toggle">
+  <input type="checkbox" checked={keepDisplayAwake}
+    onChange={(event) => setKeepDisplayAwake(event.target.checked)}/>
+  Manter o ecrã ativo
+</label><button className="save" onClick={save} disabled={busy}>{busy && <Spinner/>}Guardar definições</button></article>;
 }
 
 export default function App() {
-  const [view, setView] = useState("Hoje"), [tasks, setTasks] = useState([]), [sessions, setSessions] = useState([]), [summaries, setSummaries] = useState([]), [logs, setLogs] = useState([]), [meetingCapture, setMeetingCapture] = useState(null), [activeListening, setActiveListening] = useState(null), [activeEnabled, setActiveEnabled] = useState(() => localStorage.getItem("activeListeningEnabled") !== "false"), [error, setError] = useState(""), [query, setQuery] = useState(""), [results, setResults] = useState(null), [chatAnswer, setChatAnswer] = useState(null), [notice, setNotice] = useState(""), [asking, setAsking] = useState(false), [dailyJob, setDailyJob] = useState(null), [dailyDate, setDailyDate] = useState(localDateValue), [captureBusy, setCaptureBusy] = useState(false), [microphoneId, setMicrophoneId] = useState(() => localStorage.getItem("microphoneDeviceId") || ""), [meetingTarget, setMeetingTarget] = useState(null), [meetingsKey, setMeetingsKey] = useState(0);
+  const [view, setView] = useState("Hoje"), [tasks, setTasks] = useState([]), [taskSections, setTaskSections] = useState([]), [sessions, setSessions] = useState([]), [summaries, setSummaries] = useState([]), [logs, setLogs] = useState([]), [meetingCapture, setMeetingCapture] = useState(null), [activeListening, setActiveListening] = useState(null), [activeEnabled, setActiveEnabled] = useState(() => localStorage.getItem("activeListeningEnabled") !== "false"), [error, setError] = useState(""), [query, setQuery] = useState(""), [results, setResults] = useState(null), [chatAnswer, setChatAnswer] = useState(null), [notice, setNotice] = useState(""), [asking, setAsking] = useState(false), [dailyJob, setDailyJob] = useState(null), [dailyDate, setDailyDate] = useState(localDateValue), [captureBusy, setCaptureBusy] = useState(false), [microphoneId, setMicrophoneId] = useState(() => localStorage.getItem("microphoneDeviceId") || ""), [meetingTarget, setMeetingTarget] = useState(null), [meetingsKey, setMeetingsKey] = useState(0);
+  const [keepDisplayAwake, setKeepDisplayAwake] = useState(
+    () => localStorage.getItem("keepDisplayAwake") === "true"
+  ); 
   const activeController = useRef(null), activeStarting = useRef(false), meetingStarting = useRef(false), activeRequested = useRef(activeEnabled);
   const notificationState = useRef({ initialized: false, taskIds: new Set(), summaryIds: new Set() });
+  useEffect(() => {
+    localStorage.setItem("keepDisplayAwake", String(keepDisplayAwake));
+    window.notetaker?.setDisplayAwake(keepDisplayAwake);
+  }, [keepDisplayAwake]);
   const refresh = useCallback(async () => {
     try {
-      const [nextTasks, nextSessions, nextSummaries, nextLogs] = await Promise.all([api("/tasks/"), api("/sessions/"), api("/summaries/"), api("/active-listening-logs/")]);
+      const [nextTasks, nextSessions, nextSummaries, nextLogs, nextSections] = await Promise.all([api("/tasks/"), api("/sessions/"), api("/summaries/"), api("/active-listening-logs/"), api("/task-sections/")]);
       const tracked = notificationState.current;
       const nextTaskIds = new Set(nextTasks.map((task) => task.id));
       const nextSummaryIds = new Set(nextSummaries.map((summary) => summary.id));
@@ -301,6 +437,7 @@ export default function App() {
         tracked.taskIds = nextTaskIds;
       }
       setTasks(nextTasks);
+      setTaskSections(nextSections);
       setSessions(nextSessions);
       setSummaries(nextSummaries);
       setLogs(nextLogs);
@@ -414,5 +551,6 @@ export default function App() {
   const latestDaily = useMemo(() => summaries.find((item) => item.kind === "daily"), [summaries]);
   return <main className="shell"><aside><div className="brand"><span className="brand-mark">N</span><strong>My AI Notetaker</strong></div><nav>{VIEWS.map((item) => <button className={view === item ? "active" : ""} onClick={() => selectView(item)} key={item}>{item}</button>)}</nav><div className="privacy"><span className={activeListening || meetingCapture ? "live-dot" : "idle-dot"}/>{meetingCapture ? "Reunião em curso" : activeListening ? "Escuta ativa" : "Captura pausada"}</div></aside><section className="content"><header><div><p className="eyebrow">OFFLINE · PRIVADO</p><h1>{view}</h1></div><div className="header-actions"><div className="daily-summary-button"><button onClick={() => generateDaily(localDateValue())} disabled={Boolean(dailyJob)}>{dailyJob && <Spinner/>}Resumo do dia</button><details><summary aria-label="Escolher data do resumo">▾</summary><form onSubmit={generateSelectedDaily}><strong>Escolher outro dia</strong><input type="date" max={localDateValue()} value={dailyDate} onChange={(event) => setDailyDate(event.target.value)}/><button disabled={!dailyDate || Boolean(dailyJob)}>Gerar resumo</button></form></details></div><button className={`listening ${activeListening ? "active" : ""}`} onClick={toggleActiveListening} disabled={captureBusy || Boolean(meetingCapture)}>{activeEnabled ? "Desativar escuta" : "Ativar escuta"}</button><button className={`capture ${meetingCapture ? "active" : ""}`} onClick={toggleMeeting} disabled={captureBusy}>{captureBusy && <Spinner/>}{meetingCapture ? "Terminar reunião" : "Iniciar reunião"}</button></div></header>
     {error && <div className="error">{error}<button onClick={() => setError("")}>×</button></div>}{notice && <div className="notice">{notice}<button onClick={() => setNotice("")}>×</button></div>}
-    {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList tasks={tasks} refresh={refresh} onError={setError}/>} {view === "Reuniões" && <Meetings key={meetingsKey} sessions={sessions} refresh={refresh} onError={setError} target={meetingTarget} onTargetHandled={handleMeetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{chatAnswer && <article className="card answer"><h3>Resposta</h3><p>{chatAnswer.answer}</p>{chatAnswer.sources?.length ? <div className="answer-sources"><strong>Fontes</strong>{chatAnswer.sources.map((source) => <button key={source.segment_id || source.id} onClick={() => openSource(source)}><span>{source.meeting_title} · {source.speaker}</span><small>{source.text}</small></button>)}</div> : <small>Fontes: sem evidência suficiente</small>}</article>}{results && <SearchResults results={results} onOpenSegment={openSearchSegment}/>}</>} {view === "Definições" && <Settings microphoneId={microphoneId} setMicrophoneId={setMicrophoneId} onError={setError}/>} {view === "Logs" && <ListeningLogs logs={logs}/>}</section></main>;
+    {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList tasks={tasks} sections={taskSections} showSections={view === "Tarefas"} refresh={refresh} onError={setError}/>} {view === "Reuniões" && <Meetings key={meetingsKey} sessions={sessions} refresh={refresh} onError={setError} target={meetingTarget} onTargetHandled={handleMeetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{chatAnswer && <article className="card answer"><h3>Resposta</h3><p>{chatAnswer.answer}</p>{chatAnswer.sources?.length ? <div className="answer-sources"><strong>Fontes</strong>{chatAnswer.sources.map((source) => <button key={source.segment_id || source.id} onClick={() => openSource(source)}><span>{source.meeting_title} · {source.speaker}</span><small>{source.text}</small></button>)}</div> : <small>Fontes: sem evidência suficiente</small>}</article>}{results && <SearchResults results={results} onOpenSegment={openSearchSegment}/>}</>} {view === "Definições" && <Settings microphoneId={microphoneId} setMicrophoneId={setMicrophoneId}
+  keepDisplayAwake={keepDisplayAwake} setKeepDisplayAwake={setKeepDisplayAwake} onError={setError}/>} {view === "Logs" && <ListeningLogs logs={logs}/>}</section></main>;
 }

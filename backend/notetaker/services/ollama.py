@@ -35,6 +35,15 @@ Open questions must only contain questions or unresolved issues explicitly prese
 The summary must contain substantive information, not a title or date label. Empty entries are forbidden.
 """
 
+MEETING_ANALYSIS_SYSTEM_PROMPT = """You are a private offline meeting assistant. Return only JSON.
+Analyze one chronological transcript part once, using only explicitly supported information.
+Put compact factual notes in summary, using at most 120 words. Return at most 6 explicit decisions,
+6 explicit open questions and 4 explicit actionable tasks. Never infer missing owners, dates or outcomes.
+For tasks, keep titles under 12 words, descriptions under 15 words and evidence under 100 characters.
+Evidence must be copied verbatim from the transcript. Use empty strings for unknown optional task fields.
+Use the requested language.
+"""
+
 CHAT_SYSTEM_PROMPT = """You are a private offline meeting assistant. Return only JSON.
 Answer exclusively from the supplied context. If evidence is insufficient, say so clearly.
 Keep citation segment identifiers exact and write in the language of the question.

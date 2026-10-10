@@ -25,7 +25,10 @@ from notetaker.models import (
 
 from .dates import parse_spoken_date
 from .diarization import diarize_session
-from .ollama import ACTIVE_LISTENING_SYSTEM_PROMPT, EXTRACTION_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT, OllamaError, generate_json
+from .ollama import (
+    ACTIVE_LISTENING_SYSTEM_PROMPT, EXTRACTION_SYSTEM_PROMPT, MEETING_ANALYSIS_SYSTEM_PROMPT,
+    SUMMARY_SYSTEM_PROMPT, OllamaError, generate_json,
+)
 from .transcription import detect_language, transcribe
 
 
@@ -132,6 +135,29 @@ TASK_SCHEMA = {
     "additionalProperties": False,
 }
 
+MEETING_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "decisions": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {"type": "string"},
+        },
+        "open_questions": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {"type": "string"},
+        },
+        "tasks": {
+            "type": "array",
+            "maxItems": 4,
+            "items": TASK_SCHEMA["properties"]["tasks"]["items"],
+        },
+    },
+    "required": ["summary", "decisions", "open_questions", "tasks"],
+    "additionalProperties": False,
+}
 
 def recover_stale_jobs(max_age_minutes=15):
     """Requeue work abandoned by an interrupted backend without touching active inference."""
@@ -306,43 +332,14 @@ def process_transcription_job(job: ProcessingJob):
         chunk.save(update_fields=["status", "error"])
 
 
-def process_extraction_job(job: ProcessingJob):
-    """Run Ollama outside the short transaction used to save extracted work."""
-    segments = list(
-        TranscriptSegment.objects.filter(session=job.session)
-        .select_related("speaker", "chunk", "session")
-    )
-    segments.sort(key=transcript_segment_sort_key)
-    transcript = "\n".join(f"[{s.speaker.label if s.speaker else 'Unknown'}] {s.text}" for s in segments)
-    if not transcript:
-        return
-    language = job.session.language or CaptureSession.Language.PORTUGUESE
-    requested_language = "Portuguese" if language == "pt" else "English"
-    pieces = _analysis_chunks(transcript, limit=8000)
-    results = []
-    for index, piece in enumerate(pieces):
-        _ensure_job_active(job.pk)
-        results.append(generate_json(
-            f"Extract actionable tasks from part {index + 1} of {len(pieces)}. "
-            f"Write in {requested_language}.\n{piece}",
-            TASK_SCHEMA,
-            system_prompt=EXTRACTION_SYSTEM_PROMPT,
-            max_output_tokens=512,
-        ))
-        _set_job_progress(
-            job.pk,
-            10 + round(75 * (index + 1) / len(pieces)),
-            f"A extrair tarefas ({index + 1}/{len(pieces)})",
-        )
-        ProcessingJob.objects.filter(pk=job.pk).update(updated_at=timezone.now())
-
+def _persist_meeting_tasks(job, segments, transcript, items):
     with transaction.atomic():
         _ensure_job_active(job.pk)
         known_titles = {
             title.strip().casefold()
             for title in Task.objects.filter(session=job.session).values_list("title", flat=True)
         }
-        for item in (task for result in results for task in result.get("tasks", [])):
+        for item in items:
             title = str(item.get("title", "")).strip()
             normalized_title = title.casefold()
             evidence = str(item.get("evidence", "")).strip()
@@ -360,7 +357,7 @@ def process_extraction_job(job: ProcessingJob):
             source_segment = next(
                 (segment for segment in segments if evidence in segment.text or segment.text in evidence),
                 None,
-            )            
+            )
             task, _ = Task.objects.get_or_create(
                 session=job.session,
                 title=title,
@@ -380,6 +377,35 @@ def process_extraction_job(job: ProcessingJob):
             )
             if task.due_at and not task.due_is_ambiguous:
                 Reminder.objects.get_or_create(task=task, remind_at=task.due_at)
+
+def process_extraction_job(job: ProcessingJob):
+    """Run legacy meeting task extraction while saving each completed part immediately."""
+    segments = list(
+        TranscriptSegment.objects.filter(session=job.session)
+        .select_related("speaker", "chunk", "session")
+    )
+    segments.sort(key=transcript_segment_sort_key)
+    transcript = "\n".join(f"[{s.speaker.label if s.speaker else 'Unknown'}] {s.text}" for s in segments)
+    if not transcript:
+        return
+    language = job.session.language or CaptureSession.Language.PORTUGUESE
+    requested_language = "Portuguese" if language == "pt" else "English"
+    pieces = _analysis_chunks(transcript, limit=8000)
+    for index, piece in enumerate(pieces):
+        _ensure_job_active(job.pk)
+        result = generate_json(
+            f"Extract actionable tasks from part {index + 1} of {len(pieces)}. "
+            f"Write in {requested_language}.\n{piece}",
+            TASK_SCHEMA,
+            system_prompt=EXTRACTION_SYSTEM_PROMPT,
+            max_output_tokens=512,
+        )
+        _persist_meeting_tasks(job, segments, transcript, result.get("tasks", []))
+        _set_job_progress(
+            job.pk,
+            10 + round(75 * (index + 1) / len(pieces)),
+            f"A extrair tarefas ({index + 1}/{len(pieces)})",
+        )
 
 
 def process_active_listening_job(job: ProcessingJob):
@@ -537,6 +563,51 @@ def _summarize_material(material: str, label: str, language: str, heartbeat=None
     result["open_questions"] = _clean_list(result.get("open_questions"))
     return result
 
+def _analyze_meeting_transcript(job, transcript, segments, prompt_label, language):
+    requested_language = "Portuguese" if language == "pt" else "English"
+    pieces = _analysis_chunks(transcript, limit=8000)
+    partials = []
+    for index, piece in enumerate(pieces):
+        _set_job_progress(
+            job.pk,
+            10 + round(65 * index / len(pieces)),
+            f"A analisar parte {index + 1}/{len(pieces)}",
+        )
+        result = generate_json(
+            f"Analyze part {index + 1}/{len(pieces)} of the {prompt_label}. "
+            f"Write in {requested_language}.\n{piece}",
+            MEETING_ANALYSIS_SCHEMA,
+            system_prompt=MEETING_ANALYSIS_SYSTEM_PROMPT,
+            max_output_tokens=768,
+        )
+        _persist_meeting_tasks(job, segments, transcript, result.get("tasks", []))
+        partials.append({
+            "summary": str(result.get("summary", "")).strip(),
+            "decisions": _clean_list(result.get("decisions")),
+            "open_questions": _clean_list(result.get("open_questions")),
+        })
+        _set_job_progress(
+            job.pk,
+            10 + round(65 * (index + 1) / len(pieces)),
+            f"A analisar parte {index + 1}/{len(pieces)}",
+        )
+
+    consolidated = "\n\n".join(
+        "\n".join([
+            f"Part {index + 1}: {partial.get('summary', '')}",
+            f"Decisions: {'; '.join(partial.get('decisions', []))}",
+            f"Open questions: {'; '.join(partial.get('open_questions', []))}",
+        ])
+        for index, partial in enumerate(partials)
+    )
+    _set_job_progress(job.pk, 80, "A consolidar o resumo")
+    return _summarize_material(
+        consolidated,
+        f"complete {prompt_label} from chronological factual notes",
+        language,
+        heartbeat=lambda: _ensure_job_active(job.pk, touch=True),
+    )
+
 def _summarize_complete_transcript(job, transcript, prompt_label, language):
     """Map every transcript part and reduce partial results into one summary."""
     pieces = _analysis_chunks(transcript)
@@ -632,8 +703,11 @@ def process_summary_job(job: ProcessingJob):
         )
     if not transcript.strip():
         raise RuntimeError("No transcript is available to generate the summary.")
-    _set_job_progress(job.pk, 25, "A analisar com IA")
-    result = _summarize_complete_transcript(job, transcript, prompt_label, language)
+    _set_job_progress(job.pk, 10, "A analisar com IA")
+    if job.session_id and job.progress_phase == "combined":
+        result = _analyze_meeting_transcript(job, transcript, segments, prompt_label, language)
+    else:
+        result = _summarize_complete_transcript(job, transcript, prompt_label, language)
     _set_job_progress(job.pk, 90, "A guardar o resumo")
     with transaction.atomic():
         _ensure_job_active(job.pk)
@@ -690,7 +764,20 @@ def process_job(job: ProcessingJob):
                 status=ProcessingJob.Status.PENDING,
                 session=job.session,
                 summary_date=job.summary_date,
-            ).exclude(pk=job.pk).update(status=ProcessingJob.Status.COMPLETE, error="Superseded by a consolidated job.")
+            ).exclude(pk=job.pk).update(
+                status=ProcessingJob.Status.COMPLETE,
+                error="Superseded by a consolidated job.",
+            )
+            if job.session_id:
+                ProcessingJob.objects.filter(
+                    kind=ProcessingJob.Kind.EXTRACT,
+                    status=ProcessingJob.Status.PENDING,
+                    session=job.session,
+                ).update(
+                    status=ProcessingJob.Status.CANCELLED,
+                    error="Substituído pela análise conjunta da reunião.",
+                    updated_at=timezone.now(),
+                )
         if job.kind == ProcessingJob.Kind.TRANSCRIBE:
             process_transcription_job(job)
         elif job.kind == ProcessingJob.Kind.ACTIVE_LISTEN:
@@ -726,8 +813,7 @@ def process_job(job: ProcessingJob):
             ).update(status=AudioChunk.Status.FAILED, error=job.error)
         if job.status == ProcessingJob.Status.FAILED and job.session_id:
             downstream = {
-                ProcessingJob.Kind.DIARIZE: [ProcessingJob.Kind.SUMMARIZE, ProcessingJob.Kind.EXTRACT],
-                ProcessingJob.Kind.SUMMARIZE: [ProcessingJob.Kind.EXTRACT],
+                ProcessingJob.Kind.DIARIZE: [ProcessingJob.Kind.SUMMARIZE],
             }.get(job.kind, [])
             ProcessingJob.objects.filter(
                 session_id=job.session_id,

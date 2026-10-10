@@ -16,6 +16,7 @@ from .models import (
     Speaker,
     Summary,
     Task,
+    TaskSection,
     TranscriptSegment,
     transcript_segment_sort_key,
 )
@@ -161,7 +162,7 @@ class CaptureSessionSerializer(serializers.ModelSerializer):
             )
         current_job = transcription_job if active_chunks and transcription_job else active_job or queued_job
         job_messages = {
-            ProcessingJob.Kind.SUMMARIZE: "A gerar resumo",
+            ProcessingJob.Kind.SUMMARIZE: "A analisar reunião",
             ProcessingJob.Kind.EXTRACT: "A criar tarefas",
             ProcessingJob.Kind.DIARIZE: "A identificar participantes",
         }
@@ -256,6 +257,15 @@ class NoteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Note
         fields = "__all__"
+
+
+class TaskSectionSerializer(serializers.ModelSerializer):
+    """Validate custom section names and expose their collapsed state."""
+
+    class Meta:
+        model = TaskSection
+        fields = ("id", "name", "collapsed", "created_at")
+        read_only_fields = ("created_at",)
 
 
 class TaskSerializer(serializers.ModelSerializer):

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from django.conf import settings
 from django.db import transaction
+from django.db.models import F
 from django.http import HttpResponse
 from django.utils.html import escape
 from django.utils.dateparse import parse_date, parse_datetime
@@ -24,6 +25,7 @@ from .models import (
     Speaker,
     Summary,
     Task,
+    TaskSection,
     TranscriptSegment,
     transcript_segment_sort_key,
 )
@@ -38,6 +40,7 @@ from .serializers import (
     SpeakerSerializer,
     SummarySerializer,
     TaskSerializer,
+    TaskSectionSerializer,
     TranscriptSegmentSerializer,
 )
 from .services.ollama import health as ollama_health
@@ -107,14 +110,17 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
         for kind in (
             # ProcessingJob.Kind.DIARIZE, # comentado temporariamente para testar se fica mais rapido
             ProcessingJob.Kind.SUMMARIZE,
-            ProcessingJob.Kind.EXTRACT,
         ):
             if not ProcessingJob.objects.filter(
                 kind=kind,
                 session=session,
                 status__in=[ProcessingJob.Status.PENDING, ProcessingJob.Status.RUNNING],
             ).exists():
-                ProcessingJob.objects.create(kind=kind, session=session)
+                ProcessingJob.objects.create(
+                    kind=kind,
+                    session=session,
+                    progress_phase="combined",
+                )
         return Response(self.get_serializer(session).data)
 
     @action(detail=True, methods=["post"])
@@ -128,7 +134,6 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
         phases = [
             # ProcessingJob.Kind.DIARIZE, # comentado temporariamente para testar se fica mais rapido
             ProcessingJob.Kind.SUMMARIZE,
-            ProcessingJob.Kind.EXTRACT,
         ]
         latest = {
             kind: ProcessingJob.objects.filter(session=session, kind=kind).order_by("-created_at").first()
@@ -184,6 +189,28 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
         return Response({"job_id": job.id, "status": job.status}, status=status.HTTP_202_ACCEPTED)
 
     @action(detail=True, methods=["post"])
+    def regenerate_tasks(self, request, pk=None):
+        session = self.get_object()
+        if session.audio_chunks.exclude(status=AudioChunk.Status.COMPLETE).exists():
+            return Response(
+                {"detail": "A transcrição ainda não terminou."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if ProcessingJob.objects.filter(
+            session=session,
+            status__in=[ProcessingJob.Status.PENDING, ProcessingJob.Status.RUNNING],
+        ).exists():
+            return Response(
+                {"detail": "Já existe processamento em curso nesta sessão."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        job = ProcessingJob.objects.create(
+            kind=ProcessingJob.Kind.EXTRACT,
+            session=session,
+        )
+        return Response({"job_id": job.id, "status": job.status}, status=status.HTTP_202_ACCEPTED)
+    
+    @action(detail=True, methods=["post"])
     def retranscribe(self, request, pk=None):
         """Replace only derived transcript data when all original audio remains local."""
         session = self.get_object()
@@ -203,7 +230,6 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
             )
         with transaction.atomic():
             session.segments.all().delete()
-            session.summaries.all().delete()
             for chunk in chunks:
                 chunk.status = AudioChunk.Status.PENDING
                 chunk.error = ""
@@ -349,6 +375,14 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
         return response
 
 
+class TaskSectionViewSet(viewsets.ModelViewSet):
+    """Create and update task sections without exposing section deletion."""
+
+    queryset = TaskSection.objects.all()
+    serializer_class = TaskSectionSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+
 class TaskViewSet(viewsets.ModelViewSet):
     queryset = Task.objects.select_related("session", "source_segment").all()
     serializer_class = TaskSerializer
@@ -361,7 +395,8 @@ class TaskViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(status=task_status)
         if owner:
             queryset = queryset.filter(owner=owner)
-        return queryset
+        # Dated tasks come first; missing deadlines fall back to newest creation.
+        return queryset.order_by(F("due_at").asc(nulls_last=True), "-created_at", "-pk")
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):

@@ -15,8 +15,8 @@ const appDisplayName = "My AI Notetaker";
 const existingUserDataPath = path.join(app.getPath("appData"), "My Notetaker");
 let powerSaveBlockerId = null;
 
-function updatePowerSaveBlocker(state) {
-  const shouldBlock = state === "meeting" || state === "active-listening";
+function updatePowerSaveBlocker(enabled) {
+  const shouldBlock = Boolean(enabled);
   if (shouldBlock && powerSaveBlockerId === null) {
     powerSaveBlockerId = powerSaveBlocker.start("prevent-display-sleep");
   } else if (!shouldBlock && powerSaveBlockerId !== null) {
@@ -201,8 +201,11 @@ ipcMain.handle("export:text", async (_event, { content, defaultPath }) => {
 });
 ipcMain.on("capture:state", (_event, state) => {
   captureState = ["active-listening", "meeting"].includes(state) ? state : "paused";
-  updatePowerSaveBlocker(captureState);
   tray?.rebuild();
+});
+
+ipcMain.on("display-awake:set", (_event, enabled) => {
+  updatePowerSaveBlocker(enabled);
 });
 ipcMain.handle("login:get", () => app.getLoginItemSettings().openAtLogin);
 ipcMain.handle("login:set", (_event, enabled) => {

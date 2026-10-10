@@ -7,6 +7,7 @@ from . import views
 router = DefaultRouter()
 router.register("sessions", views.CaptureSessionViewSet)
 router.register("tasks", views.TaskViewSet)
+router.register("task-sections", views.TaskSectionViewSet)
 router.register("notes", views.NoteViewSet)
 router.register("segments", views.TranscriptSegmentViewSet)
 router.register("summaries", views.SummaryViewSet)

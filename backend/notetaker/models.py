@@ -123,6 +123,17 @@ class Note(models.Model):
         ordering = ["-updated_at"]
 
 
+class TaskSection(models.Model):
+    """Persist a named, collapsible horizontal group of tasks."""
+
+    name = models.CharField(max_length=120)
+    collapsed = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+
 class Task(models.Model):
     class CreationSource(models.TextChoices):
         MANUAL = "manual", "Manual"
@@ -156,6 +167,9 @@ class Task(models.Model):
     owner_name = models.CharField(max_length=120, blank=True)
     status = models.CharField(max_length=24, choices=Status.choices, default=Status.TODO)
     priority = models.CharField(max_length=12, choices=Priority.choices, default=Priority.NORMAL)
+    section = models.ForeignKey(
+        TaskSection, related_name="tasks", null=True, blank=True, on_delete=models.SET_NULL
+    )
     due_at = models.DateTimeField(null=True, blank=True)
     due_is_ambiguous = models.BooleanField(default=False)
     date_phrase = models.CharField(max_length=240, blank=True)
