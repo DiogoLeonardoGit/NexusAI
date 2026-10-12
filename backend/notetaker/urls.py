@@ -5,6 +5,8 @@ from . import views
 
 
 router = DefaultRouter()
+router.register("projects", views.ProjectViewSet)
+router.register("tags", views.TagViewSet)
 router.register("sessions", views.CaptureSessionViewSet)
 router.register("tasks", views.TaskViewSet)
 router.register("task-sections", views.TaskSectionViewSet)

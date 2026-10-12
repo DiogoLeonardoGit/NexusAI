@@ -1,7 +1,28 @@
 from django.db import models
 
 
+class Project(models.Model):
+    """Group meeting knowledge without owning or deleting its contents."""
+    name = models.CharField(max_length=120, unique=True)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+
+
+class Tag(models.Model):
+    """Reusable labels for meetings, notes and tasks."""
+    name = models.CharField(max_length=80, unique=True)
+
+    class Meta:
+        ordering = ["name"]
+
+
 class CaptureSession(models.Model):
+    project = models.ForeignKey(Project, null=True, blank=True, on_delete=models.SET_NULL)
+    tags = models.ManyToManyField(Tag, blank=True)
+
     class Language(models.TextChoices):
         PORTUGUESE = "pt", "Português"
         ENGLISH = "en", "English"
@@ -111,6 +132,9 @@ def transcript_segment_sort_key(segment):
 
 
 class Note(models.Model):
+    project = models.ForeignKey(Project, null=True, blank=True, on_delete=models.SET_NULL)
+    tags = models.ManyToManyField(Tag, blank=True)
+
     session = models.ForeignKey(
         CaptureSession, related_name="notes", null=True, blank=True, on_delete=models.SET_NULL
     )
@@ -135,6 +159,9 @@ class TaskSection(models.Model):
 
 
 class Task(models.Model):
+    project = models.ForeignKey(Project, null=True, blank=True, on_delete=models.SET_NULL)
+    tags = models.ManyToManyField(Tag, blank=True)
+
     class CreationSource(models.TextChoices):
         MANUAL = "manual", "Manual"
         SYSTEM = "system", "System"

@@ -335,6 +335,8 @@ def process_transcription_job(job: ProcessingJob):
 def _persist_meeting_tasks(job, segments, transcript, items):
     with transaction.atomic():
         _ensure_job_active(job.pk)
+        # Fetch current meeting organization, which may change during processing.
+        session = CaptureSession.objects.get(pk=job.session_id)
         known_titles = {
             title.strip().casefold()
             for title in Task.objects.filter(session=job.session).values_list("title", flat=True)
@@ -358,10 +360,11 @@ def _persist_meeting_tasks(job, segments, transcript, items):
                 (segment for segment in segments if evidence in segment.text or segment.text in evidence),
                 None,
             )
-            task, _ = Task.objects.get_or_create(
+            task, created = Task.objects.get_or_create(
                 session=job.session,
                 title=title,
                 defaults={
+                    "project": session.project,
                     "description": str(item.get("description", "")).strip(),
                     "owner": owner,
                     "owner_name": str(item.get("owner_name", ""))[:120],
@@ -375,6 +378,9 @@ def _persist_meeting_tasks(job, segments, transcript, items):
                     "creation_source": Task.CreationSource.SYSTEM,
                 },
             )
+            # Inherit labels once; preserve later manual task organization.
+            if created:
+                task.tags.set(session.tags.all())
             if task.due_at and not task.due_is_ambiguous:
                 Reminder.objects.get_or_create(task=task, remind_at=task.due_at)
 

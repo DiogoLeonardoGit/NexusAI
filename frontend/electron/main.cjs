@@ -14,6 +14,7 @@ const hasSingleInstanceLock = app.requestSingleInstanceLock();
 const appDisplayName = "My AI Notetaker";
 const existingUserDataPath = path.join(app.getPath("appData"), "My Notetaker");
 let powerSaveBlockerId = null;
+const activeNotifications = new Set();
 
 function updatePowerSaveBlocker(enabled) {
   const shouldBlock = Boolean(enabled);
@@ -172,7 +173,23 @@ app.whenReady().then(() => {
 
 ipcMain.handle("config:get", () => ({ apiBase, apiToken }));
 ipcMain.handle("notification:show", (_event, payload) => {
-  if (Notification.isSupported()) new Notification({ title: payload.title, body: payload.body }).show();
+  if (!Notification.isSupported()) return false;
+  const notification = new Notification({ title: payload.title, body: payload.body });
+  // Retain each notification until Windows dismisses it or delivers its click.
+  activeNotifications.add(notification);
+  const release = () => activeNotifications.delete(notification);
+  notification.on("close", release);
+  notification.on("failed", release);
+  notification.on("click", () => {
+    release();
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.webContents.send("notification:open", payload.target || {});
+  });
+  notification.show();
+  return true;
 });
 ipcMain.handle("export:pdf", async (_event, { defaultPath }) => {
   const suggestedPath = defaultPath

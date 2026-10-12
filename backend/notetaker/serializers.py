@@ -11,6 +11,8 @@ from .models import (
     AudioChunk,
     CaptureSession,
     Note,
+    Project,
+    Tag,
     ProcessingJob,
     Reminder,
     Speaker,
@@ -269,6 +271,10 @@ class TaskSectionSerializer(serializers.ModelSerializer):
 
 
 class TaskSerializer(serializers.ModelSerializer):
+    source_meeting_id = serializers.IntegerField(source="source_segment.session_id", read_only=True)
+    source_start_ms = serializers.IntegerField(source="source_segment.timeline_start_ms", read_only=True)
+    meeting_title = serializers.CharField(source="session.title", read_only=True)
+
     reminder_at = serializers.SerializerMethodField()
     reminder_status = serializers.SerializerMethodField()
     reminder_notified_at = serializers.SerializerMethodField()
@@ -325,4 +331,16 @@ class AppSettingSerializer(serializers.ModelSerializer):
 class ActiveListeningLogSerializer(serializers.ModelSerializer):
     class Meta:
         model = ActiveListeningLog
+        fields = "__all__"
+
+
+class ProjectSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Project
+        fields = "__all__"
+
+
+class TagSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Tag
         fields = "__all__"

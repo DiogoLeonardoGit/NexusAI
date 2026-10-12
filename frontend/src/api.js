@@ -18,7 +18,15 @@ export async function api(path, options = {}) {
   const response = await fetch(`${config.apiBase}${path}`, { ...options, headers });
   if (!response.ok) {
     const detail = await response.text();
-    throw new Error(detail || `API error ${response.status}`);
+    let message = `API error ${response.status}`;
+    try {
+      const payload = JSON.parse(detail);
+      // Field validation errors belong beside the form, not as raw JSON.
+      message = payload.detail || Object.entries(payload).map(([field, errors]) => `${field}: ${Array.isArray(errors) ? errors.join(" ") : String(errors)}`).join("; ") || message;
+    } catch {
+      message = detail.startsWith("<") ? `API error ${response.status}. Verifica o backend.` : detail || message;
+    }
+    throw new Error(message);
   }
   if (response.status === 204) return null;
   return response.json();
