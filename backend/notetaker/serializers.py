@@ -1,6 +1,7 @@
 from datetime import timedelta
 from pathlib import Path
 
+from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
@@ -13,6 +14,8 @@ from .models import (
     Note,
     Project,
     Tag,
+    GitLabTask,
+    GitLabLabel,
     ProcessingJob,
     Reminder,
     Speaker,
@@ -262,15 +265,43 @@ class NoteSerializer(serializers.ModelSerializer):
 
 
 class TaskSectionSerializer(serializers.ModelSerializer):
-    """Validate custom section names and expose their collapsed state."""
+    """Create a label-backed view; reuse the existing label catalogue."""
+
+    tag = serializers.PrimaryKeyRelatedField(queryset=Tag.objects.all(), required=False)
+    name = serializers.CharField(max_length=120, required=False)
 
     class Meta:
         model = TaskSection
-        fields = ("id", "name", "collapsed", "created_at")
+        fields = ("id", "name", "tag", "collapsed", "created_at")
         read_only_fields = ("created_at",)
+
+    def validate(self, attrs):
+        if self.instance and ("name" in attrs or "tag" in attrs):
+            raise serializers.ValidationError("Edita o nome através da etiqueta; esta vista só permite recolher/expandir.")
+        if not self.instance and not attrs.get("tag") and not attrs.get("name", "").strip():
+            raise serializers.ValidationError("Escolhe uma etiqueta ou indica um nome.")
+        if attrs.get("tag") and TaskSection.objects.filter(tag=attrs["tag"]).exists():
+            raise serializers.ValidationError("Já existe uma vista para esta etiqueta.")
+        return attrs
+
+    def create(self, validated_data):
+        with transaction.atomic():
+            tag = validated_data.pop("tag", None)
+            name = validated_data.pop("name", "").strip()
+            if tag is None:
+                tag, _ = Tag.objects.get_or_create(name=name)
+            if TaskSection.objects.filter(tag=tag).exists():
+                raise serializers.ValidationError("Já existe uma vista para esta etiqueta.")
+            return TaskSection.objects.create(tag=tag, name=tag.name[:120], **validated_data)
+
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        result["name"] = instance.tag.name
+        return result
 
 
 class TaskSerializer(serializers.ModelSerializer):
+    gitlab = serializers.SerializerMethodField()
     source_meeting_id = serializers.IntegerField(source="source_segment.session_id", read_only=True)
     source_start_ms = serializers.IntegerField(source="source_segment.timeline_start_ms", read_only=True)
     meeting_title = serializers.CharField(source="session.title", read_only=True)
@@ -279,6 +310,46 @@ class TaskSerializer(serializers.ModelSerializer):
     reminder_status = serializers.SerializerMethodField()
     reminder_notified_at = serializers.SerializerMethodField()
     reminder_minutes_before = serializers.SerializerMethodField()
+
+    def get_gitlab(self, instance):
+        try:
+            link = instance.gitlab
+        except GitLabTask.DoesNotExist:
+            return None
+        return {"web_url": link.web_url, "issue_iid": link.issue_iid, "project_id": link.project_id,
+                "active": link.active, "hidden": link.hidden, "pending": bool(link.pending),
+                "conflicts": link.conflicts, "error": link.error,
+                "available_tag_ids": list(GitLabLabel.objects.filter(connection=link.connection, project_id=link.project_id,
+                                                                       available=True).values_list("tag_id", flat=True))}
+
+    def validate(self, attrs):
+        if self.instance is None or not hasattr(self.instance, "gitlab"):
+            return attrs
+        link = self.instance.gitlab
+        if not link.active or link.hidden:
+            raise serializers.ValidationError("Esta tarefa deixou de estar atribuída a ti ou está oculta.")
+        if attrs.get("owner", "self") != "self" or attrs.get("status", "todo") not in {"todo", "done"}:
+            raise serializers.ValidationError("As tarefas GitLab mantêm o responsável Eu e estado aberta/concluída.")
+        if "tags" in attrs:
+            permitted = set(GitLabLabel.objects.filter(connection=link.connection, project_id=link.project_id,
+                                                      available=True).values_list("tag_id", flat=True))
+            # Existing unavailable labels can be kept or removed, but not newly added.
+            permitted.update(self.instance.tags.values_list("id", flat=True))
+            if any(tag.pk not in permitted for tag in attrs["tags"]):
+                raise serializers.ValidationError({"tags": "Escolhe etiquetas existentes neste projeto GitLab."})
+        return attrs
+
+    def update(self, instance, validated_data):
+        from .services.gitlab_sync import queue_task, sync_lock
+        with sync_lock, transaction.atomic():
+            instance = super().update(instance, validated_data)
+            if "status" in validated_data:
+                instance.completed_at = (instance.completed_at or timezone.now()) if instance.status == "done" else None
+                instance.save(update_fields=["completed_at"])
+                if instance.status == "done":
+                    instance.reminders.update(status=Reminder.Status.CANCELLED)
+            queue_task(instance)
+            return instance
 
     @staticmethod
     def _latest_reminder(instance):
@@ -341,6 +412,17 @@ class ProjectSerializer(serializers.ModelSerializer):
 
 
 class TagSerializer(serializers.ModelSerializer):
+    def validate_name(self, value):
+        if self.instance and value != self.instance.name and self.instance.gitlab_labels.exists():
+            raise serializers.ValidationError("As etiquetas importadas são geridas no catálogo GitLab.")
+        return value
+
+    def validate_color(self, value):
+        import re
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            raise serializers.ValidationError("Usa uma cor hexadecimal #RRGGBB.")
+        return value
+
     class Meta:
         model = Tag
         fields = "__all__"

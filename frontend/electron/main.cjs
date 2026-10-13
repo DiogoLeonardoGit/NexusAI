@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, Notification, Tray, desktopCapturer, dialog, ipcMain, nativeImage, session, powerSaveBlocker } = require("electron");
+const { app, BrowserWindow, Menu, Notification, Tray, desktopCapturer, dialog, ipcMain, nativeImage, session, powerSaveBlocker, safeStorage, shell } = require("electron");
 const { randomBytes } = require("crypto");
 const { spawn } = require("child_process");
 const path = require("path");
@@ -72,6 +72,7 @@ function startBackend() {
     ...process.env,
     NOTETAKER_API_TOKEN: apiToken,
     NOTETAKER_DATA_DIR: dataDir,
+    NOTETAKER_GITLAB_TOKEN: readGitLabToken(),
     WHISPER_MODEL: isDev
       ? path.join(projectRoot, "models", "faster-whisper-medium")
       : path.join(process.resourcesPath, "models", "faster-whisper-medium"),
@@ -172,6 +173,46 @@ app.whenReady().then(() => {
 });
 
 ipcMain.handle("config:get", () => ({ apiBase, apiToken }));
+
+// The token is encrypted by Windows and is never returned to the renderer.
+function readGitLabToken() {
+  const fs = require("fs");
+  const tokenPath = path.join(app.getPath("userData"), "gitlab-token.enc");
+  if (!fs.existsSync(tokenPath)) return "";
+  try {
+    if (!safeStorage.isEncryptionAvailable()) throw new Error("Encryption unavailable");
+    return safeStorage.decryptString(fs.readFileSync(tokenPath));
+  } catch {
+    console.error("Não foi possível desbloquear o token GitLab. Introduz novamente o token nas definições.");
+    return "";
+  }
+}
+
+ipcMain.handle("gitlab:token", async (event, value) => {
+  if (event.sender !== mainWindow?.webContents || typeof value !== "string" || value.length > 4096 || /[\r\n]/.test(value)) {
+    throw new Error("Pedido de credencial inválido.");
+  }
+  if (!safeStorage.isEncryptionAvailable()) throw new Error("Proteção de credenciais Windows indisponível.");
+  const fs = require("fs");
+  const tokenPath = path.join(app.getPath("userData"), "gitlab-token.enc");
+  const token = value.trim();
+  const response = await fetch(apiBase + "/gitlab/credentials/", {
+    method: "POST", headers: { "X-Local-Token": apiToken, "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (!response.ok) throw new Error("Não foi possível guardar a credencial no backend local.");
+  fs.mkdirSync(app.getPath("userData"), { recursive: true });
+  if (token) fs.writeFileSync(tokenPath, safeStorage.encryptString(token));
+  else if (fs.existsSync(tokenPath)) fs.unlinkSync(tokenPath);
+  return { has_token: Boolean(token) };
+});
+
+ipcMain.handle("gitlab:open", async (event, value) => {
+  if (event.sender !== mainWindow?.webContents) throw new Error("Pedido inválido.");
+  const url = new URL(value);
+  if (url.origin !== "https://gitlab.warpcom.com" || url.username || url.password) throw new Error("Ligação GitLab inválida.");
+  await shell.openExternal(url.href);
+});
 ipcMain.handle("notification:show", (_event, payload) => {
   if (!Notification.isSupported()) return false;
   const notification = new Notification({ title: payload.title, body: payload.body });

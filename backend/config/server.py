@@ -21,6 +21,8 @@ def retention_worker():
 
 def run():
     setup()
+    from notetaker.services.gitlab_sync import sync_worker
+    threading.Thread(target=sync_worker, name="gitlab-sync-worker", daemon=True).start()
     threading.Thread(target=retention_worker, name="audio-retention-worker", daemon=True).start()
     serve(
         application,

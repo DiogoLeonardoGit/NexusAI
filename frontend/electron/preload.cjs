@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 
 contextBridge.exposeInMainWorld("notetaker", {
+  saveGitLabToken: (token) => ipcRenderer.invoke("gitlab:token", token),
+  openGitLab: (url) => ipcRenderer.invoke("gitlab:open", url),
   config: () => ipcRenderer.invoke("config:get"),
   onNotificationOpen: (callback) => {
     const listener = (_event, target) => callback(target);

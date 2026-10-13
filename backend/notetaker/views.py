@@ -22,6 +22,7 @@ from .models import (
     Note,
     Project,
     Tag,
+    GitLabTask,
     ProcessingJob,
     Reminder,
     Speaker,
@@ -57,6 +58,45 @@ from .services.search import retrieve, search_filters
 @api_view(["GET"])
 def health(request):
     return Response({"status": "ok", "ollama": ollama_health(), "model": settings.OLLAMA_MODEL})
+
+
+@api_view(["GET", "PATCH"])
+def gitlab_settings(request):
+    """Expose connection state and the emergency switch, never credentials."""
+    from .services import gitlab
+    from .services.gitlab_sync import connection
+    config = connection()
+    if request.method == "PATCH":
+        if set(request.data) != {"enabled"} or not isinstance(request.data["enabled"], bool):
+            return Response({"detail": "Indica apenas enabled: true/false."}, status=400)
+        config.enabled = request.data["enabled"]
+        config.save(update_fields=["enabled"])
+    links = GitLabTask.objects.filter(connection=config)
+    return Response({"base_url": config.base_url, "project_path": config.project_path, "enabled": config.enabled,
+                     "read_only": not gitlab.REMOTE_WRITES_ALLOWED, "has_token": gitlab.has_token(),
+                     "username": config.username, "last_sync_at": config.last_sync_at, "error": config.error,
+                     "pending": links.exclude(pending={}).count(), "conflicts": links.exclude(conflicts={}).count(),
+                     "hidden": links.filter(hidden=True).count(), "inactive": links.filter(active=False).count()})
+
+
+@api_view(["POST"])
+def gitlab_credentials(request):
+    """Receive a token on the authenticated loopback API and keep it in memory."""
+    from .services import gitlab
+    from .services.gitlab_sync import sync_lock
+    with sync_lock:
+        gitlab.set_token(request.data.get("token"))
+    return Response({"has_token": gitlab.has_token()})
+
+
+@api_view(["POST"])
+def gitlab_sync(request):
+    from .services import gitlab
+    from .services.gitlab_sync import synchronize
+    try:
+        return Response(synchronize())
+    except gitlab.GitLabError as exc:
+        return Response({"detail": str(exc)}, status=502)
 
 
 @api_view(["POST"])
@@ -380,16 +420,24 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
 
 
 class TaskSectionViewSet(viewsets.ModelViewSet):
-    """Create and update task sections without exposing section deletion."""
+    """Manage label views; deleting a view preserves its label and task memberships."""
 
     queryset = TaskSection.objects.all()
     serializer_class = TaskSectionSerializer
-    http_method_names = ["get", "post", "patch", "head", "options"]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
 
 class TaskViewSet(viewsets.ModelViewSet):
-    queryset = Task.objects.select_related("session", "source_segment").all()
+    queryset = Task.objects.select_related("session", "source_segment", "gitlab").prefetch_related("tags").all()
     serializer_class = TaskSerializer
+
+    def dispatch(self, request, *args, **kwargs):
+        """Serialize local task edits against reconciliation to preserve outbox baselines."""
+        from .services.gitlab_sync import sync_lock
+        if request.method in {"POST", "PATCH", "PUT", "DELETE"}:
+            with sync_lock:
+                return super().dispatch(request, *args, **kwargs)
+        return super().dispatch(request, *args, **kwargs)
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -399,24 +447,54 @@ class TaskViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(status=task_status)
         if owner:
             queryset = queryset.filter(owner=owner)
+        if self.action == "list":
+            queryset = queryset.exclude(gitlab__hidden=True).exclude(gitlab__active=False)
         # Dated tasks come first; missing deadlines fall back to newest creation.
         return queryset.order_by(F("due_at").asc(nulls_last=True), "-created_at", "-pk")
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
         task = self.get_object()
-        task.status = Task.Status.DONE
-        task.completed_at = timezone.now()
-        task.save(update_fields=["status", "completed_at", "updated_at"])
-        task.reminders.update(status=Reminder.Status.CANCELLED)
+        serializer = self.get_serializer(task, data={"status": Task.Status.DONE}, partial=True)
+        serializer.is_valid(raise_exception=True)
+        task = serializer.save()
         return Response(self.get_serializer(task).data)
 
     @action(detail=True, methods=["post"])
     def reopen(self, request, pk=None):
         task = self.get_object()
-        task.status = Task.Status.TODO
-        task.save(update_fields=["status", "updated_at"])
+        serializer = self.get_serializer(task, data={"status": Task.Status.TODO}, partial=True)
+        serializer.is_valid(raise_exception=True)
+        task = serializer.save()
         return Response(self.get_serializer(task).data)
+
+    def destroy(self, request, *args, **kwargs):
+        """Local tasks can be deleted; imported tasks keep their remote identity."""
+        task = self.get_object()
+        if hasattr(task, "gitlab"):
+            return Response({"detail": "Usa Ocultar nesta app para tarefas GitLab."}, status=400)
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"])
+    def hide(self, request, pk=None):
+        from .services.gitlab_sync import sync_lock
+        with sync_lock, transaction.atomic():
+            task = self.get_object()
+            if not hasattr(task, "gitlab"):
+                return Response({"detail": "Esta tarefa não veio do GitLab."}, status=400)
+            task.gitlab.hidden = True
+            task.gitlab.save(update_fields=["hidden"])
+        return Response(status=204)
+
+    @action(detail=True, methods=["post"])
+    def resolve(self, request, pk=None):
+        from .services.gitlab_sync import resolve_conflicts, sync_lock
+        with sync_lock, transaction.atomic():
+            task = self.get_object()
+            if not hasattr(task, "gitlab") or not task.gitlab.active or task.gitlab.hidden:
+                return Response({"detail": "Tarefa GitLab indisponível."}, status=400)
+            resolve_conflicts(task.gitlab, request.data.get("choice"))
+        return Response(self.get_serializer(Task.objects.get(pk=task.pk)).data)
 
     @action(detail=True, methods=["post"])
     def schedule(self, request, pk=None):

@@ -13,7 +13,8 @@ class Project(models.Model):
 
 class Tag(models.Model):
     """Reusable labels for meetings, notes and tasks."""
-    name = models.CharField(max_length=80, unique=True)
+    name = models.CharField(max_length=255, unique=True)
+    color = models.CharField(max_length=7, default="#6699cc")
 
     class Meta:
         ordering = ["name"]
@@ -148,9 +149,10 @@ class Note(models.Model):
 
 
 class TaskSection(models.Model):
-    """Persist a named, collapsible horizontal group of tasks."""
+    """Persist a collapsible view of tasks carrying one reusable label."""
 
     name = models.CharField(max_length=120)
+    tag = models.OneToOneField(Tag, on_delete=models.CASCADE, related_name="task_view")
     collapsed = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -165,6 +167,7 @@ class Task(models.Model):
     class CreationSource(models.TextChoices):
         MANUAL = "manual", "Manual"
         SYSTEM = "system", "System"
+        GITLAB = "gitlab", "GitLab"
 
     class Owner(models.TextChoices):
         SELF = "self", "Me"
@@ -177,11 +180,6 @@ class Task(models.Model):
         DONE = "done", "Done"
         CANCELLED = "cancelled", "Cancelled"
 
-    class Priority(models.TextChoices):
-        LOW = "low", "Low"
-        NORMAL = "normal", "Normal"
-        HIGH = "high", "High"
-
     session = models.ForeignKey(
         CaptureSession, related_name="tasks", null=True, blank=True, on_delete=models.SET_NULL
     )
@@ -193,10 +191,6 @@ class Task(models.Model):
     owner = models.CharField(max_length=16, choices=Owner.choices, default=Owner.UNKNOWN)
     owner_name = models.CharField(max_length=120, blank=True)
     status = models.CharField(max_length=24, choices=Status.choices, default=Status.TODO)
-    priority = models.CharField(max_length=12, choices=Priority.choices, default=Priority.NORMAL)
-    section = models.ForeignKey(
-        TaskSection, related_name="tasks", null=True, blank=True, on_delete=models.SET_NULL
-    )
     due_at = models.DateTimeField(null=True, blank=True)
     due_is_ambiguous = models.BooleanField(default=False)
     date_phrase = models.CharField(max_length=240, blank=True)
@@ -291,6 +285,54 @@ class AppSetting(models.Model):
     key = models.CharField(max_length=100, unique=True)
     value = models.JSONField()
     updated_at = models.DateTimeField(auto_now=True)
+
+
+class GitLabConnection(models.Model):
+    """Single personal integration; credentials are held outside the database."""
+
+    base_url = models.URLField(default="https://gitlab.warpcom.com")
+    project_path = models.CharField(max_length=500, default="serviceunit/django-apps/twinportal")
+    project_id = models.PositiveBigIntegerField(null=True, blank=True)
+    user_id = models.PositiveBigIntegerField(null=True, blank=True)
+    username = models.CharField(max_length=255, blank=True)
+    enabled = models.BooleanField(default=False)
+    last_sync_at = models.DateTimeField(null=True, blank=True)
+    error = models.TextField(blank=True)
+
+
+class GitLabLabel(models.Model):
+    """Map labels to their remote identity without changing local project concepts."""
+
+    connection = models.ForeignKey(GitLabConnection, on_delete=models.CASCADE)
+    project_id = models.PositiveBigIntegerField()
+    remote_id = models.PositiveBigIntegerField()
+    tag = models.ForeignKey(Tag, on_delete=models.CASCADE, related_name="gitlab_labels")
+    remote_name = models.CharField(max_length=255)
+    available = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["connection", "project_id", "remote_id"], name="unique_gitlab_label")]
+
+
+class GitLabTask(models.Model):
+    """Persist remote identity, baseline, pending edits and conflict information."""
+
+    task = models.OneToOneField(Task, on_delete=models.CASCADE, related_name="gitlab")
+    connection = models.ForeignKey(GitLabConnection, on_delete=models.CASCADE)
+    project_id = models.PositiveBigIntegerField()
+    issue_iid = models.PositiveBigIntegerField()
+    remote_id = models.PositiveBigIntegerField()
+    web_url = models.URLField(max_length=1000)
+    snapshot = models.JSONField(default=dict)
+    pending = models.JSONField(default=dict)
+    conflicts = models.JSONField(default=dict)
+    hidden = models.BooleanField(default=False)
+    active = models.BooleanField(default=True)
+    error = models.TextField(blank=True)
+    remote_updated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["connection", "project_id", "issue_iid"], name="unique_gitlab_task")]
 
 
 class ActiveListeningLog(models.Model):

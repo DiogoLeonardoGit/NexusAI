@@ -20,6 +20,9 @@ router.register("settings", views.AppSettingViewSet)
 router.register("active-listening-logs", views.ActiveListeningLogViewSet, basename="active-listening-log")
 
 urlpatterns = [
+    path("gitlab/", views.gitlab_settings),
+    path("gitlab/credentials/", views.gitlab_credentials),
+    path("gitlab/sync/", views.gitlab_sync),
     path("health/", views.health),
     path("active-listening/", views.active_listening),
     path("search/", views.search),
