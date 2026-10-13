@@ -1,5 +1,6 @@
 import { Children, useEffect, useLayoutEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { usePopupOwners } from "./Popup";
 
 // Shared keyboard-accessible selector. The menu is portalled to avoid clipping.
 export default function Select({ value = "", children, onChange, disabled, className = "", ...props }) {
@@ -8,6 +9,7 @@ export default function Select({ value = "", children, onChange, disabled, class
   const [open, setOpen] = useState(false), [active, setActive] = useState(0), [position, setPosition] = useState({});
   const trigger = useRef(null), menu = useRef(null), typed = useRef({ text: "", time: 0 });
   const id = useId();
+  const owners = usePopupOwners();
   const available = options.map((option, index) => option.props.disabled ? -1 : index).filter((index) => index >= 0);
   const label = (option) => Children.toArray(option?.props.children).join("");
   const show = () => {
@@ -81,7 +83,7 @@ export default function Select({ value = "", children, onChange, disabled, class
       className="select-trigger" onKeyDown={keyboard} onClick={() => open ? setOpen(false) : show()}>
       <span>{label(options[selected]) || "Escolher…"}</span><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.7"/></svg>
     </button>
-    {open && createPortal(<div ref={menu} id={id} role="listbox" className="select-menu" style={{ position: "fixed", ...position }}>
+    {open && createPortal(<div ref={menu} id={id} data-popup-owners={owners} role="listbox" className="select-menu" style={{ position: "fixed", ...position }}>
       {options.map((option, index) => <div key={`${option.props.value}-${index}`} id={`${id}-${index}`} role="option" aria-selected={index === selected}
         aria-disabled={Boolean(option.props.disabled)} data-index={index} className={`select-option ${active === index ? "active" : ""} ${option.props.disabled ? "disabled" : ""}`}
         onPointerMove={() => { if (!option.props.disabled) setActive(index); }} onClick={() => choose(index)}>

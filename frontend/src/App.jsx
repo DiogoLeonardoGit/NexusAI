@@ -2,6 +2,8 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 
 import { api, apiText } from "./api";
 import Select from "./Select";
+import MultiSelect from "./MultiSelect";
+import Popup, { useOutsideDismiss } from "./Popup";
 import GitLabSettings, { GitLabIcon } from "./GitLabSettings";
 import { moveTaskLabels, tasksForLabelView } from "./taskLabels";
 import { startActiveListening, startCapture } from "./capture";
@@ -86,10 +88,10 @@ function deadlineGroup(task, now = new Date()) {
 function matchesOrganization(item, project, tag, sessions) {
   const meeting = sessions.find((session) => session.id === item.session);
   return (!project || String(item.project ?? meeting?.project) === String(project)) &&
-    (!tag || item.tags?.includes(Number(tag)) || meeting?.tags?.includes(Number(tag)));
+    (!tag || item.tags?.includes(Number(tag)));
 }
 
-function OrganizationFields({ item, projects, tags, onSave }) {
+function OrganizationFields({ item, projects, tags, onSave, showTags = false, sessions }) {
   const [saving, setSaving] = useState(false);
   const save = async (changes) => {
     if (saving) return;
@@ -100,25 +102,29 @@ function OrganizationFields({ item, projects, tags, onSave }) {
     <label>Projeto<Select disabled={saving} value={item.project || ""} onChange={(event) => save({ project: event.target.value ? Number(event.target.value) : null })}>
       <option value="">Sem projeto</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
     </Select></label>
-    <fieldset><legend>Etiquetas</legend>{tags.length ? tags.map((tag) => <label className="tag-choice" key={tag.id}><input disabled={saving} type="checkbox" checked={item.tags?.includes(tag.id) || false}
-      onChange={(event) => save({ tags: event.target.checked ? [...(item.tags || []), tag.id] : (item.tags || []).filter((id) => id !== tag.id) })}/>{tag.name}</label>) : <small>Cria etiquetas em Projetos.</small>}</fieldset>
+    {showTags && <div className="organization-label-field"><span>Etiquetas</span><MultiSelect options={tags} value={item.tags || []} disabled={saving} onChange={(value) => save({ tags: value })}/></div>}
+    {sessions && <label>Reunião<Select aria-label="Reunião associada" disabled={saving} value={item.session || ""} onChange={(event) => save({ session: event.target.value ? Number(event.target.value) : null })}>
+      <option value="">Sem reunião</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title || "Reunião sem título"}</option>)}
+    </Select></label>}
   </div>;
 }
 
 // Assignment controls sit beside actions, keeping the reading flow clear.
 function OrganizationMenu(props) {
   const project = props.projects.find((item) => item.id === props.item.project);
-  const labels = props.tags.filter((item) => props.item.tags?.includes(item.id));
-  return <details className="organization-menu"><summary aria-label="Organizar projeto e etiquetas" title={[project?.name, ...labels.map((item) => item.name)].filter(Boolean).join(" · ") || "Projeto e etiquetas"}>Organizar</summary>
-    <div className="organization-panel"><h4>Projeto e etiquetas</h4><OrganizationFields {...props}/></div>
-  </details>;
+  const labels = props.showTags ? props.tags.filter((item) => props.item.tags?.includes(item.id)) : [];
+  const heading = props.showTags ? "Projeto e etiquetas" : "Projeto";
+  return <Popup className="organization-menu"><summary aria-label={`Organizar ${heading.toLocaleLowerCase()}`} title={[project?.name, ...labels.map((item) => item.name)].filter(Boolean).join(" · ") || heading}>Organizar</summary>
+    <div className="organization-panel"><h4>{heading}</h4><OrganizationFields {...props}/></div>
+  </Popup>;
 }
 
 // References reveal their evidence and source links on hover, focus or click.
 function ReferenceInfo({ children, label = "Referências" }) {
   const [open, setOpen] = useState(false);
-  const id = useId();
-  return <span className="reference-info" onMouseEnter={() => setOpen(true)} onMouseLeave={(event) => { if (!event.currentTarget.contains(document.activeElement)) setOpen(false); }}
+  const id = useId(), root = useRef(null);
+  useOutsideDismiss(root, open, () => setOpen(false));
+  return <span ref={root} className="reference-info" onMouseEnter={() => setOpen(true)} onMouseLeave={(event) => { if (!event.currentTarget.contains(document.activeElement)) setOpen(false); }}
     onFocus={() => setOpen(true)} onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false); }}
     onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); setOpen(false); } }}>
     <button type="button" className="info-button" aria-label={label} aria-expanded={open} aria-controls={open ? id : undefined} onClick={() => setOpen(true)}>ⓘ</button>
@@ -126,7 +132,7 @@ function ReferenceInfo({ children, label = "Referências" }) {
   </span>;
 }
 
-function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, onError, onOpen, taskProps, onProjectSaved, onTagSaved }) {
+function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, onError, onOpen, onProjectSaved, onTagSaved }) {
   const [selected, setSelected] = useState(null), [name, setName] = useState(""), [description, setDescription] = useState(""), [tagName, setTagName] = useState("");
   const [editingProject, setEditingProject] = useState(null), [editingTag, setEditingTag] = useState(null);
   const [busy, setBusy] = useState(""), [formError, setFormError] = useState({}), [success, setSuccess] = useState("");
@@ -148,6 +154,9 @@ function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, 
   const projectSessions = sessions.filter((item) => item.project === project?.id);
   const projectTasks = tasks.filter((item) => matchesOrganization(item, project?.id, "", sessions));
   const projectNotes = notes.filter((item) => matchesOrganization(item, project?.id, "", sessions));
+  // Associated records live inside their meeting; standalone records remain directly navigable.
+  const standaloneNotes = projectNotes.filter((note) => !projectSessions.some((meeting) => meeting.id === note.session));
+  const standaloneTasks = projectTasks.filter((task) => !projectSessions.some((meeting) => meeting.id === task.session));
   const projectSubmit = async (event) => {
     event.preventDefault();
     const item = await save("projects", { name: (editingProject ? editingProject.name : name).trim(), description: editingProject ? editingProject.description : description }, editingProject?.id);
@@ -160,7 +169,7 @@ function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, 
   };
   return <div className="projects-workspace">
     {project && <button type="button" className="back" onClick={() => { setSelected(null); setForm(null); }}>← Todos os projetos</button>}
-    <div className="projects-heading"><div><h2>{project ? "Projeto" : "Os teus projetos"}</h2><p>Reuniões, notas e tarefas organizadas por projeto.</p></div><div className="form-actions"><button type="button" className="primary-action" disabled={Boolean(busy)} onClick={() => { setEditingProject(null); setForm(form === "project" ? null : "project"); }}>Novo projeto</button><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => { setEditingTag(null); setForm(form === "tags" ? null : "tags"); }}>Gerir etiquetas</button></div></div>
+    <div className="projects-heading">{!project && <div><h2>Os teus projetos</h2><p>Reuniões, notas e tarefas organizadas por projeto.</p></div>}<div className="form-actions"><button type="button" className="primary-action" disabled={Boolean(busy)} onClick={() => { setEditingProject(null); setForm(form === "project" ? null : "project"); }}>Novo projeto</button><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => { setEditingTag(null); setForm(form === "tags" ? null : "tags"); }}>Gerir etiquetas</button></div></div>
     {success && <p className="project-success" role="status">{success}</p>}
     {form && <div className="organization-forms">
       {form === "project" && <form className="organization-form" onSubmit={projectSubmit}>
@@ -182,10 +191,20 @@ function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, 
     {!project && (projects.length ? <div className="project-grid">{projects.map((item) => <button type="button" className={`project-tile ${selected === item.id ? "selected" : ""}`} aria-pressed={selected === item.id} key={item.id} onClick={() => setSelected(item.id)}><strong>{item.name}</strong><p>{item.description || "Sem descrição"}</p><small>{sessions.filter((session) => session.project === item.id).length} reuniões · {tasks.filter((task) => matchesOrganization(task, item.id, "", sessions)).length} tarefas</small></button>)}</div> : <div className="project-empty"><strong>A tua próxima reunião pode ter um lugar.</strong><p>Usa “Novo projeto” para começar e associa-lhe reuniões ou tarefas.</p></div>)}
     {project && <section className="project-detail">
       <div className="projects-heading"><div><h2>{project.name}</h2><p>{project.description}</p><small>{projectSessions.length} reuniões · {projectTasks.length} tarefas · {projectNotes.length} notas</small></div><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => { setEditingProject({ ...project }); setFormError({}); setForm("project"); }}>Editar projeto</button></div>
-      <h3>Reuniões e decisões</h3><div className="card-list">{projectSessions.length ? projectSessions.map((item) => <button className="card project-meeting" key={item.id} onClick={() => onOpen({ kind: "session", object_id: item.id, meeting_id: item.id })}><strong>{item.title || "Reunião sem título"}</strong><small>{new Date(item.started_at).toLocaleDateString()}</small></button>) : <p className="empty">Associa uma reunião a este projeto para consultar as suas decisões aqui.</p>}</div>
-      {summaries.filter((item) => item.kind === "meeting" && projectSessions.some((session) => session.id === item.session)).map((summary) => <SummaryCard key={summary.id} summary={summary} title={projectSessions.find((session) => session.id === summary.session)?.title || "Resumo"}/>)}
-      <h3>Notas</h3><div className="card-list">{projectNotes.length ? projectNotes.map((item) => <button className="card" key={item.id} onClick={() => onOpen({ kind: "note", object_id: item.id, meeting_id: item.session })}>{item.title || "Nota pessoal"}<p>{item.body}</p></button>) : <p className="empty">Ainda não existem notas neste projeto.</p>}</div>
-      <h3>Tarefas</h3><TaskList key={project.id} {...taskProps} tasks={projectTasks} defaultProject={project.id}/>
+      <h3>Reuniões e decisões</h3>
+      <div className="card-list">{projectSessions.length ? projectSessions.map((meeting) => <details className="project-meeting-group" key={meeting.id}>
+        <summary className="card project-meeting"><strong>{meeting.title || "Reunião sem título"}</strong><small>{new Date(meeting.started_at).toLocaleDateString()}</small><button type="button" className="text-button project-open-meeting" onClick={(event) => { event.preventDefault(); event.stopPropagation(); onOpen({ kind: "session", object_id: meeting.id, meeting_id: meeting.id }); }}>Abrir reunião →</button></summary>
+        <div className="project-meeting-content">
+          {summaries.filter((summary) => summary.kind === "meeting" && summary.session === meeting.id).map((summary) => <div key={summary.id} role="link" tabIndex={0} className="project-summary-link"
+            onClick={() => onOpen({ kind: "summary", object_id: summary.id, meeting_id: meeting.id })}
+            onKeyDown={(event) => { if (event.key === "Enter") onOpen({ kind: "summary", object_id: summary.id, meeting_id: meeting.id }); }}>
+            <SummaryCard summary={summary} title="Resumo"/></div>)}
+          <h4>Notas</h4><div className="card-list">{notes.filter((note) => note.session === meeting.id).map((note) => <button type="button" className="card project-content-link" key={note.id} onClick={() => onOpen({ kind: "note", object_id: note.id, meeting_id: meeting.id })}><strong>{note.title || "Nota pessoal"}</strong><p>{note.body}</p></button>)}</div>
+          <h4>Tarefas</h4><div className="card-list">{tasks.filter((task) => task.session === meeting.id).map((task) => <button type="button" className="card project-content-link" key={task.id} onClick={() => onOpen({ kind: "task", object_id: task.id })}><strong>{task.title}</strong>{task.description && <p>{task.description}</p>}<small>{task.status === "done" ? "Concluída" : "Por concluir"}</small></button>)}</div>
+        </div>
+      </details>) : <p className="empty">Associa uma reunião a este projeto para consultar as suas decisões aqui.</p>}</div>
+      {standaloneNotes.length > 0 && <><h3>Notas sem reunião neste projeto</h3><div className="card-list">{standaloneNotes.map((note) => <button type="button" className="card project-content-link" key={note.id} onClick={() => onOpen({ kind: "note", object_id: note.id, meeting_id: note.session })}><strong>{note.title || "Nota pessoal"}</strong><p>{note.body}</p></button>)}</div></>}
+      {standaloneTasks.length > 0 && <><h3>Tarefas sem reunião neste projeto</h3><div className="card-list">{standaloneTasks.map((task) => <button type="button" className="card project-content-link" key={task.id} onClick={() => onOpen({ kind: "task", object_id: task.id })}><strong>{task.title}</strong>{task.description && <p>{task.description}</p>}</button>)}</div></>}
     </section>}
   </div>;
 }
@@ -194,8 +213,9 @@ function TaskCreateButton({ open, onClick }) {
   return <button type="button" className="add-task-button" aria-label="Adicionar tarefa" title={open ? "Fechar formulário" : "Adicionar tarefa"} aria-expanded={open} aria-controls="new-task-form" onClick={onClick}><span aria-hidden="true">+</span></button>;
 }
 
-export function TaskList({ tasks, sections = [], showSections, refresh, onError, today, projects = [], tags = [], onOpenSource, targetId, targetKey, defaultProject = null, gitlabStatus, createOpen, onCreateOpenChange }) {
+export function TaskList({ tasks, sections = [], showSections, refresh, onError, today, projects = [], tags = [], onOpenSource, targetId, targetKey, defaultProject = null, defaultSession = null, sessions = [], gitlabStatus, createOpen, onCreateOpenChange }) {
   const [title, setTitle] = useState(""), [description, setDescription] = useState("");
+  const [newSession, setNewSession] = useState(defaultSession || "");
   const [sectionName, setSectionName] = useState(""), [columnTag, setColumnTag] = useState("");
   const [localCreateOpen, setLocalCreateOpen] = useState(false), [layout, setLayout] = useState(() => localStorage.getItem("taskLayout") || "list");
   // The Tarefas page controls creation from its global filter row; other usages stay local.
@@ -215,7 +235,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const createTask = async (event) => {
     event.preventDefault();
     if (!title.trim()) return;
-    const saved = await run("new", () => api("/tasks/", { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim(), owner: "self", status: "todo", project: defaultProject }) }));
+    const saved = await run("new", () => api("/tasks/", { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim(), owner: "self", status: "todo", project: defaultProject, session: newSession ? Number(newSession) : null }) }));
     if (saved) { setTitle(""); setDescription(""); setShowCreate(false); }
   };
   // Persist section changes through the same API/refresh flow as task edits.
@@ -312,7 +332,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
               else window.open(task.gitlab.web_url, "_blank", "noopener,noreferrer");
             }}><GitLabIcon/></button>}
             {isEditing ? <input className="task-title-input" value={editingTask.title} onChange={(event) => setEditingTask({ ...editingTask, title: event.target.value })}/> : <h3>{task.title}</h3>}
-            <div className="item-actions">{!isEditing && <OrganizationMenu item={task} projects={projects} tags={task.gitlab ? tags.filter((tag) => task.gitlab.available_tag_ids.includes(tag.id) || task.tags?.includes(tag.id)) : tags} onSave={(changes) => run(`organization-${task.id}`, () => api(`/tasks/${task.id}/`, { method: "PATCH", body: JSON.stringify(changes) }))}/>} {isEditing ? <><button className="text-button" onClick={saveTask} disabled={!editingTask.title.trim() || busy === `edit-${task.id}`}>{busy === `edit-${task.id}` && <Spinner/>}Concluir</button><button className="text-button secondary-text" onClick={() => setEditingTask(null)}>Cancelar</button></> : <><button className="text-button" onClick={() => beginTaskEdit(task)}>Editar</button><button className="text-button danger" onClick={() => deleteTask(task)} disabled={busy === `delete-${task.id}`}>{busy === `delete-${task.id}` && <Spinner/>}{task.gitlab ? "Ocultar nesta app" : "Eliminar"}</button></>}</div>
+            <div className="item-actions">{!isEditing && <OrganizationMenu item={task} showTags sessions={sessions} projects={projects} tags={task.gitlab ? tags.filter((tag) => task.gitlab.available_tag_ids.includes(tag.id) || task.tags?.includes(tag.id)) : tags} onSave={(changes) => run(`organization-${task.id}`, () => api(`/tasks/${task.id}/`, { method: "PATCH", body: JSON.stringify(changes) }))}/>} {isEditing ? <><button className="text-button" onClick={saveTask} disabled={!editingTask.title.trim() || busy === `edit-${task.id}`}>{busy === `edit-${task.id}` && <Spinner/>}Concluir</button><button className="text-button secondary-text" onClick={() => setEditingTask(null)}>Cancelar</button></> : <><button className="text-button" onClick={() => beginTaskEdit(task)}>Editar</button><button className="text-button danger" onClick={() => deleteTask(task)} disabled={busy === `delete-${task.id}`}>{busy === `delete-${task.id}` && <Spinner/>}{task.gitlab ? "Ocultar nesta app" : "Eliminar"}</button></>}</div>
           </div>
           {isEditing ? <AutoSizeTextarea className="task-description-input" value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <p className="task-description">{task.description}</p>}
 
@@ -341,9 +361,8 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     {showSections && gitlabStatus && <div className="gitlab-status"><span><GitLabIcon/> {gitlabStatus.enabled ? "Consulta GitLab ativa" : "Sincronização GitLab desativada"} · {gitlabStatus.read_only ? "Escritas bloqueadas" : "Bidirecional"} · {gitlabStatus.pending} pendentes</span>
       {gitlabStatus.enabled && <button type="button" className="text-button" onClick={() => run("disable-sync", () => api("/gitlab/", { method: "PATCH", body: JSON.stringify({ enabled: false }) }))}>Desativar sincronização</button>}
       {gitlabStatus.error && <small role="alert">{gitlabStatus.error}</small>}</div>}
-    {showSections && <div className="task-toolbar"><div className="view-switch" aria-label="Apresentação das tarefas">{[["list", "Lista"], ["board", "Quadro"]].map(([value, text]) => <button type="button" key={value} aria-pressed={layout === value} className={layout === value ? "active" : ""} onClick={() => { setLayout(value); localStorage.setItem("taskLayout", value); }}>{text}</button>)}</div></div>}
-    {(!showSections || showCreate) && <form id="new-task-form" className="quick-task" onSubmit={createTask}><input aria-label="Título da nova tarefa" autoFocus={showSections} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><AutoSizeTextarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><button disabled={Boolean(busy) || !title.trim()}>{busy === "new" && <Spinner/>}Adicionar</button>{showSections && <button type="button" className="secondary" onClick={() => setShowCreate(false)}>Cancelar</button>}</form>}
-    <div className="task-filter-row"><div className="filters">{[["todo", "A fazer"], ["mine", "Minhas tarefas"], ["others", "Pendentes de outros intervenientes"], ["done", "Concluídas"], ["all", "Todas"]].map(([value, label]) => <button type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div>{showSections && !onCreateOpenChange && <TaskCreateButton open={showCreate} onClick={() => setShowCreate((value) => !value)}/>}</div>
+    {(!showSections || showCreate) && <form id="new-task-form" className="quick-task" onSubmit={createTask}><input aria-label="Título da nova tarefa" autoFocus={showSections} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><AutoSizeTextarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><label className="new-task-meeting">Reunião<Select aria-label="Reunião da nova tarefa" disabled={Boolean(busy) || Boolean(defaultSession)} value={newSession} onChange={(event) => setNewSession(event.target.value)}><option value="">Sem reunião</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title || "Reunião sem título"}</option>)}</Select></label><button disabled={Boolean(busy) || !title.trim()}>{busy === "new" && <Spinner/>}Adicionar</button>{showSections && <button type="button" className="secondary" onClick={() => setShowCreate(false)}>Cancelar</button>}</form>}
+    <div className="task-filter-row"><div className="filters">{[["todo", "A fazer"], ["mine", "Minhas tarefas"], ["others", "Pendentes de outros intervenientes"], ["done", "Concluídas"], ["all", "Todas"]].map(([value, label]) => <button type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div>{showSections && <div className="view-switch" aria-label="Apresentação das tarefas">{[["list", "Lista"], ["board", "Quadro"]].map(([value, text]) => <button type="button" key={value} aria-pressed={layout === value} className={layout === value ? "active" : ""} onClick={() => { setLayout(value); localStorage.setItem("taskLayout", value); }}>{text}</button>)}</div>}{showSections && !onCreateOpenChange && <TaskCreateButton open={showCreate} onClick={() => setShowCreate((value) => !value)}/>}</div>
     <div className="task-search-filters">
       <label className="task-search-field">Pesquisar tarefas<input type="search" placeholder="Pesquisar no título ou descrição…" value={taskSearch} onChange={(event) => setTaskSearch(event.target.value)}/></label>
       <label>Ordenar por<Select value={taskOrder} onChange={(event) => setTaskOrder(event.target.value)}><option value="default">Predefinido</option><option value="created-asc">Data de criação: crescente</option><option value="created-desc">Data de criação: decrescente</option><option value="due-asc">Data limite: crescente</option><option value="due-desc">Data limite: decrescente</option></Select></label>
@@ -391,7 +410,7 @@ function ProcessingBadge({ processing, onRetry, onCancel, retrying = false, canc
   return <span className={`status-badge ${processing.state}`}>{active && <Spinner/>}{processing.message}{transcribing && counters && ` · ${counters}`}{progress}{elapsed && ` · ${elapsed}`}{active && onCancel && <button onClick={onCancel} disabled={cancelling}>{cancelling && <Spinner/>}Cancelar</button>}{processing.retryable && onRetry && <button onClick={onRetry} disabled={retrying}>{retrying && <Spinner/>}Repetir</button>}</span>;
 }
 
-function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags }) {
+function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags, tasks, taskProps }) {
   const [selected, setSelected] = useState(null);
   const [note, setNote] = useState("");
   const [title, setTitle] = useState("");
@@ -474,7 +493,7 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
     } catch (error) { onError(error.message); }
     finally { setBusy(""); }
   };
-  const addNote = () => note.trim() && run("note", async () => { await api("/notes/", { method: "POST", body: JSON.stringify({ session: selected.id, body: note, project: selected.project, tags: selected.tags || [] }) }); setNote(""); });
+  const addNote = () => note.trim() && run("note", async () => { await api("/notes/", { method: "POST", body: JSON.stringify({ session: selected.id, body: note, project: selected.project }) }); setNote(""); });
   const groupedSegments = selected?.segments.reduce((groups, segment) => {
     const previous = groups.at(-1);
     if (previous?.speaker === segment.speaker) {
@@ -498,8 +517,8 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
   }, []) || [];
   if (selected) return <div>
     <button className="back" onClick={() => setSelected(null)}>← Todas as reuniões</button>
-    <div className="meeting-title"><div className="title-editor">{editingTitle ? <input value={title} onChange={(event) => setTitle(event.target.value)} autoFocus/> : <h2>{selected.title || "Reunião sem título"}</h2>}<p>{new Date(selected.started_at).toLocaleString()}</p></div><div className="meeting-actions">{editingTitle ? <><button onClick={saveTitle} disabled={!title.trim() || busy === "rename"}>{busy === "rename" && <Spinner/>}Concluir</button><button onClick={() => { setTitle(selected.title); setEditingTitle(false); }}>Cancelar</button></> : <button onClick={() => setEditingTitle(true)}>Editar</button>}<details><summary>Exportar</summary><div className="export-menu"><button onClick={exportMarkdown} disabled={busy === "markdown"}>Markdown</button><button onClick={exportHtml} disabled={busy === "html"}>HTML</button><button onClick={exportPdf} disabled={busy === "pdf"}>PDF</button></div></details><button className="danger" onClick={deleteMeeting} disabled={busy === "delete"}>{busy === "delete" && <Spinner/>}{task.gitlab ? "Ocultar nesta app" : "Eliminar"}</button></div></div>
-    <div className="meeting-meta"><div className="processing-actions"><ProcessingBadge processing={selected.processing} onRetry={retryProcessing} onCancel={cancelProcessing} retrying={busy === "retry"} cancelling={busy === "cancel"}/><details className="processing-menu">
+    <div className="meeting-title"><div className="title-editor">{editingTitle ? <input value={title} onChange={(event) => setTitle(event.target.value)} autoFocus/> : <h2>{selected.title || "Reunião sem título"}</h2>}<p>{new Date(selected.started_at).toLocaleString()}</p></div><div className="meeting-actions">{editingTitle ? <><button onClick={saveTitle} disabled={!title.trim() || busy === "rename"}>{busy === "rename" && <Spinner/>}Concluir</button><button onClick={() => { setTitle(selected.title); setEditingTitle(false); }}>Cancelar</button></> : <button onClick={() => setEditingTitle(true)}>Editar</button>}<Popup><summary>Exportar</summary><div className="export-menu"><button onClick={exportMarkdown} disabled={busy === "markdown"}>Markdown</button><button onClick={exportHtml} disabled={busy === "html"}>HTML</button><button onClick={exportPdf} disabled={busy === "pdf"}>PDF</button></div></Popup><button className="danger" onClick={deleteMeeting} disabled={busy === "delete"}>{busy === "delete" && <Spinner/>}Eliminar</button></div></div>
+    <div className="meeting-meta"><div className="processing-actions"><ProcessingBadge processing={selected.processing} onRetry={retryProcessing} onCancel={cancelProcessing} retrying={busy === "retry"} cancelling={busy === "cancel"}/><Popup className="processing-menu">
   <summary>Reprocessar</summary>
   <div className="export-menu">
     <button onClick={retranscribe}
@@ -515,9 +534,9 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
       {busy === "tasks" && <Spinner/>}Voltar a criar tarefas
     </button>
   </div>
-</details></div><label>Idioma <Select value={selected.language || ""} onChange={(event) => setLanguage(event.target.value)} disabled={busy === "language"}><option value="" disabled>Deteção automática</option><option value="pt">Português</option><option value="en">English</option></Select></label></div>
-    <nav className="section-tabs" aria-label="Conteúdo da reunião">{["Resumo", "Transcrição", "Notas", "Organização"].map((panel) => <button type="button" key={panel} className={meetingPanel === panel ? "active" : ""} aria-pressed={meetingPanel === panel} onClick={() => setMeetingPanel(panel)}>{panel}</button>)}</nav>
-    <section className="meeting-panel" hidden={meetingPanel !== "Organização"}><article className="card"><h3>Projeto e etiquetas</h3><OrganizationFields item={selected} projects={projects} tags={tags} onSave={(changes) => run("organization", () => api(`/sessions/${selected.id}/`, { method: "PATCH", body: JSON.stringify(changes) }))}/></article>
+</Popup></div><label>Idioma <Select value={selected.language || ""} onChange={(event) => setLanguage(event.target.value)} disabled={busy === "language"}><option value="" disabled>Deteção automática</option><option value="pt">Português</option><option value="en">English</option></Select></label></div>
+    <nav className="section-tabs" aria-label="Conteúdo da reunião">{["Resumo", "Transcrição", "Notas", "Tarefas", "Organização"].map((panel) => <button type="button" key={panel} className={meetingPanel === panel ? "active" : ""} aria-pressed={meetingPanel === panel} onClick={() => setMeetingPanel(panel)}>{panel}</button>)}</nav>
+    <section className="meeting-panel" hidden={meetingPanel !== "Organização"}><article className="card"><h3>Projeto</h3><OrganizationFields item={selected} projects={projects} tags={tags} onSave={(changes) => run("organization", () => api(`/sessions/${selected.id}/`, { method: "PATCH", body: JSON.stringify(changes) }))}/></article>
     </section><section className="meeting-panel" hidden={meetingPanel !== "Resumo"}>
     {selected.summaries.length === 0 && <article className="card summary pending-summary">{!["failed", "cancelled"].includes(selected.processing.state) && <Spinner/>}<p>{selected.processing.state === "failed" ? "Não foi possível gerar o resumo. Usa Repetir para tentar novamente." : selected.processing.state === "cancelled" ? "O processamento desta reunião foi cancelado." : "O resumo aparecerá quando o processamento terminar."}</p></article>}
     {selected.summaries.map((summary) => <SummaryCard summary={summary} key={summary.id}/>)}
@@ -525,6 +544,8 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
     {selected.speakers.length > 0 && <article className="card participants"><h3>Participantes</h3>{selected.speakers.map((speaker) => { const isEditing = editingSpeaker?.id === speaker.id; return <div className="participant-row" key={speaker.id}><div className="participant-field"><span>{speaker.kind === "self" ? "A minha voz" : "Participante"}</span>{isEditing ? <input value={editingSpeaker.label} onChange={(event) => setEditingSpeaker({ ...editingSpeaker, label: event.target.value })} autoFocus/> : <strong>{speaker.label}</strong>}</div><div className="participant-actions">{isEditing ? <><button className="text-button" onClick={() => saveSpeaker(speaker)} disabled={!editingSpeaker.label.trim() || busy === `speaker-${speaker.id}`}>Concluir</button><button className="text-button secondary-text" onClick={() => setEditingSpeaker(null)}>Cancelar</button></> : <button className="text-button" onClick={() => setEditingSpeaker({ id: speaker.id, label: speaker.label })}>Editar</button>}{speaker.kind !== "self" && speaker.label !== "Outros" && !isEditing && <button className="text-button" onClick={() => mergeSpeaker(speaker)} disabled={busy === `merge-${speaker.id}`}>{busy === `merge-${speaker.id}` && <Spinner/>}Fundir em Outros</button>}</div></div>; })}</article>}
     </section><section className="meeting-panel" hidden={meetingPanel !== "Notas"}>
     <article className="card notes"><h3>Notas pessoais</h3>{selected.notes.map((item) => <div id={`note-${item.id}`} className={target?.noteId === item.id ? "highlighted-segment" : ""} key={item.id}><p>{item.body}</p><OrganizationMenu item={item} projects={projects} tags={tags} onSave={(changes) => run(`note-${item.id}`, () => api(`/notes/${item.id}/`, { method: "PATCH", body: JSON.stringify(changes) }))}/></div>)}<textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="Adicionar uma nota…"/><button onClick={addNote} disabled={busy === "note"}>{busy === "note" && <Spinner/>}Guardar nota</button></article>
+    </section><section className="meeting-panel" hidden={meetingPanel !== "Tarefas"}>
+      <TaskList key={selected.id} {...taskProps} targetId={null} tasks={tasks.filter((task) => task.session === selected.id)} defaultProject={selected.project} defaultSession={selected.id}/>
     </section><section className="meeting-panel" hidden={meetingPanel !== "Transcrição"}>
     {!groupedSegments.length && <p className="empty">A transcrição aparecerá quando estiver disponível.</p>}
     <div className="transcript">{groupedSegments.map((group) => {
@@ -742,20 +763,20 @@ export default function App() {
     generateDaily(dailyDate);
   };
   const organizationTasks = tasks.filter((item) => matchesOrganization(item, projectFilter, tagFilter, sessions));
-  const organizationSessions = sessions.filter((item) => matchesOrganization(item, projectFilter, tagFilter, []));
-  const taskProps = { gitlabStatus, sections: taskSections, refresh, onError: setError, projects, tags, onOpenSource: openSource, targetId: taskTarget?.id, targetKey: taskTarget?.nonce };
+  const organizationSessions = sessions.filter((item) => matchesOrganization(item, projectFilter, "", []));
+  const taskProps = { gitlabStatus, sections: taskSections, refresh, onError: setError, projects, tags, sessions, onOpenSource: openSource, targetId: taskTarget?.id, targetKey: taskTarget?.nonce };
   const latestDaily = useMemo(() => summaries.find((item) => item.kind === "daily"), [summaries]);
-  return <main className="shell"><aside><div className="brand"><span className="brand-mark">N</span><strong>My AI Notetaker</strong></div><nav>{VIEWS.map((item) => <button className={view === item ? "active" : ""} onClick={() => selectView(item)} key={item}>{item}</button>)}</nav><div className="privacy"><span className={activeListening || meetingCapture ? "live-dot" : "idle-dot"}/>{meetingCapture ? "Reunião em curso" : activeListening ? "Escuta ativa" : "Captura pausada"}</div></aside><section className="content"><header><div><p className="eyebrow">LOCAL · PRIVADO</p><h1>{view}</h1></div><div className="header-actions"><div className="daily-summary-button"><button onClick={() => generateDaily(localDateValue())} disabled={Boolean(dailyJob)}>{dailyJob && <Spinner/>}Resumo do dia</button><details><summary aria-label="Escolher data do resumo">▾</summary><form onSubmit={generateSelectedDaily}><strong>Escolher outro dia</strong><input type="date" max={localDateValue()} value={dailyDate} onChange={(event) => setDailyDate(event.target.value)}/><button disabled={!dailyDate || Boolean(dailyJob)}>Gerar resumo</button></form></details></div><button className={`listening ${activeListening ? "active" : ""}`} onClick={toggleActiveListening} disabled={captureBusy || Boolean(meetingCapture)}>{activeEnabled ? "Desativar escuta" : "Ativar escuta"}</button><button className={`capture ${meetingCapture ? "active" : ""}`} onClick={toggleMeeting} disabled={captureBusy}>{captureBusy && <Spinner/>}{meetingCapture ? "Terminar reunião" : "Iniciar reunião"}</button></div></header>
+  return <main className="shell"><aside><div className="brand"><span className="brand-mark">N</span><strong>My AI Notetaker</strong></div><nav>{VIEWS.map((item) => <button className={view === item ? "active" : ""} onClick={() => selectView(item)} key={item}>{item}</button>)}</nav><div className="privacy"><span className={activeListening || meetingCapture ? "live-dot" : "idle-dot"}/>{meetingCapture ? "Reunião em curso" : activeListening ? "Escuta ativa" : "Captura pausada"}</div></aside><section className="content"><header><div><p className="eyebrow">LOCAL · PRIVADO</p><h1>{view}</h1></div><div className="header-actions"><div className="daily-summary-button"><button onClick={() => generateDaily(localDateValue())} disabled={Boolean(dailyJob)}>{dailyJob && <Spinner/>}Resumo do dia</button><Popup><summary aria-label="Escolher data do resumo">▾</summary><form onSubmit={generateSelectedDaily}><strong>Escolher outro dia</strong><input type="date" max={localDateValue()} value={dailyDate} onChange={(event) => setDailyDate(event.target.value)}/><button disabled={!dailyDate || Boolean(dailyJob)}>Gerar resumo</button></form></Popup></div><button className={`listening ${activeListening ? "active" : ""}`} onClick={toggleActiveListening} disabled={captureBusy || Boolean(meetingCapture)}>{activeEnabled ? "Desativar escuta" : "Ativar escuta"}</button><button className={`capture ${meetingCapture ? "active" : ""}`} onClick={toggleMeeting} disabled={captureBusy}>{captureBusy && <Spinner/>}{meetingCapture ? "Terminar reunião" : "Iniciar reunião"}</button></div></header>
     {error && <div className="error">{error}<button onClick={() => setError("")}>×</button></div>}{notice && <div className="notice">{notice}<button onClick={() => setNotice("")}>×</button></div>}
-    {["Hoje", "Tarefas", "Reuniões", "Pesquisa"].includes(view) && <div className={`organization-toolbar ${view === "Tarefas" ? "with-task-action" : ""}`}><details className="filter-panel"><summary>Filtros <span className="filter-indicator">{[projectFilter, tagFilter, ...(view === "Pesquisa" ? [participantFilter, dateFrom, dateTo] : [])].filter(Boolean).length || ""}</span></summary>
+    {["Hoje", "Tarefas", "Reuniões", "Pesquisa"].includes(view) && <div className={`organization-toolbar ${view === "Tarefas" ? "with-task-action" : ""}`}><Popup className="filter-panel"><summary>Filtros <span className="filter-indicator">{[projectFilter, ...(view === "Reuniões" ? [] : [tagFilter]), ...(view === "Pesquisa" ? [participantFilter, dateFrom, dateTo] : [])].filter(Boolean).length || ""}</span></summary>
       <div className="search-filters">
       <label>Projeto<Select value={projectFilter} onChange={(event) => setProjectFilter(event.target.value)}><option value="">Todos</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</Select></label>
-      <label>Etiqueta<Select value={tagFilter} onChange={(event) => setTagFilter(event.target.value)}><option value="">Todas</option>{tags.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</Select></label>
+      {view !== "Reuniões" && <label>Etiqueta<Select value={tagFilter} onChange={(event) => setTagFilter(event.target.value)}><option value="">Todas</option>{tags.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</Select></label>}
       {view === "Pesquisa" && <><label>Participante<Select value={participantFilter} onChange={(event) => setParticipantFilter(event.target.value)}><option value="">Todos</option>{participants.map((item) => <option key={item.id} value={item.id}>{item.label} · {sessions.find((session) => session.id === item.session)?.title || "Reunião"}</option>)}</Select></label><label>Desde<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)}/></label><label>Até<input type="date" value={dateTo} min={dateFrom} onChange={(event) => setDateTo(event.target.value)}/></label></>}
       <button type="button" className="text-button" onClick={() => { setProjectFilter(""); setTagFilter(""); setParticipantFilter(""); setDateFrom(""); setDateTo(""); }}>Limpar filtros</button>
-    </div></details>{view === "Tarefas" && <TaskCreateButton open={taskCreateOpen} onClick={() => setTaskCreateOpen((value) => !value)}/>}</div>}
-    {view === "Projetos" && <Projects projects={projects} tags={tags} sessions={sessions} tasks={tasks} notes={notes} summaries={summaries} refresh={refresh} onError={setError} onOpen={openSource} taskProps={taskProps} onProjectSaved={(item) => setProjects((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))} onTagSaved={(item) => setTags((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))}/>}
-    {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList {...taskProps} tasks={organizationTasks} today={view === "Hoje"} showSections={view === "Tarefas"} createOpen={view === "Tarefas" ? taskCreateOpen : undefined} onCreateOpenChange={view === "Tarefas" ? setTaskCreateOpen : undefined}/>} {view === "Reuniões" && <Meetings projects={projects} tags={tags} key={meetingsKey} sessions={organizationSessions} refresh={refresh} onError={setError} target={meetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{contentDetail && <article className="card"><h3>{contentDetail.title || "Nota pessoal"}</h3><p>{contentDetail.body}</p><OrganizationMenu item={contentDetail} projects={projects} tags={tags} onSave={async (changes) => {
+    </div></Popup>{view === "Tarefas" && <TaskCreateButton open={taskCreateOpen} onClick={() => setTaskCreateOpen((value) => !value)}/>}</div>}
+    {view === "Projetos" && <Projects projects={projects} tags={tags} sessions={sessions} tasks={tasks} notes={notes} summaries={summaries} refresh={refresh} onError={setError} onOpen={openSource} onProjectSaved={(item) => setProjects((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))} onTagSaved={(item) => setTags((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))}/>}
+    {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList {...taskProps} tasks={organizationTasks} today={view === "Hoje"} showSections={view === "Tarefas"} createOpen={view === "Tarefas" ? taskCreateOpen : undefined} onCreateOpenChange={view === "Tarefas" ? setTaskCreateOpen : undefined}/>} {view === "Reuniões" && <Meetings tasks={tasks} taskProps={taskProps} projects={projects} tags={tags} key={meetingsKey} sessions={organizationSessions} refresh={refresh} onError={setError} target={meetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{contentDetail && <article className="card"><h3>{contentDetail.title || "Nota pessoal"}</h3><p>{contentDetail.body}</p><OrganizationMenu item={contentDetail} projects={projects} tags={tags} onSave={async (changes) => {
       try { const saved = await api(`/notes/${contentDetail.id}/`, { method: "PATCH", body: JSON.stringify(changes) }); setContentDetail(saved); await refresh(); }
       catch (nextError) { setError(nextError.message); }
     }}/><button onClick={() => setContentDetail(null)}>Fechar</button></article>}{chatAnswer && <article className="card answer"><h3>Resposta</h3><p>{chatAnswer.answer}</p>{chatAnswer.warning && <small>{chatAnswer.warning}</small>}<ReferenceInfo label="Fontes da resposta">{chatAnswer.sources?.length ? <span className="answer-sources">{chatAnswer.sources.map((source) => <button key={source.id} onClick={() => openSource(source)}><span>{source.meeting_title} · {source.speaker}</span><small>{source.text}</small></button>)}</span> : <span className="reference-text">Sem evidência suficiente.</span>}</ReferenceInfo></article>}{results && <div className="card-list search-results">{results.sources?.length ? results.sources.map((source) => <button className="card search-result" key={source.id} onClick={() => openSource(source)}><div className="search-result-meta"><span>{{segment: "Transcrição", summary: "Resumo", note: "Nota", task: "Tarefa", session: "Reunião"}[source.kind]}</span><span>{source.title || source.meeting_title}</span></div><p>{source.text}</p></button>) : <div className="empty">Não foram encontrados resultados locais.</div>}</div>}</>} {view === "Definições" && <Settings microphoneId={microphoneId} setMicrophoneId={setMicrophoneId}

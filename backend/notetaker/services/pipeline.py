@@ -378,9 +378,7 @@ def _persist_meeting_tasks(job, segments, transcript, items):
                     "creation_source": Task.CreationSource.SYSTEM,
                 },
             )
-            # Inherit labels once; preserve later manual task organization.
-            if created:
-                task.tags.set(session.tags.all())
+            # Labels belong to tasks and are assigned independently of the meeting.
             if task.due_at and not task.due_is_ambiguous:
                 Reminder.objects.get_or_create(task=task, remind_at=task.due_at)
 

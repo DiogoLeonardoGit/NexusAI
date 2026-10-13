@@ -48,14 +48,16 @@ def search_filters(values):
 
 
 def _filtered(queryset, kind, filters):
-    """Scope records by their own organization or their parent meeting."""
+    """Inherit projects from meetings; label filters apply only to tasks."""
     meeting = "" if kind == "session" else "session__"
     own = "" if kind in ("session", "note", "task") else "session__"
     for field, lookup in (("project", "project_id"), ("tag", "tags__id")):
         if field in filters:
+            if field == "tag" and kind != "task":
+                return queryset.none()
             condition = Q(**{own + lookup: filters[field]})
-            if kind in ("note", "task"):
-                condition |= Q(**{meeting + lookup: filters[field]}) if field == "tag" else Q(project__isnull=True, **{meeting + lookup: filters[field]})
+            if field == "project" and kind in ("note", "task"):
+                condition |= Q(project__isnull=True, **{meeting + lookup: filters[field]})
             queryset = queryset.filter(condition)
     if "participant" in filters:
         lookup = "speaker_id" if kind == "segment" else meeting + "speakers__id"
@@ -117,9 +119,7 @@ def retrieve(question, filters=None, *, expand=False):
                 if kind == "summary":
                     text += "\n" + "\n".join([*item.decisions, *item.open_questions])
                 project = getattr(item, "project", None) or (session.project if session else None)
-                labels = list(item.tags.all()) if kind in ("session", "note", "task") else []
-                if session and kind != "session":
-                    labels.extend(session.tags.all())
+                labels = list(item.tags.all()) if kind == "task" else []
                 metadata = f"{project.name if project else ''} {' '.join(tag.name for tag in labels)}"
                 if kind == "task":
                     status_words = {"todo": "pending pendente a fazer", "pending_confirmation": "pending pendente confirmar", "done": "completed concluida concluido", "cancelled": "cancelled cancelada cancelado"}
