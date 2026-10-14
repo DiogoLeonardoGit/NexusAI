@@ -89,19 +89,20 @@ class GitLabTests(TestCase):
         link.refresh_from_db()
         self.assertNotIn("state", link.pending)
 
-    def test_remote_edits_preserve_local_projects_and_meetings(self):
+    def test_remote_edits_preserve_local_meeting_and_derived_project(self):
         self.enable_import()
         task = Task.objects.get()
         project = Project.objects.create(name="Local")
         meeting = CaptureSession.objects.create(title="Reunião", started_at=timezone.now(), project=project)
-        response = self.client.patch(f"/api/tasks/{task.pk}/", {"project": project.pk, "session": meeting.pk}, format="json")
+        response = self.client.patch(f"/api/tasks/{task.pk}/", {"session": meeting.pk}, format="json")
         self.assertEqual(response.status_code, 200)
         self.issue.update(title="Título remoto", state="closed")
         synchronize()
         task.refresh_from_db()
         self.assertEqual(task.title, "Título remoto")
         self.assertEqual(task.status, "done")
-        self.assertEqual(task.project, project)
+        self.assertIsNone(task.project)
+        self.assertEqual(self.client.get(f"/api/tasks/{task.pk}/").data["project"], project.pk)
         self.assertEqual(task.session, meeting)
         self.assertEqual(task.gitlab.pending, {})
 
@@ -201,29 +202,35 @@ class GitLabTests(TestCase):
         self.assertEqual(GitLabTask.objects.get().pending, {"state": "closed"})
         self.assertEqual(self.client.get("/api/gitlab/").data["error"], "Sem VPN")
 
-    def test_future_write_path_acknowledges_only_simulated_success(self):
+    def test_manual_write_path_acknowledges_only_simulated_success(self):
         self.enable_import()
         task = Task.objects.get()
         self.client.post(f"/api/tasks/{task.pk}/complete/")
         self.fake.get.side_effect = lambda path: ({"id": 7, "username": "diogo", "email": gitlab.EXPECTED_EMAIL}
                                                  if path == "/user" else deepcopy(self.issue))
         self.fake.update_task.return_value = {**self.issue, "state": "closed"}
-        with patch.object(gitlab, "REMOTE_WRITES_ALLOWED", True):
-            synchronize()
+        settings = self.client.patch("/api/gitlab/", {"write_enabled": True}, format="json")
+        self.assertEqual(settings.status_code, 200)
+        self.assertFalse(settings.data["read_only"])
+        synchronize()
+        self.fake.update_task.assert_not_called()
+        response = self.client.post("/api/gitlab/push/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["sent"], 1)
         self.fake.update_task.assert_called_once()
         link = GitLabTask.objects.get()
         self.assertEqual(link.pending, {})
         self.assertEqual(link.snapshot["state"], "closed")
         self.assertEqual(link.task.status, "done")
 
-    def test_future_write_path_rechecks_assignee_before_sending(self):
+    def test_manual_write_path_rechecks_assignee_before_sending(self):
         self.enable_import()
         task = Task.objects.get()
         self.client.post(f"/api/tasks/{task.pk}/complete/")
         self.fake.get.side_effect = lambda path: ({"id": 7, "username": "diogo", "email": gitlab.EXPECTED_EMAIL}
                                                  if path == "/user" else {**self.issue, "assignees": [{"id": 8}]})
-        with patch.object(gitlab, "REMOTE_WRITES_ALLOWED", True):
-            synchronize()
+        with patch.object(gitlab, "writes_enabled", return_value=True):
+            synchronize(send_updates=True)
         self.fake.update_task.assert_not_called()
         self.assertFalse(GitLabTask.objects.get().active)
 
@@ -252,10 +259,10 @@ class ClientSafetyTests(TestCase):
             gitlab.GitLabClient(config).get("/user")
         self.assertIsNone(gitlab.NoRedirects().redirect_request(None, None, 302, None, {}, "https://other.example.com"))
 
-    def test_disabled_connection_blocks_even_a_future_write_enabled_release(self):
+    def test_disabled_connection_blocks_even_manually_authorized_writes(self):
         config = GitLabConnection.objects.create(enabled=False)
-        with patch.object(gitlab, "REMOTE_WRITES_ALLOWED", True), self.assertRaises(gitlab.GitLabError):
-            gitlab.GitLabClient(config).request("/projects/42/issues/5", "PUT", {})
+        with patch.object(gitlab, "writes_enabled", return_value=True), self.assertRaises(gitlab.GitLabError):
+            gitlab.GitLabClient(config, allow_writes=True).request("/projects/42/issues/5", "PUT", {})
 
     def test_future_outbound_payload_uses_only_deltas_in_simulated_transport(self):
         config = GitLabConnection.objects.create(enabled=True)

@@ -55,8 +55,8 @@ def _filtered(queryset, kind, filters):
         if field in filters:
             if field == "tag" and kind != "task":
                 return queryset.none()
-            condition = Q(**{own + lookup: filters[field]})
-            if field == "project" and kind in ("note", "task"):
+            condition = Q(**{(meeting if field == "project" and kind == "task" else own) + lookup: filters[field]})
+            if field == "project" and kind == "note":
                 condition |= Q(project__isnull=True, **{meeting + lookup: filters[field]})
             queryset = queryset.filter(condition)
     if "participant" in filters:
@@ -106,7 +106,7 @@ def retrieve(question, filters=None, *, expand=False):
         ("segment", TranscriptSegment.objects.select_related("speaker", "session", "chunk", "session__project").prefetch_related("session__tags")),
         ("summary", Summary.objects.select_related("session", "session__project").prefetch_related("session__tags")),
         ("note", Note.objects.select_related("session", "project", "session__project").prefetch_related("tags", "session__tags")),
-        ("task", Task.objects.select_related("session", "project", "session__project").prefetch_related("tags", "session__tags")),
+        ("task", Task.objects.select_related("session", "session__project").prefetch_related("tags", "session__tags")),
         ("session", CaptureSession.objects.select_related("project").prefetch_related("tags")),
     ]
     records = []
@@ -118,7 +118,9 @@ def retrieve(question, filters=None, *, expand=False):
                 text = getattr(item, "text", getattr(item, "content", getattr(item, "body", getattr(item, "description", ""))))
                 if kind == "summary":
                     text += "\n" + "\n".join([*item.decisions, *item.open_questions])
-                project = getattr(item, "project", None) or (session.project if session else None)
+                # Tasks belong only to their meeting's project, including legacy rows.
+                project = (session.project if session else None) if kind == "task" else (
+                    getattr(item, "project", None) or (session.project if session else None))
                 labels = list(item.tags.all()) if kind == "task" else []
                 metadata = f"{project.name if project else ''} {' '.join(tag.name for tag in labels)}"
                 if kind == "task":

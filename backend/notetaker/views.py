@@ -46,6 +46,7 @@ from .serializers import (
     SummarySerializer,
     TaskSerializer,
     TaskSectionSerializer,
+    TaskTimeEntrySerializer,
     TranscriptSegmentSerializer,
 )
 from .services.ollama import health as ollama_health
@@ -62,21 +63,25 @@ def health(request):
 
 @api_view(["GET", "PATCH"])
 def gitlab_settings(request):
-    """Expose connection state and the emergency switch, never credentials."""
+    """Expose connection state and explicit write opt-in, never credentials."""
     from .services import gitlab
-    from .services.gitlab_sync import connection
+    from .services.gitlab_sync import connection, pending_links
     config = connection()
     if request.method == "PATCH":
-        if set(request.data) != {"enabled"} or not isinstance(request.data["enabled"], bool):
-            return Response({"detail": "Indica apenas enabled: true/false."}, status=400)
-        config.enabled = request.data["enabled"]
-        config.save(update_fields=["enabled"])
+        if not request.data or set(request.data) - {"enabled", "write_enabled"} or any(not isinstance(value, bool) for value in request.data.values()):
+            return Response({"detail": "Indica enabled e/ou write_enabled: true/false."}, status=400)
+        if "enabled" in request.data:
+            config.enabled = request.data["enabled"]
+            config.save(update_fields=["enabled"])
+        if "write_enabled" in request.data:
+            AppSetting.objects.update_or_create(key=gitlab.WRITE_SETTING, defaults={"value": request.data["write_enabled"]})
     links = GitLabTask.objects.filter(connection=config)
     return Response({"base_url": config.base_url, "project_path": config.project_path, "enabled": config.enabled,
-                     "read_only": not gitlab.REMOTE_WRITES_ALLOWED, "has_token": gitlab.has_token(),
+                     "read_only": not gitlab.writes_enabled(), "has_token": gitlab.has_token(),
                      "username": config.username, "last_sync_at": config.last_sync_at, "error": config.error,
-                     "pending": links.exclude(pending={}).count(), "conflicts": links.exclude(conflicts={}).count(),
-                     "hidden": links.filter(hidden=True).count(), "inactive": links.filter(active=False).count()})
+                     "pending": pending_links(config).count(), "conflicts": links.exclude(conflicts={}).count(),
+                     "hidden": links.filter(hidden=True).count(), "inactive": links.filter(active=False).count(),
+                     "available_tag_ids": list(config.gitlablabel_set.filter(project_id=config.project_id, available=True).values_list("tag_id", flat=True))})
 
 
 @api_view(["POST"])
@@ -95,6 +100,17 @@ def gitlab_sync(request):
     from .services.gitlab_sync import synchronize
     try:
         return Response(synchronize())
+    except gitlab.GitLabError as exc:
+        return Response({"detail": str(exc)}, status=502)
+
+
+@api_view(["POST"])
+def gitlab_push(request):
+    """Only this explicit card action authorizes remote task updates."""
+    from .services import gitlab
+    from .services.gitlab_sync import synchronize
+    try:
+        return Response(synchronize(send_updates=True))
     except gitlab.GitLabError as exc:
         return Response({"detail": str(exc)}, status=502)
 
@@ -428,7 +444,7 @@ class TaskSectionViewSet(viewsets.ModelViewSet):
 
 
 class TaskViewSet(viewsets.ModelViewSet):
-    queryset = Task.objects.select_related("session", "source_segment", "gitlab").prefetch_related("tags").all()
+    queryset = Task.objects.select_related("session", "source_segment", "gitlab").prefetch_related("tags", "time_entries").all()
     serializer_class = TaskSerializer
 
     def dispatch(self, request, *args, **kwargs):
@@ -467,6 +483,72 @@ class TaskViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         task = serializer.save()
         return Response(self.get_serializer(task).data)
+
+    @action(detail=False, methods=["post"])
+    def bulk(self, request):
+        """Validate every selected task before atomically adding labels or closing."""
+        if not isinstance(request.data, dict):
+            return Response({"detail": "Indica um objeto com task_ids e action."}, status=400)
+        operation = request.data.get("action")
+        expected = {"task_ids", "action", "tag_ids"} if operation == "add_labels" else {"task_ids", "action"}
+        if not isinstance(operation, str) or operation not in {"add_labels", "close"} or set(request.data) != expected:
+            return Response({"detail": "Indica task_ids e action: close ou add_labels (com tag_ids)."}, status=400)
+        identifiers = request.data.get("task_ids")
+        if not isinstance(identifiers, list) or not identifiers or any(type(value) is not int or value <= 0 for value in identifiers):
+            return Response({"detail": "Seleciona tarefas com IDs inteiros positivos."}, status=400)
+        identifiers = set(identifiers)
+        label_ids = request.data.get("tag_ids", [])
+        if operation == "add_labels" and (not isinstance(label_ids, list) or not label_ids or any(type(value) is not int or value <= 0 for value in label_ids)):
+            return Response({"detail": "Seleciona etiquetas com IDs inteiros positivos."}, status=400)
+        # Task dispatch already holds the same lock used by GitLab reconciliation.
+        with transaction.atomic():
+            tasks = list(self.get_queryset().filter(pk__in=identifiers))
+            if len(tasks) != len(identifiers):
+                return Response({"detail": "Uma das tarefas selecionadas já não está disponível. Nenhuma foi alterada."}, status=400)
+            serializers = []
+            skipped = 0
+            for task in tasks:
+                changes = {"status": Task.Status.DONE} if operation == "close" else {
+                    "tags": sorted(set(task.tags.values_list("pk", flat=True)) | set(label_ids))}
+                serializer = self.get_serializer(task, data=changes, partial=True)
+                if not serializer.is_valid():
+                    return Response({"detail": f"A tarefa “{task.title}” não permite esta operação. Nenhuma foi alterada.",
+                                     "errors": serializer.errors}, status=400)
+                if operation == "close" and task.status == Task.Status.DONE:
+                    skipped += 1
+                else:
+                    serializers.append(serializer)
+            for serializer in serializers:
+                serializer.save()
+        return Response({"updated": len(serializers), "skipped": skipped})
+
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        """Explicitly create a GitLab issue from this local task, preserving local identity."""
+        from .services import gitlab
+        from .services.gitlab_sync import publish_task
+        if request.data:
+            return Response({"detail": "Envia a tarefa guardada, sem campos adicionais."}, status=400)
+        try:
+            task = publish_task(self.get_object())
+            return Response(self.get_serializer(task).data)
+        except gitlab.GitLabError as exc:
+            return Response({"detail": str(exc)}, status=502)
+
+    @action(detail=True, methods=["get", "post"], url_path="time")
+    def time_entries(self, request, pk=None):
+        """Record manual time locally; only the existing manual GitLab push sends it."""
+        task = self.get_object()
+        if request.method == "GET":
+            return Response(TaskTimeEntrySerializer(task.time_entries.all(), many=True).data)
+        if hasattr(task, "gitlab") and (task.gitlab.hidden or not task.gitlab.active):
+            return Response({"detail": "Esta tarefa não está disponível para registar tempo."}, status=400)
+        if not isinstance(request.data, dict) or set(request.data) != {"duration_seconds"}:
+            return Response({"detail": "Indica apenas duration_seconds, em minutos inteiros positivos."}, status=400)
+        serializer = TaskTimeEntrySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(task=task)
+        return Response(self.get_serializer(self.get_object()).data, status=201)
 
     def destroy(self, request, *args, **kwargs):
         """Local tasks can be deleted; imported tasks keep their remote identity."""
@@ -806,4 +888,14 @@ class ProjectViewSet(viewsets.ModelViewSet):
 class TagViewSet(viewsets.ModelViewSet):
     queryset = Tag.objects.all()
     serializer_class = TagSerializer
-    http_method_names = ["get", "post", "patch", "head", "options"]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def destroy(self, request, *args, **kwargs):
+        """Delete one local label and its view, preserving associated contents."""
+        from .services.gitlab_sync import sync_lock
+        with sync_lock, transaction.atomic():
+            label = self.get_object()
+            if label.gitlab_labels.exists():
+                return Response({"detail": "As etiquetas importadas são geridas no GitLab."}, status=400)
+            label.delete()
+        return Response(status=204)

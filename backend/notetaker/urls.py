@@ -23,6 +23,7 @@ urlpatterns = [
     path("gitlab/", views.gitlab_settings),
     path("gitlab/credentials/", views.gitlab_credentials),
     path("gitlab/sync/", views.gitlab_sync),
+    path("gitlab/push/", views.gitlab_push),
     path("health/", views.health),
     path("active-listening/", views.active_listening),
     path("search/", views.search),

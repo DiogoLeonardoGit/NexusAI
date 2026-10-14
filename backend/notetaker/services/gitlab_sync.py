@@ -4,24 +4,97 @@ import logging
 import threading
 
 from django.db import close_old_connections, transaction
+from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework.exceptions import ValidationError
 
-from notetaker.models import GitLabConnection, GitLabLabel, GitLabTask, Reminder, Tag, Task
+from notetaker.models import AppSetting, GitLabConnection, GitLabLabel, GitLabTask, Reminder, Tag, Task, TaskTimeEntry
 from . import gitlab
 
 logger = logging.getLogger(__name__)
 sync_lock = threading.RLock()
+COMPLETION_LABELS = frozenset({"To Do", "On Going", "On Testing / Pending Deploy"})
+UNSENT_TIME_STATES = (TaskTimeEntry.SyncState.PENDING, TaskTimeEntry.SyncState.SENDING, TaskTimeEntry.SyncState.UNCERTAIN)
 
 
 def connection():
     return GitLabConnection.objects.get_or_create(pk=1)[0]
 
 
+def pending_links(config):
+    """Count each linked task once, including its undelivered or uncertain time."""
+    return GitLabTask.objects.filter(connection=config).filter(
+        ~Q(pending={}) | Q(task__time_entries__sync_state__in=UNSENT_TIME_STATES)).distinct()
+
+
+def publish_key(task_id):
+    """Use the existing preferences table for a durable creation reservation."""
+    return f"gitlab_publish_task_{task_id}"
+
+
+def publish_task(task):
+    """Publish a local task once, validating the live catalogue before any POST.
+
+    The reservation survives crashes and uncertain responses. It deliberately
+    blocks another create until the remote result is checked, avoiding blind retries.
+    """
+    with sync_lock:
+        if GitLabTask.objects.filter(task=task).exists():
+            return task
+        if AppSetting.objects.filter(key=publish_key(task.pk)).exists():
+            raise ValidationError({"detail": "Existe um envio sem confirmação para esta tarefa. Verifica o GitLab; a criação não será repetida."})
+        if task.status != Task.Status.TODO or task.owner != Task.Owner.SELF:
+            raise ValidationError({"detail": "Só podes enviar tarefas abertas com responsável Eu."})
+        config = connection()
+        if not config.enabled or not gitlab.writes_enabled() or not gitlab.has_token():
+            raise ValidationError({"detail": "Ativa a sincronização e a escrita e configura o token GitLab."})
+        client = gitlab.GitLabClient(config, allow_writes=True)
+        user = client.get("/user")
+        if user.get("email", "").lower() != gitlab.EXPECTED_EMAIL:
+            raise gitlab.GitLabError("O token tem de pertencer a diogo.leonardo@warpcom.com.")
+        project = client.project()
+        config.user_id, config.username, config.project_id = user["id"], user["username"], project["id"]
+        config.save(update_fields=["user_id", "username", "project_id"])
+        available = sync_labels(config, client)
+        names = set(task.tags.values_list("name", flat=True))
+        missing = sorted(names - set(available))
+        if missing:
+            raise ValidationError({"detail": "Estas labels não existem no GitLab: " + ", ".join(missing)})
+        if not names & COMPLETION_LABELS:
+            raise ValidationError({"detail": "Escolhe pelo menos uma label principal: To Do, On Going ou On Testing / Pending Deploy."})
+        if any("," in name for name in names):
+            raise ValidationError({"detail": "A API GitLab não permite enviar labels com vírgulas."})
+        reservation = AppSetting.objects.create(key=publish_key(task.pk), value={"state": "sending", "project_id": config.project_id})
+        try:
+            issue = client.create_task(task, config.project_id, config.user_id, names)
+        except gitlab.GitLabCreateUncertain:
+            reservation.value = {"state": "uncertain", "project_id": config.project_id}
+            reservation.save(update_fields=["value"])
+            raise
+        except gitlab.GitLabError:
+            # Rejected requests or local preflight failures did not create an issue.
+            reservation.delete()
+            raise
+        # Keep the reservation if acknowledgement cannot be linked locally.
+        # A later click must never emit another POST after remote success.
+        with transaction.atomic():
+            GitLabTask.objects.create(task=task, connection=config, project_id=config.project_id,
+                                      issue_iid=issue["iid"], remote_id=issue["id"], web_url=issue["web_url"],
+                                      snapshot=state_of(issue), remote_updated_at=parse_datetime(issue.get("updated_at") or ""))
+            task.refresh_from_db()
+            queue_task(task)
+            reservation.delete()
+        return task
+
+
 def state_of(issue):
-    return {"title": issue["title"], "description": issue.get("description") or "",
-            "state": issue["state"], "labels": sorted(issue.get("labels", []))}
+    values = {"title": issue["title"], "description": issue.get("description") or "",
+              "state": issue["state"], "labels": sorted(issue.get("labels", []))}
+    # Time is independent of editable task fields and must never enter scalar conflicts.
+    total = (issue.get("time_stats") or {}).get("total_time_spent", 0)
+    values["total_time_spent"] = total if type(total) is int and total >= 0 else 0
+    return values
 
 
 def local_state(task):
@@ -63,6 +136,14 @@ def merge_states(baseline, pending, remote, existing_conflicts=None):
         result[key] = wanted
         if wanted != actual:
             remaining[key] = wanted
+    # Closing locally also removes progress labels added remotely before manual send.
+    # Restrict this rule to a pending close; imported closed history stays unchanged.
+    if pending.get("state") == "closed":
+        result["labels"] = sorted(set(result["labels"]) - COMPLETION_LABELS)
+        if result["labels"] != remote.get("labels", []):
+            remaining["labels"] = result["labels"]
+        else:
+            remaining.pop("labels", None)
     return result, remaining, conflicts
 
 
@@ -105,15 +186,19 @@ def check_enabled(config):
     return config.enabled
 
 
-def synchronize():
-    """Run a full reconciliation; no work or requests while disabled."""
+def synchronize(*, send_updates=False):
+    """Import automatically; send deltas only for an explicit manual request."""
     if not sync_lock.acquire(blocking=False):
         return {"busy": True}
     try:
         config = connection()
         if not config.enabled:
             return {"disabled": True}
-        client = gitlab.GitLabClient(config)
+        if send_updates and not gitlab.writes_enabled():
+            raise ValidationError({"detail": "Ativa o modo de escrita nas definições GitLab."})
+        client = gitlab.GitLabClient(config, allow_writes=send_updates)
+        started_at = timezone.now()
+        sent, failed = 0, 0
         try:
             user = client.get("/user")
             if user.get("email", "").lower() != gitlab.EXPECTED_EMAIL:
@@ -177,13 +262,31 @@ def synchronize():
                     link.error = ""
                     link.web_url = issue["web_url"]
                     link.save()
-                if link.pending and not link.conflicts and not link.hidden and gitlab.REMOTE_WRITES_ALLOWED and check_enabled(config):
-                    push_pending(link, config, client, labels)
+                has_time = link.task.time_entries.filter(sync_state__in=UNSENT_TIME_STATES).exists() if send_updates else False
+                if send_updates and (link.pending or has_time) and not link.conflicts and not link.hidden and check_enabled(config):
+                    try:
+                        fields_sent = bool(push_pending(link, config, client, labels)) if link.pending else False
+                        if fields_sent:
+                            sent += 1
+                        if has_time and push_time_entries(link, config, client) and not fields_sent:
+                            sent += 1
+                    except gitlab.GitLabDisabled:
+                        raise
+                    except gitlab.GitLabError as exc:
+                        link.error = str(exc)
+                        link.save(update_fields=["error"])
+                        failed += 1
             # Missing assignments suspend edits, never delete personal records.
             GitLabTask.objects.filter(connection=config).exclude(pk__in=seen).update(active=False)
-            config.last_sync_at, config.error = timezone.now(), ""
+            config.last_sync_at = timezone.now()
+            config.error = f"Não foi possível enviar {failed} tarefa(s). As alterações continuam pendentes." if failed else ""
             config.save(update_fields=["last_sync_at", "error"])
-            return {"imported": imported, "updated": len(seen), "read_only": not gitlab.REMOTE_WRITES_ALLOWED}
+            links = GitLabTask.objects.filter(connection=config)
+            return {"imported": imported, "updated": len(seen), "read_only": not gitlab.writes_enabled(),
+                    "sent": sent, "failed": failed, "pending": pending_links(config).count(),
+                    "time_entries_sent": TaskTimeEntry.objects.filter(task__gitlab__connection=config,
+                        sync_state=TaskTimeEntry.SyncState.SENT, synced_at__gte=started_at).count(),
+                    "conflicts": links.exclude(conflicts={}).count()}
         except gitlab.GitLabDisabled:
             return {"disabled": True}
         except gitlab.GitLabError as exc:
@@ -209,7 +312,7 @@ def resolve_conflicts(link, choice):
 
 
 def push_pending(link, config, client, labels):
-    """Future write path: recheck assignment and reconcile again before emitting deltas."""
+    """Recheck assignment and conflicts before manually emitting field deltas."""
     latest = client.get(f"/projects/{link.project_id}/issues/{link.issue_iid}")
     if not any(person["id"] == config.user_id for person in latest.get("assignees", [])):
         link.active = False
@@ -235,7 +338,54 @@ def push_pending(link, config, client, labels):
                 if name not in labels:
                     labels[name] = Tag.objects.get_or_create(name=name)[0].pk
             apply_state(link.task, link.snapshot, labels)
+            link.error = ""
             link.save()
+        return True
+    return False
+
+
+def push_time_entries(link, config, client):
+    """Send each manual time record once, acknowledging its remote total atomically.
+
+    SENDING is committed before the additive request, so a crash cannot trigger a
+    blind retry. Uncertain responses block time delivery for this task until reviewed.
+    """
+    if not link.active or link.hidden or link.conflicts:
+        return 0
+    entries = link.task.time_entries
+    if entries.filter(sync_state__in=(TaskTimeEntry.SyncState.SENDING, TaskTimeEntry.SyncState.UNCERTAIN)).exists():
+        raise gitlab.GitLabError("Há um envio de tempo por confirmar nesta tarefa. Verifica o GitLab; o tempo não será enviado novamente.")
+    latest = client.get(f"/projects/{link.project_id}/issues/{link.issue_iid}")
+    if not any(person["id"] == config.user_id for person in latest.get("assignees", [])):
+        link.active = False
+        link.save(update_fields=["active"])
+        return 0
+    sent = 0
+    for entry in entries.filter(sync_state=TaskTimeEntry.SyncState.PENDING):
+        if not check_enabled(config):
+            raise gitlab.GitLabDisabled("Sincronização desativada.")
+        entry.sync_state, entry.error = TaskTimeEntry.SyncState.SENDING, ""
+        entry.save(update_fields=["sync_state", "error"])
+        try:
+            stats = client.add_spent_time(link, entry.duration_seconds)
+            total = stats.get("total_time_spent") if isinstance(stats, dict) else None
+            if type(total) is not int or total < 0:
+                raise gitlab.GitLabTimeUncertain("Não foi possível confirmar o total de tempo recebido pelo GitLab. Verifica o registo antes de repetir.")
+        except gitlab.GitLabTimeUncertain as exc:
+            entry.sync_state, entry.error = TaskTimeEntry.SyncState.UNCERTAIN, str(exc)
+            entry.save(update_fields=["sync_state", "error"])
+            raise
+        except gitlab.GitLabError as exc:
+            entry.sync_state, entry.error = TaskTimeEntry.SyncState.PENDING, str(exc)
+            entry.save(update_fields=["sync_state", "error"])
+            raise
+        with transaction.atomic():
+            link.snapshot["total_time_spent"] = total
+            link.save(update_fields=["snapshot"])
+            entry.sync_state, entry.synced_at, entry.error = TaskTimeEntry.SyncState.SENT, timezone.now(), ""
+            entry.save(update_fields=["sync_state", "synced_at", "error"])
+        sent += 1
+    return sent
 
 
 def sync_worker():

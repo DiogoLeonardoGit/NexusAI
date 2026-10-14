@@ -44,7 +44,9 @@ describe("task interface", () => {
   it("moves cards between label columns while retaining priority labels", async () => {
     await render(); await click("Quadro");
     expect(element.querySelector(".task-board")).toBeTruthy();
-    const source = element.querySelector(".task-drag-handle");
+    const source = element.querySelector(".task-board-card");
+    expect(source.textContent).toBe(task.title);
+    expect(source.querySelector(".task-description, .task-meta, .item-actions, .task-drag-handle, .check")).toBeNull();
     const destination = [...element.querySelectorAll(".task-section")].find((item) => item.querySelector("strong").textContent === "Revisão");
     await act(async () => source.dispatchEvent(dragEvent("dragstart")));
     await act(async () => destination.dispatchEvent(dragEvent("drop")));
@@ -52,7 +54,7 @@ describe("task interface", () => {
   });
   it("completes a card dropped in the completed column", async () => {
     await render(); await click("Quadro");
-    const source = element.querySelector(".task-drag-handle");
+    const source = element.querySelector(".task-board-card");
     const destination = [...element.querySelectorAll(".task-section")].find((item) => item.querySelector("strong").textContent === "Concluídas");
     await act(async () => source.dispatchEvent(dragEvent("dragstart")));
     await act(async () => destination.dispatchEvent(dragEvent("drop")));

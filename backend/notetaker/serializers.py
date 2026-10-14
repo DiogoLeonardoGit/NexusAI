@@ -22,6 +22,7 @@ from .models import (
     Summary,
     Task,
     TaskSection,
+    TaskTimeEntry,
     TranscriptSegment,
     transcript_segment_sort_key,
 )
@@ -300,8 +301,27 @@ class TaskSectionSerializer(serializers.ModelSerializer):
         return result
 
 
+class TaskTimeEntrySerializer(serializers.ModelSerializer):
+    """Accept only positive, whole-minute manual entries; delivery metadata is read-only."""
+    duration_seconds = serializers.IntegerField(min_value=60, max_value=2147483647)
+
+    class Meta:
+        model = TaskTimeEntry
+        fields = ("id", "duration_seconds", "sync_state", "error", "created_at", "synced_at")
+        read_only_fields = ("id", "sync_state", "error", "created_at", "synced_at")
+
+    def validate_duration_seconds(self, value):
+        if value % 60:
+            raise serializers.ValidationError("Regista o tempo em minutos inteiros.")
+        return value
+
+
 class TaskSerializer(serializers.ModelSerializer):
+    # Project is derived from the meeting; the legacy model field is not exposed.
+    project = serializers.IntegerField(source="session.project_id", read_only=True, allow_null=True, default=None)
     gitlab = serializers.SerializerMethodField()
+    gitlab_export = serializers.SerializerMethodField()
+    time_tracking = serializers.SerializerMethodField()
     source_meeting_id = serializers.IntegerField(source="source_segment.session_id", read_only=True)
     source_start_ms = serializers.IntegerField(source="source_segment.timeline_start_ms", read_only=True)
     meeting_title = serializers.CharField(source="session.title", read_only=True)
@@ -311,18 +331,43 @@ class TaskSerializer(serializers.ModelSerializer):
     reminder_notified_at = serializers.SerializerMethodField()
     reminder_minutes_before = serializers.SerializerMethodField()
 
+    def get_time_tracking(self, instance):
+        """Combine confirmed remote totals with pending increments without double counting.
+
+        Uncertain entries are displayed separately because the remote total may
+        already include them; an imported total must never be sent back as an increment.
+        """
+        entries = list(instance.time_entries.all())
+        pending = sum(entry.duration_seconds for entry in entries if entry.sync_state == TaskTimeEntry.SyncState.PENDING)
+        uncertain = sum(entry.duration_seconds for entry in entries if entry.sync_state in (TaskTimeEntry.SyncState.SENDING, TaskTimeEntry.SyncState.UNCERTAIN))
+        remote = instance.gitlab.snapshot.get("total_time_spent", 0) if hasattr(instance, "gitlab") else 0
+        total = remote + pending if hasattr(instance, "gitlab") else sum(entry.duration_seconds for entry in entries)
+        return {"total_seconds": total, "remote_seconds": remote, "pending_seconds": pending,
+                "uncertain_seconds": uncertain, "entries_count": len(entries)}
+
+    def get_gitlab_export(self, instance):
+        """Expose an uncertain creation state without credentials or remote response bodies."""
+        if hasattr(instance, "gitlab"):
+            return None
+        from .services.gitlab_sync import publish_key
+        reservation = AppSetting.objects.filter(key=publish_key(instance.pk)).values_list("value", flat=True).first()
+        return {"state": reservation.get("state", "uncertain")} if isinstance(reservation, dict) else None
+
     def get_gitlab(self, instance):
         try:
             link = instance.gitlab
         except GitLabTask.DoesNotExist:
             return None
         return {"web_url": link.web_url, "issue_iid": link.issue_iid, "project_id": link.project_id,
-                "active": link.active, "hidden": link.hidden, "pending": bool(link.pending),
+                "active": link.active, "hidden": link.hidden, "pending": bool(link.pending) or any(
+                    entry.sync_state != TaskTimeEntry.SyncState.SENT for entry in instance.time_entries.all()),
                 "conflicts": link.conflicts, "error": link.error,
                 "available_tag_ids": list(GitLabLabel.objects.filter(connection=link.connection, project_id=link.project_id,
                                                                        available=True).values_list("tag_id", flat=True))}
 
     def validate(self, attrs):
+        if "project" in self.initial_data:
+            raise serializers.ValidationError({"project": "Associa a tarefa a uma reunião. O projeto é determinado pela reunião."})
         if self.instance is None or not hasattr(self.instance, "gitlab"):
             return attrs
         link = self.instance.gitlab
@@ -340,13 +385,15 @@ class TaskSerializer(serializers.ModelSerializer):
         return attrs
 
     def update(self, instance, validated_data):
-        from .services.gitlab_sync import queue_task, sync_lock
+        from .services.gitlab_sync import COMPLETION_LABELS, queue_task, sync_lock
         with sync_lock, transaction.atomic():
             instance = super().update(instance, validated_data)
             if "status" in validated_data:
                 instance.completed_at = (instance.completed_at or timezone.now()) if instance.status == "done" else None
                 instance.save(update_fields=["completed_at"])
                 if instance.status == "done":
+                    # Remove only task memberships; keep the reusable label catalogue.
+                    instance.tags.remove(*instance.tags.filter(name__in=COMPLETION_LABELS))
                     instance.reminders.update(status=Reminder.Status.CANCELLED)
             queue_task(instance)
             return instance
@@ -412,6 +459,12 @@ class ProjectSerializer(serializers.ModelSerializer):
 
 
 class TagSerializer(serializers.ModelSerializer):
+    is_gitlab = serializers.SerializerMethodField()
+
+    def get_is_gitlab(self, obj):
+        """Expose remote ownership to protect imported labels in local controls."""
+        return obj.gitlab_labels.exists()
+
     def validate_name(self, value):
         if self.instance and value != self.instance.name and self.instance.gitlab_labels.exists():
             raise serializers.ValidationError("As etiquetas importadas são geridas no catálogo GitLab.")

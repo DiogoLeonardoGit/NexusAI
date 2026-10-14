@@ -39,7 +39,7 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 .task.overdue { border-color: #d85b63; box-shadow: 0 0 0 1px #d85b6344; }
 .task-alert { display: grid; place-items: center; flex: 0 0 24px; width: 24px; height: 24px; border-radius: 50%; color: #161109; background: #e8bd50; font-weight: 900; }
 .task.overdue .task-alert { color: white; background: #d85b63; }
-.task-body { flex: 1; min-width: 0; }
+.task-body { flex: 1; min-width: 0; text-align: left; }
 .check { width: 24px; height: 24px; border: 1px solid #495568; border-radius: 7px; color: transparent; background: transparent; }
 .check:hover, .check.done { border-color: #c9f27b; color: #0f140b; background: #c9f27b; }
 .warning { display: inline-block; margin-top: 8px; padding: 4px 8px; border: 0; border-radius: 6px; color: #ffd18a; background: #3d2b14; font-size: 12px; }
@@ -57,6 +57,7 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 .text-button.secondary-text { margin-left: 10px; color: #98a4b5; }
 .task-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
 .task-card-header > div { flex: 0 0 auto; }
+.task-card-header > h3 { min-width: 0; overflow-wrap: anywhere; }
 .task-title-input, .task-description-input, .task-meta input, .task-meta select { padding: 7px 9px; border: 0; outline: none; border-radius: 0; color: #e8edf4; background: transparent; }
 .task-title-input { width: min(620px, 100%); min-width: 0; font-weight: 700; }
 .task-description { margin: 2px 0 6px; color: #cbd4df; white-space: pre-wrap; }
@@ -64,6 +65,11 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 .task-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: #94a0b1; line-height: 1.5; }
 .task-meta .warning { margin-top: 0; }
 .task-meta .schedule-editor { flex-basis: 100%; }
+.task-time-total { font-variant-numeric: tabular-nums; color: #cbd4df; }
+.task-time-pending, .task-time-uncertain { color: #d9bd7f; }
+.task-time-editor { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; flex-basis: 100%; padding: 12px; margin: 6px 0; border: 1px solid #303949; border-radius: 8px; background: #10161d; }
+.task-time-editor label { display: grid; gap: 5px; font-size: 12px; }
+.task .task-time-editor input { width: 100px; padding: 8px; border: 1px solid #303949; border-radius: 6px; color: #e8edf4; background: #0f141c; }
 .task-meta.editing .schedule-editor { flex-basis: auto; margin-top: 0; }
 .task-meta input, .task-meta select { padding: 4px 7px; }
 .task-meta select { border: 1px solid #303949; border-radius: 7px; background: #0f141c; }
@@ -348,6 +354,21 @@ button.search-result:hover { border-color: #526f35; }
 .task-filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 14px; }
 .task-filter-row .filters { flex: 1 1 auto; min-width: 0; margin-bottom: 0; flex-wrap: wrap; }
 .task-filter-row .view-switch { flex-shrink: 0; margin-left: auto; }
+.task-bulk-popup { position: relative; flex: 0 0 auto; }
+.task-bulk-popup > summary { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 9px 12px; border: 1px solid #394354; border-radius: 9px; background: #171d26; color: #c7d0dc; font-size: 13px; list-style: none; cursor: pointer; }
+.task-bulk-popup > summary::-webkit-details-marker { display: none; }
+.task-bulk-popup.is-selecting > summary { border-color: #648b3a66; color: #d9edbf; background: #28371f; }
+.task-bulk-popup > summary[aria-disabled="true"] { opacity: .65; cursor: default; }
+.task-bulk-popup > summary:focus-visible { outline: 2px solid #c9f27b; outline-offset: 3px; }
+.bulk-selection-count { padding: 1px 6px; border-radius: 10px; background: #c9f27b; color: #142007; font-size: 11px; }
+.task-bulk-controls { position: absolute; z-index: 20; top: calc(100% + 8px); right: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 12px; width: min(460px, calc(100vw - 48px)); max-height: 70vh; overflow-y: auto; padding: 16px; border: 1px solid #394354; border-radius: 10px; background: #10161d; box-shadow: 0 12px 30px #0008; }
+.task-bulk-controls strong { color: #c3cddb; font-size: 12px; }
+.bulk-label-picker { flex: 1 1 230px; min-width: 0; }
+.bulk-label-picker .multi-select { width: 100%; }
+.task-selection { flex: 0 0 18px; width: 18px; height: 18px; margin: 3px 0 0; accent-color: #c9f27b; cursor: pointer; }
+.task-action-result { margin-bottom: 14px; color: #c9e7aa; font-size: 13px; }
+.task-section-heading[draggable="true"] { cursor: grab; }
+.task-section-heading[draggable="true"]:active { cursor: grabbing; }
 .organization-toolbar { position: relative; }
 .organization-toolbar.with-task-action .filter-panel > summary { min-height: 40px; }
 .organization-toolbar > .add-task-button { position: absolute; top: 0; right: 0; }
@@ -364,13 +385,20 @@ button.search-result:hover { border-color: #526f35; }
 .task-board { display: flex; overflow-x: auto; align-items: flex-start; gap: 16px; padding-bottom: 16px; }
 .task-board .task-section { flex: 0 0 360px; max-width: 90vw; }
 .task-board .task { min-width: 0; }
-.task-board .task-card-header { flex-wrap: wrap; }
-.task-board .item-actions { flex-wrap: wrap; }
+.task-board-card { padding: 14px 16px; text-align: left; }
+.task-board-card[draggable="true"] { cursor: grab; }
+.task-board-card[draggable="true"]:active { cursor: grabbing; }
+.task-board-card > h3 { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; line-height: 1.5; }
 .task-labels { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
 .label-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border: 1px solid #46525e; border-radius: 14px; font-size: 12px; }
 .label-chip i { width: 9px; height: 9px; border-radius: 50%; }
 .gitlab-icon { width: 22px; height: 22px; flex-shrink: 0; vertical-align: middle; }
 .gitlab-origin { padding: 3px; border: 0; background: transparent; }
+.gitlab-publish { display: inline-flex; align-items: center; padding: 3px; border: 0; background: transparent; color: #b8d992; }
+.gitlab-publish:disabled { cursor: not-allowed; opacity: .55; }
+.local-to-gitlab-icon { display: inline-flex; align-items: center; gap: 2px; }
+.local-to-gitlab-icon > svg { width: 19px; height: 19px; flex-shrink: 0; }
+.gitlab-publish:focus-visible { outline: 2px solid #c9f27b; outline-offset: 3px; border-radius: 4px; }
 .sync-pending { color: #d9bd7f; display: block; margin: 5px 0; }
 .sync-conflict { padding: 12px; border: 1px solid #d9bd7f; border-radius: 8px; margin: 8px 0; }
 .sync-conflict button { margin: 4px; }
@@ -380,7 +408,7 @@ button.search-result:hover { border-color: #526f35; }
 .gitlab-settings-brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
 .gitlab-brand-icon { display: grid; place-items: center; flex: 0 0 46px; height: 46px; border: 1px solid #fca32626; border-radius: 13px; background: #fc6d260d; }
 .gitlab-brand-icon .gitlab-icon { width: 28px; height: 28px; }
-.gitlab-settings h2 { margin: 0 0 5px; font-size: 21px; font-weight: 700; letter-spacing: -.02em; }
+.gitlab-settings h2 { margin: 0 0 5px; font-size: 21px; font-weight: 700; letter-spacing: -.02em; text-align: left; }
 .gitlab-settings .gitlab-settings-brand p { margin: 0; font-size: 13px; }
 .gitlab-settings-badges { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .gitlab-connection-badge, .gitlab-mode-badge { display: inline-flex; align-items: center; gap: 7px; padding: 6px 10px; border: 1px solid #34404f; border-radius: 999px; color: #a8b3c2; background: #19212c; font-size: 11px; font-weight: 600; white-space: nowrap; }
@@ -421,7 +449,19 @@ button.search-result:hover { border-color: #526f35; }
 .gitlab-sync-explanation > strong { color: #c3cddb; font-size: 12px; font-weight: 600; }
 .gitlab-settings .gitlab-sync-explanation p { margin: 7px 0; color: #8f9bac; font-size: 12px; line-height: 1.6; }
 .gitlab-sync-explanation small { display: block; color: #718095; font-size: 11px; line-height: 1.5; }
-.gitlab-sync-actions { display: flex; flex-shrink: 0; flex-wrap: wrap; gap: 9px; }
+.gitlab-sync-actions { display: flex; flex-wrap: wrap; gap: 9px; }
+.gitlab-write-toggle { display: flex; align-items: center; gap: 12px; margin-top: 24px; color: #dbe3ed; font-size: 13px; }
+.gitlab-write-toggle input { accent-color: #c9f27b; width: 18px; height: 18px; }
+.gitlab-write-toggle small { display: block; margin-top: 5px; color: #8f9bac; }
+.tag-management-item { display: flex; align-items: center; gap: 8px; }
+.notes-workspace { display: grid; gap: 18px; }
+.notes-filters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.notes-filters label, .note-editor > label { display: grid; gap: 8px; color: #aab6c6; font-size: 13px; }
+.notes-filters input, .note-editor input, .note-editor textarea { width: 100%; padding: 10px; border: 1px solid #303949; border-radius: 8px; color: #e8edf4; background: #0f141c; }
+.note-editor { display: grid; gap: 16px; }
+.note-editor textarea { resize: vertical; }
+.note-body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.note-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 16px; color: #8794a7; }
 .gitlab-settings-error { margin: 0 0 20px; padding: 14px 16px; border: 1px solid #a7604e66; border-radius: 9px; color: #f0c0ac; background: #39201b66; font-size: 12px; }
 .gitlab-settings .gitlab-settings-error p { margin: 6px 0 0; color: #d6a895; font-size: 12px; line-height: 1.6; }
 @media (max-width: 1200px) {

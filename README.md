@@ -2,7 +2,7 @@
 
 Assistente pessoal desktop para Windows. Captura microfone e áudio do sistema, transcreve português e inglês com Faster Whisper e usa o `gemma4:12b` local através do Ollama para criar resumos, tarefas e lembretes.
 
-Áudio, transcrições e notas permanecem no computador. O frontend comunica apenas com o backend local, que escuta em `127.0.0.1`. A integração GitLab opcional consulta tarefas na instância empresarial através do backend; nesta fase, não envia alterações.
+Áudio, transcrições e notas permanecem no computador. O frontend comunica apenas com o backend local, que escuta em `127.0.0.1`. A integração GitLab opcional consulta tarefas na instância empresarial através do backend e permite enviar alterações manualmente, após ativar o modo de escrita.
 
 ## Requisitos
 
@@ -76,13 +76,14 @@ O backend é empacotado como pasta para evitar o atraso de extração de execut�
 ## Projetos, etiquetas e trabalho diário
 
 A vista Projetos permite criar e editar projetos e etiquetas e reúne reuniões, decisões,
-notas e tarefas. Os conteúdos têm controlos para atribuir projetos e etiquetas.
+notas e tarefas. Reuniões e notas têm controlos para atribuir projetos; tarefas escolhem
+uma reunião e herdam exclusivamente o projeto dessa reunião. Etiquetas organizam as tarefas.
 Acede a Projetos no menu lateral. A criação seleciona imediatamente o projeto e mostra
 uma confirmação; a edição usa formulários da aplicação. Os seletores usam menus próprios
 com navegação por setas, Enter para escolher e Escape para fechar.
-Novas tarefas extraídas herdam a organização atual da reunião; alterações manuais posteriores
-são preservadas. Notas e tarefas sem projeto próprio também aparecem através do projeto da
-reunião de origem. Uma atribuição explícita a outro projeto prevalece.
+Novas tarefas extraídas ficam associadas à reunião. Se a reunião mudar de projeto, as suas
+tarefas acompanham essa mudança. Nas notas, um projeto próprio continua a prevalecer sobre
+o projeto da reunião de origem.
 
 Em Tarefas, o botão `+`, alinhado com os filtros, abre a criação inline. O formulário
 fecha após guardar ou cancelar. Projetos e Hoje conservam os seus formulários atuais.
@@ -114,7 +115,7 @@ Projetos e etiquetas exigem uma migration, com autorizações separadas para cri
 conforme o AGENTS.md. O empacotamento também requer uma base inicial vazia com o schema
 atualizado; não distribuir uma base com dados pessoais.
 
-## Integração GitLab — fase de consulta
+## Integração GitLab — consulta e envio manual
 
 A ligação está limitada a `https://gitlab.warpcom.com` e ao projeto
 `serviceunit/django-apps/twinportal`. É necessário acesso VPN e um token pessoal com
@@ -124,8 +125,8 @@ encriptado pelo Windows (`safeStorage`) na pasta de dados da aplicação. O back
 recebe-o apenas em memória; não é devolvido pela API nem guardado na SQLite.
 O modo de desenvolvimento só em browser não persiste credenciais.
 
-A sincronização está **desativada por defeito**. Ativar permite exclusivamente consultas
-e importação nesta fase. Desativar impede novos pedidos, incluindo novas páginas de uma
+A sincronização e o modo de escrita estão **desativados por defeito**. Ativar a sincronização permite consultas
+e importação. Desativar impede novos pedidos, incluindo novas páginas de uma
 consulta em curso; um pedido HTTP já enviado pode terminar. O controlo está em Definições
 e na aba Tarefas. Há sincronização ao iniciar o backend, a cada 60 segundos e no botão
 Sincronizar agora, enquanto a aplicação estiver em execução, mesmo minimizada.
@@ -138,17 +139,64 @@ alterações. Os registos locais são preservados. `Ocultar nesta app` conserva 
 externa e evita reimportação; não elimina nem fecha tarefas no GitLab.
 
 As tarefas importadas mostram o ícone GitLab, que abre a origem no browser. As locais
-continuam locais. Projetos e ligações a reuniões permanecem independentes do projeto GitLab.
+continuam locais. As tarefas podem ser associadas a reuniões locais e herdam o projeto
+dessas reuniões; esta organização é independente do projeto GitLab.
 Etiquetas remotas mantêm referências por projeto/ID e só podem ser escolhidas no projeto
 de origem. Renomear etiquetas importadas é feito no GitLab; retirar uma etiqueta de uma
 tarefa é permitido localmente e fica pendente.
 
 Concluir/reabrir, editar título/descrição e alterar etiquetas atualiza a app e guarda
-alterações pendentes. **Nenhuma dessas alterações é enviada nesta fase**, mesmo com a
-sincronização ativa. A barreira `REMOTE_WRITES_ALLOWED = False`, no cliente GitLab,
-bloqueia todos os métodos remotos de escrita antes do transporte. A lógica de emissão
-de deltas está implementada e validada com respostas simuladas; ativar escritas exigirá
-uma autorização futura e uma alteração deliberada dessa barreira.
+alterações pendentes. Em Definições > GitLab, ativa **Permitir escrita no GitLab** e
+clica em **Enviar alterações pendentes** para enviar os updates. A preferência é guardada
+nas configurações existentes. A consulta automática e **Sincronizar agora** nunca enviam
+alterações, mesmo com escrita ativa. O cliente verifica a autorização manual, o modo de
+escrita e a sincronização antes de cada pedido de escrita. Um pedido já enviado pode terminar.
+Antes do envio, a app volta a verificar a atribuição e os conflitos. Tarefas ocultas,
+sem atribuição/acesso ou com conflitos não são enviadas. Falhas mantêm as alterações
+pendentes e o card apresenta o resultado. O envio de alterações atualiza tarefas já
+ligadas ao GitLab; reuniões, os respetivos projetos e lembretes continuam locais.
+
+Nas tarefas locais, o botão **local → GitLab**, no lugar do ícone de origem, cria um
+ticket no projeto GitLab configurado. Requer tarefa aberta com responsável **Eu**,
+sincronização e escrita ativas e token configurado. Todas as labels têm de existir no
+catálogo GitLab e é obrigatória pelo menos uma de **To Do**, **On Going** ou
+**On Testing / Pending Deploy**. Labels inexistentes ou com vírgulas bloqueiam o envio;
+o backend consulta novamente o catálogo antes da criação e não cria labels locais no GitLab.
+Depois do sucesso, a mesma tarefa recebe a ligação e o ícone GitLab normal, mantendo
+a origem local e a reunião. O Quadro continua a apresentar apenas o título.
+Um registo de envio pendente nas configurações existentes impede outra criação após
+uma resposta incerta ou uma falha ao guardar a ligação. Nesses casos, é necessário
+verificar o ticket no GitLab antes de resolver o envio; não há repetição automática.
+
+Ao concluir uma tarefa na app, são removidas apenas as suas associações às etiquetas
+`To Do`, `On Going` e `On Testing / Pending Deploy`, quando existirem. As outras etiquetas
+e o catálogo são preservados. Nas tarefas GitLab, a remoção fica pendente juntamente
+com o fecho e é enviada pelo botão manual; a reconciliação também retira essas etiquetas
+se forem adicionadas remotamente antes do envio do fecho pendente. Reabrir não as repõe.
+Esta regra não altera retroativamente tarefas já fechadas.
+
+### Tempo gasto por tarefa
+
+Na vista Lista, **Registar tempo** adiciona horas e minutos ao total da tarefa.
+Cada registo é guardado separadamente; guardar não altera o tempo anterior nem envia
+pedidos de escrita ao GitLab. O tempo é preservado ao fechar ou reabrir a tarefa.
+O Quadro continua a apresentar apenas o título.
+
+Nas tarefas ligadas ao GitLab, a consulta importa o total remoto e o botão manual de
+envio acrescenta apenas os registos locais pendentes, com escrita e sincronização ativas.
+O total apresentado inclui o total GitLab confirmado e o tempo local pendente.
+Tempo com resposta incerta aparece separadamente, porque pode já constar do total remoto;
+esses registos não são repetidos automaticamente. Pedidos rejeitados continuam pendentes.
+Ao publicar uma tarefa local, os registos mantêm-se na mesma tarefa e ficam pendentes
+para o botão de envio. As alterações de título, labels e estado são confirmadas separadamente
+dos registos de tempo, preservando sucessos parciais.
+
+Os registos são persistidos na nova tabela `TaskTimeEntry`. A migration correspondente
+tem de ser criada, revista e aplicada com as autorizações separadas previstas no projeto.
+
+Na aba Tarefas, **Upload changes to GitLab** fica junto de **Desativar sincronização**
+e envia todas as alterações GitLab pendentes, com os mesmos bloqueios do card nas
+definições. Este envio é independente da seleção de tarefas.
 
 O sincronismo compara a última versão remota com as alterações locais. Campos independentes
 e alterações de etiquetas são conciliados; conflitos de título, descrição ou estado ficam
@@ -163,3 +211,41 @@ Foi aplicada à base local com uma cópia SQLite consistente em `data/backups/`.
 Também foi atualizada a base vazia `backend/template/notetaker.sqlite3` usada pelo
 instalador, sem copiar tarefas, reuniões, projetos, credenciais ou dados pessoais.
 Os testes de sincronismo simulam o GitLab e não fazem pedidos à instância real.
+
+## Notas e organização
+
+A aba **Notas** reúne as notas existentes de reuniões e as notas pessoais sem reunião.
+Permite criar e editar título/conteúdo, associar reunião, projeto e etiquetas, pesquisar,
+filtrar por origem/projeto/etiqueta e abrir a reunião de origem. Não duplica as notas.
+O fluxo de organização das tarefas é **Projeto → Reuniões → Tarefas**. Uma tarefa só
+pode ser associada a uma reunião, que determina o seu projeto. Os cartões e contagens
+na aba **Projetos**, os filtros e a pesquisa seguem essa relação. Nas reuniões do projeto,
+as tarefas reutilizam os mesmos cartões e controlos da aba Tarefas.
+Tarefas existentes ou importadas sem reunião permanecem na aba **Tarefas**, onde podem
+ser associadas a uma reunião. O campo antigo de projeto direto permanece na base por
+compatibilidade, sem efeito funcional; não são feitas associações automáticas.
+
+No modo **Quadro**, cada cartão apresenta apenas o título da tarefa e pode ser arrastado
+pelo próprio cartão entre as colunas. A caixa de seleção aparece apenas com **Selecionar
+tarefas** ativo. Os detalhes e as ações individuais continuam disponíveis no modo **Lista**.
+
+Nas listas de Tarefas, Projetos e Reuniões, **Selecionar tarefas**, à direita de **Ordenar
+por**, abre um popup e ativa caixas de seleção separadas do controlo de concluir/reabrir.
+O popup reúne as ações em grupo; fechar com um clique fora ou Escape preserva a seleção.
+**Terminar seleção** limpa-a e desativa as caixas. **Selecionar todas as filtradas** inclui as
+tarefas das vistas recolhidas e conta cada tarefa uma vez, mesmo quando surge em várias
+vistas por etiqueta. Tarefas que deixam de corresponder aos filtros saem da seleção.
+**Adicionar labels** mantém as etiquetas existentes e só apresenta etiquetas compatíveis
+com todas as tarefas selecionadas. **Fechar selecionadas** pede confirmação e aplica as
+mesmas regras de fecho individual, ignorando as já concluídas. A operação é atómica:
+se uma tarefa não permitir a ação, nenhuma é alterada. Os updates GitLab ficam pendentes.
+
+Arrasta os cabeçalhos dos separadores por etiqueta para reorganizar a ordem, guardada
+localmente e partilhada entre Lista e Quadro. Novas vistas surgem depois das existentes;
+Sem etiqueta de vista e Concluídas mantêm as suas posições. Arrastar um separador não
+altera etiquetas das tarefas. Para associar uma tarefa a um projeto, escolhe uma reunião
+desse projeto no menu **Organizar → Reunião e etiquetas** da tarefa.
+
+Em **Projetos > Gerir etiquetas**, **Eliminar** pede confirmação antes de remover uma
+etiqueta local, as suas associações e a vista de tarefas correspondente. As tarefas,
+reuniões e notas são preservadas. Etiquetas importadas permanecem geridas no GitLab.

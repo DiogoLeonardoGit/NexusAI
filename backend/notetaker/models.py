@@ -1,3 +1,4 @@
+from django.core.validators import MinValueValidator
 from django.db import models
 
 
@@ -208,6 +209,26 @@ class Task(models.Model):
     class Meta:
         ordering = ["status", "due_at", "-created_at"]
         indexes = [models.Index(fields=["status", "due_at"])]
+
+
+class TaskTimeEntry(models.Model):
+    """Append-only manual time records with durable GitLab delivery state."""
+
+    class SyncState(models.TextChoices):
+        PENDING = "pending", "Pending"
+        SENDING = "sending", "Sending"
+        SENT = "sent", "Sent"
+        UNCERTAIN = "uncertain", "Uncertain"
+
+    task = models.ForeignKey(Task, related_name="time_entries", on_delete=models.CASCADE)
+    duration_seconds = models.PositiveIntegerField(validators=[MinValueValidator(60)])
+    sync_state = models.CharField(max_length=16, choices=SyncState.choices, default=SyncState.PENDING)
+    error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    synced_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
 
 
 class Reminder(models.Model):

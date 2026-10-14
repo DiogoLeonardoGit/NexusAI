@@ -1,4 +1,4 @@
-"""GitLab REST client. Phase one has a non-configurable remote-write barrier."""
+"""GitLab REST client with persistent opt-in and a manual-request write barrier."""
 
 import json
 import os
@@ -12,10 +12,15 @@ from rest_framework.exceptions import ValidationError
 EXPECTED_EMAIL = "diogo.leonardo@warpcom.com"
 BASE_URL = "https://gitlab.warpcom.com"
 PROJECT_PATH = "serviceunit/django-apps/twinportal"
-# A future, separately authorised release can enable outbound edits here.
-REMOTE_WRITES_ALLOWED = False
+WRITE_SETTING = "gitlab_write_enabled"
 _token = os.getenv("NOTETAKER_GITLAB_TOKEN", "")
 _credential_lock = threading.Lock()
+
+
+def writes_enabled():
+    """Missing or malformed preferences always keep remote writes blocked."""
+    from notetaker.models import AppSetting
+    return AppSetting.objects.filter(key=WRITE_SETTING).values_list("value", flat=True).first() is True
 
 
 class GitLabError(Exception):
@@ -24,6 +29,14 @@ class GitLabError(Exception):
 
 class GitLabDisabled(GitLabError):
     """Abort pagination promptly when the local switch is turned off."""
+
+
+class GitLabCreateUncertain(GitLabError):
+    """A create request may have reached GitLab; repeating it could duplicate an issue."""
+
+
+class GitLabTimeUncertain(GitLabError):
+    """An additive time request may have succeeded and must not be replayed blindly."""
 
 
 class NoRedirects(HTTPRedirectHandler):
@@ -50,18 +63,19 @@ def has_token():
 class GitLabClient:
     """Restrict authenticated requests to the configured HTTPS instance."""
 
-    def __init__(self, connection):
+    def __init__(self, connection, *, allow_writes=False):
         self.connection = connection
+        self.allow_writes = allow_writes
         self.opener = build_opener(NoRedirects())
 
     def request(self, path, method="GET", data=None, query=None):
         if self.connection.base_url.rstrip("/") != BASE_URL or not path.startswith("/") or urlsplit(path).netloc:
             raise GitLabError("Destino GitLab inválido.")
-        if method != "GET" and (not REMOTE_WRITES_ALLOWED or not self.connection.enabled):
-            raise GitLabError("Escritas no GitLab bloqueadas nesta fase.")
         self.connection.refresh_from_db(fields=["enabled"])
         if not self.connection.enabled:
             raise GitLabDisabled("Sincronização desativada.")
+        if method != "GET" and (not self.allow_writes or not writes_enabled()):
+            raise GitLabError("Escrita desativada ou envio manual não autorizado.")
         with _credential_lock:
             credential = _token
         if not credential:
@@ -77,10 +91,20 @@ class GitLabClient:
             with self.opener.open(request, timeout=20) as response:
                 return json.load(response), response.headers.get("X-Next-Page", "")
         except HTTPError as exc:
+            if method == "POST" and path.endswith("/add_spent_time") and exc.code >= 500:
+                raise GitLabTimeUncertain("O envio de tempo ficou incerto. Verifica o GitLab antes de repetir o registo.") from exc
+            if method == "POST" and path.endswith("/issues") and exc.code >= 500:
+                raise GitLabCreateUncertain("A resposta à criação ficou incerta. Verifica o GitLab antes de tentar novamente.") from exc
             messages = {401: "Token inválido ou expirado.", 403: "Sem permissão no GitLab.",
                         404: "Tarefa ou projeto indisponível.", 429: "Limite de pedidos atingido; será feita nova tentativa."}
+            if method == "POST" and (path.endswith("/issues") or path.endswith("/add_spent_time")):
+                messages[429] = "Limite de pedidos atingido. Tenta novamente mais tarde."
             raise GitLabError(messages.get(exc.code, f"GitLab respondeu com HTTP {exc.code}.")) from exc
         except (URLError, TimeoutError, OSError, ValueError) as exc:
+            if method == "POST" and path.endswith("/add_spent_time"):
+                raise GitLabTimeUncertain("O envio de tempo ficou incerto. Verifica o GitLab antes de repetir o registo.") from exc
+            if method == "POST" and path.endswith("/issues"):
+                raise GitLabCreateUncertain("A resposta à criação ficou incerta. Verifica o GitLab antes de tentar novamente.") from exc
             raise GitLabError("Não foi possível consultar o GitLab. Verifica VPN, rede e certificado.") from exc
 
     def get(self, path, **query):
@@ -102,6 +126,19 @@ class GitLabClient:
 
     def project(self):
         return self.get("/projects/" + quote(PROJECT_PATH, safe=""))
+
+    def create_task(self, task, project_id, user_id, labels):
+        """Create one explicitly approved issue; labels must be prevalidated by the caller."""
+        return self.request(f"/projects/{project_id}/issues", "POST", {
+            "title": task.title, "description": task.description,
+            "assignee_ids": [user_id], "labels": ",".join(sorted(labels)),
+        })[0]
+
+    def add_spent_time(self, link, duration_seconds):
+        """Send one minute-precision time increment, preserving existing remote time."""
+        return self.request(f"/projects/{link.project_id}/issues/{link.issue_iid}/add_spent_time", "POST", {
+            "duration": f"{duration_seconds // 60}m",
+        })[0]
 
     def update_task(self, link, changes):
         """Send only field deltas; never replace unrelated remote labels."""

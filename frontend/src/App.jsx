@@ -4,13 +4,22 @@ import { api, apiText } from "./api";
 import Select from "./Select";
 import MultiSelect from "./MultiSelect";
 import Popup, { useOutsideDismiss } from "./Popup";
-import GitLabSettings, { GitLabIcon } from "./GitLabSettings";
+import GitLabSettings, { GitLabIcon, LocalToGitLabIcon } from "./GitLabSettings";
+import Notes from "./Notes";
 import { moveTaskLabels, tasksForLabelView } from "./taskLabels";
 import { startActiveListening, startCapture } from "./capture";
 
 
-const VIEWS = ["Hoje", "Tarefas", "Projetos", "Reuniões", "Pesquisa", "Definições", "Logs"];
+const VIEWS = ["Hoje", "Tarefas", "Projetos", "Reuniões", "Notas", "Pesquisa", "Definições", "Logs"];
 const REMINDER_OPTIONS = [[0, "Na hora"], [5, "5 minutos antes"], [15, "15 minutos antes"], [30, "30 minutos antes"], [60, "1 hora antes"], [1440, "1 dia antes"]];
+const GITLAB_PRIMARY_LABELS = new Set(["To Do", "On Going", "On Testing / Pending Deploy"]);
+
+// Format stored seconds without losing precision in imported GitLab totals.
+function formatTrackedTime(seconds = 0) {
+  const value = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(value / 3600), minutes = Math.floor(value % 3600 / 60), remainder = value % 60;
+  return [hours && `${hours}h`, minutes && `${minutes}m`, remainder && `${remainder}s`].filter(Boolean).join(" ") || "0m";
+}
 
 // Explicit date orders override the default; missing deadlines always stay last.
 function compareTasks(left, right, order = "default") {
@@ -85,13 +94,14 @@ function deadlineGroup(task, now = new Date()) {
   return localDateValue(due) <= localDateValue(limit) ? "Próximos sete dias" : "Mais tarde";
 }
 
-function matchesOrganization(item, project, tag, sessions) {
+function matchesOrganization(item, project, tag, sessions, meetingProjectOnly = false) {
   const meeting = sessions.find((session) => session.id === item.session);
-  return (!project || String(item.project ?? meeting?.project) === String(project)) &&
+  const projectId = meetingProjectOnly ? meeting?.project : item.project ?? meeting?.project;
+  return (!project || String(projectId) === String(project)) &&
     (!tag || item.tags?.includes(Number(tag)));
 }
 
-function OrganizationFields({ item, projects, tags, onSave, showTags = false, sessions }) {
+function OrganizationFields({ item, projects, tags, onSave, showTags = false, sessions, allowProject = true }) {
   const [saving, setSaving] = useState(false);
   const save = async (changes) => {
     if (saving) return;
@@ -99,9 +109,9 @@ function OrganizationFields({ item, projects, tags, onSave, showTags = false, se
     try { await onSave(changes); } finally { setSaving(false); }
   };
   return <div className="organization-fields">
-    <label>Projeto<Select disabled={saving} value={item.project || ""} onChange={(event) => save({ project: event.target.value ? Number(event.target.value) : null })}>
+    {allowProject && <label>Projeto<Select disabled={saving} value={item.project || ""} onChange={(event) => save({ project: event.target.value ? Number(event.target.value) : null })}>
       <option value="">Sem projeto</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-    </Select></label>
+    </Select></label>}
     {showTags && <div className="organization-label-field"><span>Etiquetas</span><MultiSelect options={tags} value={item.tags || []} disabled={saving} onChange={(value) => save({ tags: value })}/></div>}
     {sessions && <label>Reunião<Select aria-label="Reunião associada" disabled={saving} value={item.session || ""} onChange={(event) => save({ session: event.target.value ? Number(event.target.value) : null })}>
       <option value="">Sem reunião</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title || "Reunião sem título"}</option>)}
@@ -111,9 +121,10 @@ function OrganizationFields({ item, projects, tags, onSave, showTags = false, se
 
 // Assignment controls sit beside actions, keeping the reading flow clear.
 function OrganizationMenu(props) {
-  const project = props.projects.find((item) => item.id === props.item.project);
+  const meeting = props.sessions?.find((item) => item.id === props.item.session);
+  const project = props.projects.find((item) => item.id === (props.allowProject === false ? meeting?.project : props.item.project));
   const labels = props.showTags ? props.tags.filter((item) => props.item.tags?.includes(item.id)) : [];
-  const heading = props.showTags ? "Projeto e etiquetas" : "Projeto";
+  const heading = props.allowProject === false ? "Reunião e etiquetas" : props.showTags ? "Projeto e etiquetas" : "Projeto";
   return <Popup className="organization-menu"><summary aria-label={`Organizar ${heading.toLocaleLowerCase()}`} title={[project?.name, ...labels.map((item) => item.name)].filter(Boolean).join(" · ") || heading}>Organizar</summary>
     <div className="organization-panel"><h4>{heading}</h4><OrganizationFields {...props}/></div>
   </Popup>;
@@ -132,7 +143,7 @@ function ReferenceInfo({ children, label = "Referências" }) {
   </span>;
 }
 
-function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, onError, onOpen, onProjectSaved, onTagSaved }) {
+function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, onError, onOpen, onProjectSaved, onTagSaved, taskProps }) {
   const [selected, setSelected] = useState(null), [name, setName] = useState(""), [description, setDescription] = useState(""), [tagName, setTagName] = useState("");
   const [editingProject, setEditingProject] = useState(null), [editingTag, setEditingTag] = useState(null);
   const [busy, setBusy] = useState(""), [formError, setFormError] = useState({}), [success, setSuccess] = useState("");
@@ -152,11 +163,10 @@ function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, 
     finally { setBusy(""); }
   };
   const projectSessions = sessions.filter((item) => item.project === project?.id);
-  const projectTasks = tasks.filter((item) => matchesOrganization(item, project?.id, "", sessions));
+  const projectTasks = tasks.filter((item) => matchesOrganization(item, project?.id, "", sessions, true));
   const projectNotes = notes.filter((item) => matchesOrganization(item, project?.id, "", sessions));
   // Associated records live inside their meeting; standalone records remain directly navigable.
   const standaloneNotes = projectNotes.filter((note) => !projectSessions.some((meeting) => meeting.id === note.session));
-  const standaloneTasks = projectTasks.filter((task) => !projectSessions.some((meeting) => meeting.id === task.session));
   const projectSubmit = async (event) => {
     event.preventDefault();
     const item = await save("projects", { name: (editingProject ? editingProject.name : name).trim(), description: editingProject ? editingProject.description : description }, editingProject?.id);
@@ -166,6 +176,17 @@ function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, 
     event.preventDefault();
     const item = await save("tags", { name: (editingTag ? editingTag.name : tagName).trim() }, editingTag?.id);
     if (item) { setTagName(""); setEditingTag(null); setForm(null); }
+  };
+  // Removing a local label also removes its view, never its associated contents.
+  const deleteTag = async (tag) => {
+    if (busy || tag.is_gitlab || !window.confirm(`Eliminar a etiqueta “${tag.name}”? As associações e a sua vista de tarefas serão removidas. As tarefas, reuniões e notas serão mantidas.`)) return;
+    setBusy("delete-tag"); setFormError({}); setSuccess("");
+    try {
+      await api(`/tags/${tag.id}/`, { method: "DELETE" });
+      if (editingTag?.id === tag.id) setEditingTag(null);
+      setSuccess("Etiqueta eliminada."); await refresh();
+    } catch (error) { setFormError({ tags: error.message }); }
+    finally { setBusy(""); }
   };
   return <div className="projects-workspace">
     {project && <button type="button" className="back" onClick={() => { setSelected(null); setForm(null); }}>← Todos os projetos</button>}
@@ -185,10 +206,10 @@ function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, 
           {formError.tags && <p className="field-error" role="alert">{formError.tags}</p>}
           <div className="form-actions"><button className="primary-action" type="submit" disabled={Boolean(busy) || !(editingTag ? editingTag.name : tagName).trim()}>{busy === "tags" && <Spinner/>}{editingTag ? "Guardar etiqueta" : "Criar etiqueta"}</button><button className="secondary-action" type="button" onClick={() => { setEditingTag(null); setForm(null); }}>Cancelar</button></div>
         </form>
-        <div className="tag-management">{tags.map((tag) => <button type="button" className="tag-pill" key={tag.id} disabled={Boolean(busy)} onClick={() => { setEditingTag({ ...tag }); setFormError({}); }}>{tag.name}<span aria-hidden="true">✎</span><span className="sr-only">Editar etiqueta</span></button>)}</div>
+        <div className="tag-management">{tags.map((tag) => <div className="tag-management-item" key={tag.id}><button type="button" className="tag-pill" disabled={Boolean(busy)} onClick={() => { setEditingTag({ ...tag }); setFormError({}); }}>{tag.name}<span aria-hidden="true">✎</span><span className="sr-only">Editar etiqueta</span></button><button type="button" className="text-button danger" aria-label={`Eliminar etiqueta ${tag.name}`} disabled={Boolean(busy) || tag.is_gitlab} title={tag.is_gitlab ? "Etiqueta gerida no GitLab" : "Eliminar etiqueta local"} onClick={() => deleteTag(tag)}>Eliminar</button></div>)}</div>
       </div>}
     </div>}
-    {!project && (projects.length ? <div className="project-grid">{projects.map((item) => <button type="button" className={`project-tile ${selected === item.id ? "selected" : ""}`} aria-pressed={selected === item.id} key={item.id} onClick={() => setSelected(item.id)}><strong>{item.name}</strong><p>{item.description || "Sem descrição"}</p><small>{sessions.filter((session) => session.project === item.id).length} reuniões · {tasks.filter((task) => matchesOrganization(task, item.id, "", sessions)).length} tarefas</small></button>)}</div> : <div className="project-empty"><strong>A tua próxima reunião pode ter um lugar.</strong><p>Usa “Novo projeto” para começar e associa-lhe reuniões ou tarefas.</p></div>)}
+    {!project && (projects.length ? <div className="project-grid">{projects.map((item) => <button type="button" className={`project-tile ${selected === item.id ? "selected" : ""}`} aria-pressed={selected === item.id} key={item.id} onClick={() => setSelected(item.id)}><strong>{item.name}</strong><p>{item.description || "Sem descrição"}</p><small>{sessions.filter((session) => session.project === item.id).length} reuniões · {tasks.filter((task) => matchesOrganization(task, item.id, "", sessions, true)).length} tarefas</small></button>)}</div> : <div className="project-empty"><strong>A tua próxima reunião pode ter um lugar.</strong><p>Usa “Novo projeto” para começar e associa-lhe reuniões.</p></div>)}
     {project && <section className="project-detail">
       <div className="projects-heading"><div><h2>{project.name}</h2><p>{project.description}</p><small>{projectSessions.length} reuniões · {projectTasks.length} tarefas · {projectNotes.length} notas</small></div><button type="button" className="secondary-action" disabled={Boolean(busy)} onClick={() => { setEditingProject({ ...project }); setFormError({}); setForm("project"); }}>Editar projeto</button></div>
       <h3>Reuniões e decisões</h3>
@@ -200,20 +221,32 @@ function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, 
             onKeyDown={(event) => { if (event.key === "Enter") onOpen({ kind: "summary", object_id: summary.id, meeting_id: meeting.id }); }}>
             <SummaryCard summary={summary} title="Resumo"/></div>)}
           <h4>Notas</h4><div className="card-list">{notes.filter((note) => note.session === meeting.id).map((note) => <button type="button" className="card project-content-link" key={note.id} onClick={() => onOpen({ kind: "note", object_id: note.id, meeting_id: meeting.id })}><strong>{note.title || "Nota pessoal"}</strong><p>{note.body}</p></button>)}</div>
-          <h4>Tarefas</h4><div className="card-list">{tasks.filter((task) => task.session === meeting.id).map((task) => <button type="button" className="card project-content-link" key={task.id} onClick={() => onOpen({ kind: "task", object_id: task.id })}><strong>{task.title}</strong>{task.description && <p>{task.description}</p>}<small>{task.status === "done" ? "Concluída" : "Por concluir"}</small></button>)}</div>
+          <h4>Tarefas</h4><TaskList {...taskProps} tasks={projectTasks.filter((task) => task.session === meeting.id)} defaultSession={meeting.id} initialFilter="all"/>
         </div>
       </details>) : <p className="empty">Associa uma reunião a este projeto para consultar as suas decisões aqui.</p>}</div>
       {standaloneNotes.length > 0 && <><h3>Notas sem reunião neste projeto</h3><div className="card-list">{standaloneNotes.map((note) => <button type="button" className="card project-content-link" key={note.id} onClick={() => onOpen({ kind: "note", object_id: note.id, meeting_id: note.session })}><strong>{note.title || "Nota pessoal"}</strong><p>{note.body}</p></button>)}</div></>}
-      {standaloneTasks.length > 0 && <><h3>Tarefas sem reunião neste projeto</h3><div className="card-list">{standaloneTasks.map((task) => <button type="button" className="card project-content-link" key={task.id} onClick={() => onOpen({ kind: "task", object_id: task.id })}><strong>{task.title}</strong>{task.description && <p>{task.description}</p>}</button>)}</div></>}
     </section>}
   </div>;
 }
 
-function TaskCreateButton({ open, onClick }) {
-  return <button type="button" className="add-task-button" aria-label="Adicionar tarefa" title={open ? "Fechar formulário" : "Adicionar tarefa"} aria-expanded={open} aria-controls="new-task-form" onClick={onClick}><span aria-hidden="true">+</span></button>;
+function TaskCreateButton({ open, onClick, formId = "new-task-form" }) {
+  return <button type="button" className="add-task-button" aria-label="Adicionar tarefa" title={open ? "Fechar formulário" : "Adicionar tarefa"} aria-expanded={open} aria-controls={formId} onClick={onClick}><span aria-hidden="true">+</span></button>;
 }
 
-export function TaskList({ tasks, sections = [], showSections, refresh, onError, today, projects = [], tags = [], onOpenSource, targetId, targetKey, defaultProject = null, defaultSession = null, sessions = [], gitlabStatus, createOpen, onCreateOpenChange }) {
+// Recover a usable preference if a previous local order is missing or malformed.
+function readTaskSectionOrder() {
+  try {
+    const value = JSON.parse(localStorage.getItem("taskSectionOrder") || "[]");
+    return Array.isArray(value) ? [...new Set(value.filter((id) => Number.isInteger(id) && id > 0))] : [];
+  } catch (error) {
+    if (error instanceof SyntaxError) return [];
+    throw error;
+  }
+}
+
+export function TaskList({ tasks, sections = [], showSections, refresh, onError, today, projects = [], tags = [], onOpenSource, targetId, targetKey, defaultSession = null, sessions = [], gitlabStatus, createOpen, onCreateOpenChange, initialFilter = "todo", compactCreate = false }) {
+  const localFormId = useId();
+  const formId = showSections ? "new-task-form" : `new-task-${localFormId}`;
   const [title, setTitle] = useState(""), [description, setDescription] = useState("");
   const [newSession, setNewSession] = useState(defaultSession || "");
   const [sectionName, setSectionName] = useState(""), [columnTag, setColumnTag] = useState("");
@@ -223,10 +256,17 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const setShowCreate = onCreateOpenChange ?? setLocalCreateOpen;
   const [taskSearch, setTaskSearch] = useState(""), [taskOrder, setTaskOrder] = useState("default");
   const [unassignedCollapsed, setUnassignedCollapsed] = useState(false), [dropTarget, setDropTarget] = useState(null);
+  const [sectionOrder, setSectionOrder] = useState(readTaskSectionOrder);
   const draggedTask = useRef(null);
-  const [filter, setFilter] = useState("todo"), [editingTask, setEditingTask] = useState(null), [scheduleTask, setScheduleTask] = useState(null);
+  const draggedSection = useRef(null);
+  const orderedSections = [...sectionOrder.map((id) => sections.find((section) => section.id === id)).filter(Boolean), ...sections.filter((section) => !sectionOrder.includes(section.id))];
+  const [filter, setFilter] = useState(initialFilter), [editingTask, setEditingTask] = useState(null), [scheduleTask, setScheduleTask] = useState(null);
   const [dueAt, setDueAt] = useState(""), [minutesBefore, setMinutesBefore] = useState(15), [busy, setBusy] = useState(null);
+  const [selecting, setSelecting] = useState(false), [selectedIds, setSelectedIds] = useState([]), [bulkLabels, setBulkLabels] = useState([]);
+  const [actionResult, setActionResult] = useState("");
+  const [timeTask, setTimeTask] = useState(null), [timeHours, setTimeHours] = useState(""), [timeMinutes, setTimeMinutes] = useState("");
   const run = async (key, operation) => {
+    if (busy) return false;
     setBusy(key);
     try { await operation(); await refresh(); return true; }
     catch (error) { onError(error.message); return false; }
@@ -235,8 +275,22 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const createTask = async (event) => {
     event.preventDefault();
     if (!title.trim()) return;
-    const saved = await run("new", () => api("/tasks/", { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim(), owner: "self", status: "todo", project: defaultProject, session: newSession ? Number(newSession) : null }) }));
+    const saved = await run("new", () => api("/tasks/", { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim(), owner: "self", status: "todo", session: newSession ? Number(newSession) : null }) }));
     if (saved) { setTitle(""); setDescription(""); setShowCreate(false); }
+  };
+  // Each save appends one local record; it never overwrites an existing time total.
+  const registerTime = async (event, task) => {
+    event.preventDefault();
+    if (busy) return;
+    const hours = Number(timeHours || 0), minutes = Number(timeMinutes || 0);
+    const duration = hours * 3600 + minutes * 60;
+    if (!Number.isInteger(hours) || hours < 0 || !Number.isInteger(minutes) || minutes < 0 || minutes > 59 || duration < 60 || duration > 2147483647) {
+      onError("Indica um tempo positivo, com horas inteiras e minutos entre 0 e 59."); return;
+    }
+    const saved = await run(`time-${task.id}`, () => api(`/tasks/${task.id}/time/`, {
+      method: "POST", body: JSON.stringify({ duration_seconds: duration }),
+    }));
+    if (saved) { setTimeTask(null); setTimeHours(""); setTimeMinutes(""); }
   };
   // Persist section changes through the same API/refresh flow as task edits.
   const createSection = async (event) => {
@@ -253,6 +307,18 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     return run(`section-${section.id}`, () => api(`/task-sections/${section.id}/`, {
       method: "PATCH", body: JSON.stringify({ collapsed: !section.collapsed }),
     }));
+  };
+  // Reordering headings changes only presentation, never task label memberships.
+  const reorderSections = (event, destination) => {
+    event.preventDefault(); event.stopPropagation(); setDropTarget(null);
+    const source = draggedSection.current; draggedSection.current = null;
+    if (busy || destination.tag == null || source === destination.id) return;
+    const next = orderedSections.map((section) => section.id);
+    const from = next.indexOf(source), to = next.indexOf(destination.id);
+    if (from < 0 || to < 0) return;
+    next.splice(to, 0, next.splice(from, 1)[0]);
+    try { localStorage.setItem("taskSectionOrder", JSON.stringify(next)); setSectionOrder(next); }
+    catch (error) { onError(`Não foi possível guardar a ordem dos separadores: ${error.message}`); }
   };
   // Dropping on the whole section also supports empty and collapsed groups.
   const moveTask = async (event, destination) => {
@@ -307,6 +373,64 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     if (filter === "others") return task.owner === "other" && !["done", "cancelled"].includes(task.status);
     return !["done", "cancelled"].includes(task.status);
   }).sort((left, right) => compareTasks(left, right, taskOrder));
+  // IDs are unique even when a task appears in several label views. Hidden
+  // selections never participate after a filter change or a background refresh.
+  const selectedTasks = visible.filter((task) => selectedIds.includes(task.id));
+  const selectedTaskIds = selectedTasks.map((task) => task.id);
+  const compatibleLabels = tags.filter((tag) => selectedTasks.every((task) => !task.gitlab || task.gitlab.available_tag_ids.includes(tag.id) || task.tags?.includes(tag.id)));
+  const applicableLabels = bulkLabels.filter((id) => compatibleLabels.some((tag) => tag.id === id));
+  const selectableKey = visible.map((task) => task.id).sort((a, b) => a - b).join(",");
+  useEffect(() => {
+    const allowed = new Set(selectableKey ? selectableKey.split(",").map(Number) : []);
+    setSelectedIds((current) => current.filter((id) => allowed.has(id)));
+  }, [selectableKey]);
+  const endSelection = (event) => {
+    setSelecting(false); setSelectedIds([]); setBulkLabels([]); setActionResult("");
+    const popup = event.currentTarget.closest("details");
+    if (popup) popup.open = false;
+  };
+  // One backend transaction applies the whole batch; GitLab writes remain manual.
+  const applyBulk = async (action) => {
+    if (busy || !selectedTaskIds.length || (action === "add_labels" && !applicableLabels.length)) return;
+    const openCount = selectedTasks.filter((task) => task.status !== "done").length;
+    if (action === "close" && (!openCount || !window.confirm(`Fechar ${openCount} tarefa(s) selecionada(s)? Os lembretes serão cancelados e as labels de progresso serão removidas. As alterações GitLab ficam pendentes de envio.`))) return;
+    setActionResult("");
+    const saved = await run("bulk", async () => {
+      const response = await api("/tasks/bulk/", { method: "POST", body: JSON.stringify({
+        task_ids: selectedTaskIds, action, ...(action === "add_labels" ? { tag_ids: applicableLabels } : {}),
+      }) });
+      setActionResult(`${response.updated} tarefa(s) atualizadas${response.skipped ? ` · ${response.skipped} já concluídas` : ""}.`);
+    });
+    if (saved) { setSelectedIds([]); setBulkLabels([]); }
+  };
+  const uploadChanges = async () => {
+    setActionResult("");
+    await run("gitlab-push", async () => {
+      const response = await api("/gitlab/push/", { method: "POST" });
+      setActionResult(response.busy ? "Já existe uma sincronização em curso. Tenta novamente." : response.disabled ? "A sincronização está desativada." : `${response.sent} tarefa(s) enviadas · ${response.time_entries_sent ?? 0} registos de tempo · ${response.failed} falhas · ${response.pending} pendentes · ${response.conflicts} conflitos`);
+    });
+  };
+  // Frontend preflight explains disabled publishing; the API revalidates live labels.
+  const publishDisabledReason = (task) => {
+    if (task.gitlab_export) return "Envio sem confirmação. Verifica o GitLab; a criação não será repetida.";
+    if (editingTask?.id === task.id) return "Guarda a edição antes de enviar o ticket.";
+    if (task.status !== "todo" || task.owner !== "self") return "Só podes enviar tarefas abertas com responsável Eu.";
+    if (!gitlabStatus?.enabled || gitlabStatus.read_only || !gitlabStatus.has_token) return "Ativa a sincronização e a escrita e configura o token GitLab.";
+    const assigned = tags.filter((tag) => task.tags?.includes(tag.id));
+    const invalid = (task.tags || []).filter((id) => !gitlabStatus.available_tag_ids?.includes(id));
+    if (invalid.length) return `Estas labels não existem no GitLab: ${invalid.map((id) => tags.find((tag) => tag.id === id)?.name || `#${id}`).join(", ")}`;
+    if (!assigned.some((tag) => GITLAB_PRIMARY_LABELS.has(tag.name))) return "Escolhe pelo menos uma label principal: To Do, On Going ou On Testing / Pending Deploy.";
+    if (assigned.some((tag) => tag.name.includes(","))) return "A API GitLab não permite enviar labels com vírgulas.";
+    return "";
+  };
+  const publishLocalTask = async (task) => {
+    if (busy || publishDisabledReason(task)) return;
+    setActionResult("");
+    await run(`publish-${task.id}`, async () => {
+      const saved = await api(`/tasks/${task.id}/publish/`, { method: "POST" });
+      setActionResult(`Ticket #${saved.gitlab.issue_iid} criado no GitLab.`);
+    });
+  };
   // Targets override filters and folded groups so notification navigation is visible.
   useEffect(() => { if (targetId) { setFilter("all"); setTaskSearch(""); } }, [targetId, targetKey]);
   useEffect(() => {
@@ -319,7 +443,28 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
         const reminderFired = task.status !== "done" && task.reminder_status === "notified";
         const alertClass = overdue ? "overdue" : reminderFired ? "reminder-fired" : "";
         const isEditing = editingTask?.id === task.id;
+        // Board cards keep only the title; the whole card retains the existing
+        // column drag behaviour and bulk selection is shown only when enabled.
+        if (showSections && !today && layout === "board") {
+          return <article id={`task-${task.id}-column-${column?.id ?? "unassigned"}`} data-task-id={task.id}
+            className={`card task task-board-card ${targetId === task.id ? "highlighted-segment" : ""}`} key={task.id}
+            draggable={!busy && !isEditing}
+            onDragStart={(event) => {
+              if (busy || isEditing) { event.preventDefault(); return; }
+              draggedTask.current = { id: task.id, tag: column?.tag ?? null, done: column?.id === "done" };
+              event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", String(task.id));
+            }}
+            onDragEnd={() => { draggedTask.current = null; setDropTarget(null); }}>
+            {selecting && <input type="checkbox" className="task-selection" aria-label={`Selecionar tarefa ${task.title}`}
+              checked={selectedTaskIds.includes(task.id)} disabled={Boolean(busy)}
+              onDragStart={(event) => { event.preventDefault(); event.stopPropagation(); }}
+              onChange={(event) => { const checked = event.target.checked; setSelectedIds((current) => checked ? [...new Set([...current, task.id])] : current.filter((id) => id !== task.id)); }}/>
+            }
+            <h3>{task.title}</h3>
+          </article>;
+        }
         return <article id={column ? `task-${task.id}-column-${column.id ?? "unassigned"}` : `task-${task.id}`} data-task-id={task.id} className={`card task ${alertClass} ${targetId === task.id ? "highlighted-segment" : ""}`} key={task.id}>
+        {selecting && <input type="checkbox" className="task-selection" aria-label={`Selecionar tarefa ${task.title}`} checked={selectedTaskIds.includes(task.id)} disabled={Boolean(busy)} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...new Set([...current, task.id])] : current.filter((id) => id !== task.id))}/>}
         {showSections && <button type="button" className="task-drag-handle" aria-label={`Arrastar tarefa ${task.title}`} title="Arrastar para outra vista de etiqueta" disabled={Boolean(busy) || isEditing} draggable={!busy && !isEditing}
           onDragStart={(event) => { draggedTask.current = { id: task.id, tag: column?.tag ?? null, done: column?.id === "done" }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", String(task.id)); }}
           onDragEnd={() => { draggedTask.current = null; setDropTarget(null); }}>⠿</button>}
@@ -327,12 +472,14 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
         <button className={`check ${task.status === "done" ? "done" : ""}`} title={task.status === "done" ? "Reabrir tarefa" : "Concluir tarefa"} disabled={busy === `status-${task.id}`} onClick={() => run(`status-${task.id}`, () => api(`/tasks/${task.id}/${task.status === "done" ? "reopen" : "complete"}/`, { method: "POST" }))}>✓</button>
         <div className="task-body">
           <div className="task-card-header">
-            {task.gitlab && <button type="button" className="gitlab-origin" title="Abrir tarefa no GitLab" onClick={() => {
+
+            {isEditing ? <input className="task-title-input" value={editingTask.title} onChange={(event) => setEditingTask({ ...editingTask, title: event.target.value })}/> : <h3>{task.title}</h3>}
+            <div className="item-actions">{task.gitlab && <button type="button" className="gitlab-origin" title="Abrir tarefa no GitLab" onClick={() => {
               if (window.notetaker?.openGitLab) window.notetaker.openGitLab(task.gitlab.web_url).catch((error) => onError(error.message));
               else window.open(task.gitlab.web_url, "_blank", "noopener,noreferrer");
-            }}><GitLabIcon/></button>}
-            {isEditing ? <input className="task-title-input" value={editingTask.title} onChange={(event) => setEditingTask({ ...editingTask, title: event.target.value })}/> : <h3>{task.title}</h3>}
-            <div className="item-actions">{!isEditing && <OrganizationMenu item={task} showTags sessions={sessions} projects={projects} tags={task.gitlab ? tags.filter((tag) => task.gitlab.available_tag_ids.includes(tag.id) || task.tags?.includes(tag.id)) : tags} onSave={(changes) => run(`organization-${task.id}`, () => api(`/tasks/${task.id}/`, { method: "PATCH", body: JSON.stringify(changes) }))}/>} {isEditing ? <><button className="text-button" onClick={saveTask} disabled={!editingTask.title.trim() || busy === `edit-${task.id}`}>{busy === `edit-${task.id}` && <Spinner/>}Concluir</button><button className="text-button secondary-text" onClick={() => setEditingTask(null)}>Cancelar</button></> : <><button className="text-button" onClick={() => beginTaskEdit(task)}>Editar</button><button className="text-button danger" onClick={() => deleteTask(task)} disabled={busy === `delete-${task.id}`}>{busy === `delete-${task.id}` && <Spinner/>}{task.gitlab ? "Ocultar nesta app" : "Eliminar"}</button></>}</div>
+            }}><GitLabIcon/></button>}{!task.gitlab && <button type="button" className="gitlab-publish" aria-label="Enviar ticket para o GitLab"
+              title={publishDisabledReason(task) || "Enviar ticket para o GitLab"} disabled={Boolean(busy) || Boolean(publishDisabledReason(task))}
+              onClick={() => publishLocalTask(task)}>{busy === `publish-${task.id}` ? <Spinner/> : <LocalToGitLabIcon/>}</button>}{!isEditing && <OrganizationMenu item={task} allowProject={false} showTags sessions={sessions} projects={projects} tags={task.gitlab ? tags.filter((tag) => task.gitlab.available_tag_ids.includes(tag.id) || task.tags?.includes(tag.id)) : tags} onSave={(changes) => run(`organization-${task.id}`, () => api(`/tasks/${task.id}/`, { method: "PATCH", body: JSON.stringify(changes) }))}/>} {isEditing ? <><button className="text-button" onClick={saveTask} disabled={!editingTask.title.trim() || busy === `edit-${task.id}`}>{busy === `edit-${task.id}` && <Spinner/>}Concluir</button><button className="text-button secondary-text" onClick={() => setEditingTask(null)}>Cancelar</button></> : <><button className="text-button" onClick={() => beginTaskEdit(task)}>Editar</button><button className="text-button danger" onClick={() => deleteTask(task)} disabled={busy === `delete-${task.id}`}>{busy === `delete-${task.id}` && <Spinner/>}{task.gitlab ? "Ocultar nesta app" : "Eliminar"}</button></>}</div>
           </div>
           {isEditing ? <AutoSizeTextarea className="task-description-input" value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <p className="task-description">{task.description}</p>}
 
@@ -344,6 +491,18 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
             <button disabled={Boolean(busy)} onClick={() => run(`resolve-${task.id}`, () => api(`/tasks/${task.id}/resolve/`, { method: "POST", body: JSON.stringify({ choice: "local" }) }))}>Manter alterações locais</button>
             <button disabled={Boolean(busy)} onClick={() => run(`resolve-${task.id}`, () => api(`/tasks/${task.id}/resolve/`, { method: "POST", body: JSON.stringify({ choice: "remote" }) }))}>Usar versão GitLab</button></div>}
           <div className={`task-meta ${isEditing ? "editing" : ""}`}>
+            <span className="task-time-total">Tempo: {formatTrackedTime(task.time_tracking?.total_seconds)}</span>
+            {task.gitlab && task.time_tracking?.pending_seconds > 0 && <small className="task-time-pending">{formatTrackedTime(task.time_tracking.pending_seconds)} pendentes de envio</small>}
+            {task.time_tracking?.uncertain_seconds > 0 && <small className="task-time-uncertain" role="alert">Envio de {formatTrackedTime(task.time_tracking.uncertain_seconds)} por confirmar. Verifica o GitLab.</small>}
+            <button type="button" className="text-button" disabled={Boolean(busy) || Boolean(task.gitlab && (!task.gitlab.active || task.gitlab.hidden))} onClick={() => {
+              setTimeTask(timeTask === task.id ? null : task.id); setTimeHours(""); setTimeMinutes("");
+            }}>Registar tempo</button>
+            {timeTask === task.id && <form className="task-time-editor" onSubmit={(event) => registerTime(event, task)}>
+              <label>Horas<input type="number" min="0" max="596523" step="1" value={timeHours} disabled={Boolean(busy)} onChange={(event) => setTimeHours(event.target.value)} placeholder="0"/></label>
+              <label>Minutos<input type="number" min="0" max="59" step="1" value={timeMinutes} disabled={Boolean(busy)} onChange={(event) => setTimeMinutes(event.target.value)} placeholder="0"/></label>
+              <button type="submit" className="text-button" disabled={Boolean(busy) || !(Number(timeHours || 0) > 0 || Number(timeMinutes || 0) > 0)}>{busy === `time-${task.id}` && <Spinner/>}Guardar tempo</button>
+              <button type="button" className="text-button secondary-text" disabled={Boolean(busy)} onClick={() => setTimeTask(null)}>Cancelar</button>
+            </form>}
             {(task.evidence || task.source_segment || task.session) && <ReferenceInfo>{task.evidence && <span className="reference-text">{task.evidence}</span>}{(task.source_segment || task.session) && <button type="button" className="text-button" onClick={() => onOpenSource?.({ kind: "segment", meeting_id: task.source_meeting_id || task.session, segment_id: task.source_segment })}>Ver na reunião{task.source_start_ms != null ? ` · ${formatTranscriptTime(task.source_start_ms)}` : ""}</button>}</ReferenceInfo>}
             {isEditing ? <><Select aria-label="Responsável da tarefa" disabled={Boolean(task.gitlab)} value={editingTask.owner} onChange={(event) => setEditingTask({ ...editingTask, owner: event.target.value })}><option value="self">Eu</option><option value="other">Outro interveniente</option><option value="unknown">Por definir</option></Select>{editingTask.owner === "other" && <input value={editingTask.owner_name} onChange={(event) => setEditingTask({ ...editingTask, owner_name: event.target.value })} placeholder="Nome do responsável"/>}</> : <span>{task.owner === "self" ? "Eu" : task.owner_name || "Outro interveniente"}</span>}
             {!isEditing && <span>· Criada a {new Date(task.created_at).toLocaleString()} {task.creation_source === "gitlab" ? "no GitLab" : task.creation_source === "system" ? "pelo Sistema" : "por ti"}</span>}
@@ -356,22 +515,37 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
         </div>
       </article>;
   };
-  const groups = [{ id: null, tag: null, name: "Sem etiqueta de vista", collapsed: unassignedCollapsed }, ...sections, ...(layout === "board" ? [{ id: "done", tag: null, name: "Concluídas", collapsed: false }] : [])];
+  const groups = [{ id: null, tag: null, name: "Sem etiqueta de vista", collapsed: unassignedCollapsed }, ...orderedSections, ...(layout === "board" ? [{ id: "done", tag: null, name: "Concluídas", collapsed: false }] : [])];
   return <>
-    {showSections && gitlabStatus && <div className="gitlab-status"><span><GitLabIcon/> {gitlabStatus.enabled ? "Consulta GitLab ativa" : "Sincronização GitLab desativada"} · {gitlabStatus.read_only ? "Escritas bloqueadas" : "Bidirecional"} · {gitlabStatus.pending} pendentes</span>
-      {gitlabStatus.enabled && <button type="button" className="text-button" onClick={() => run("disable-sync", () => api("/gitlab/", { method: "PATCH", body: JSON.stringify({ enabled: false }) }))}>Desativar sincronização</button>}
+    {showSections && gitlabStatus && <div className="gitlab-status"><span><GitLabIcon/> {gitlabStatus.enabled ? "Consulta GitLab ativa" : "Sincronização GitLab desativada"} · {gitlabStatus.read_only ? "Escritas bloqueadas" : "Escrita manual"} · {gitlabStatus.pending} pendentes</span>
+      {gitlabStatus.enabled && <button type="button" className="text-button" disabled={Boolean(busy)} onClick={() => run("disable-sync", () => api("/gitlab/", { method: "PATCH", body: JSON.stringify({ enabled: false }) }))}>Desativar sincronização</button>}
+      <button type="button" className="text-button" disabled={Boolean(busy) || !gitlabStatus.enabled || gitlabStatus.read_only || !gitlabStatus.has_token || !gitlabStatus.pending} onClick={uploadChanges}>{busy === "gitlab-push" && <Spinner/>}Upload changes to GitLab</button>
       {gitlabStatus.error && <small role="alert">{gitlabStatus.error}</small>}</div>}
-    {(!showSections || showCreate) && <form id="new-task-form" className="quick-task" onSubmit={createTask}><input aria-label="Título da nova tarefa" autoFocus={showSections} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><AutoSizeTextarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><label className="new-task-meeting">Reunião<Select aria-label="Reunião da nova tarefa" disabled={Boolean(busy) || Boolean(defaultSession)} value={newSession} onChange={(event) => setNewSession(event.target.value)}><option value="">Sem reunião</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title || "Reunião sem título"}</option>)}</Select></label><button disabled={Boolean(busy) || !title.trim()}>{busy === "new" && <Spinner/>}Adicionar</button>{showSections && <button type="button" className="secondary" onClick={() => setShowCreate(false)}>Cancelar</button>}</form>}
-    <div className="task-filter-row"><div className="filters">{[["todo", "A fazer"], ["mine", "Minhas tarefas"], ["others", "Pendentes de outros intervenientes"], ["done", "Concluídas"], ["all", "Todas"]].map(([value, label]) => <button type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div>{showSections && <div className="view-switch" aria-label="Apresentação das tarefas">{[["list", "Lista"], ["board", "Quadro"]].map(([value, text]) => <button type="button" key={value} aria-pressed={layout === value} className={layout === value ? "active" : ""} onClick={() => { setLayout(value); localStorage.setItem("taskLayout", value); }}>{text}</button>)}</div>}{showSections && !onCreateOpenChange && <TaskCreateButton open={showCreate} onClick={() => setShowCreate((value) => !value)}/>}</div>
+    {actionResult && <p className="task-action-result" role="status">{actionResult}</p>}
+    {((!showSections && !compactCreate) || showCreate) && <form id={formId} className="quick-task" onSubmit={createTask}><input aria-label="Título da nova tarefa" autoFocus={showSections || compactCreate} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><AutoSizeTextarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><label className="new-task-meeting">Reunião<Select aria-label="Reunião da nova tarefa" disabled={Boolean(busy) || Boolean(defaultSession)} value={newSession} onChange={(event) => setNewSession(event.target.value)}><option value="">Sem reunião</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title || "Reunião sem título"}</option>)}</Select></label><button disabled={Boolean(busy) || !title.trim()}>{busy === "new" && <Spinner/>}Adicionar</button>{(showSections || compactCreate) && <button type="button" className="secondary" onClick={() => setShowCreate(false)}>Cancelar</button>}</form>}
+    <div className="task-filter-row"><div className="filters">{[["todo", "A fazer"], ["mine", "Minhas tarefas"], ["others", "Pendentes de outros intervenientes"], ["done", "Concluídas"], ["all", "Todas"]].map(([value, label]) => <button type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div>{showSections && <div className="view-switch" aria-label="Apresentação das tarefas">{[["list", "Lista"], ["board", "Quadro"]].map(([value, text]) => <button type="button" key={value} aria-pressed={layout === value} className={layout === value ? "active" : ""} onClick={() => { setLayout(value); localStorage.setItem("taskLayout", value); }}>{text}</button>)}</div>}{(showSections || compactCreate) && !onCreateOpenChange && <TaskCreateButton formId={formId} open={showCreate} onClick={() => setShowCreate((value) => !value)}/>}</div>
     <div className="task-search-filters">
       <label className="task-search-field">Pesquisar tarefas<input type="search" placeholder="Pesquisar no título ou descrição…" value={taskSearch} onChange={(event) => setTaskSearch(event.target.value)}/></label>
       <label>Ordenar por<Select value={taskOrder} onChange={(event) => setTaskOrder(event.target.value)}><option value="default">Predefinido</option><option value="created-asc">Data de criação: crescente</option><option value="created-desc">Data de criação: decrescente</option><option value="due-asc">Data limite: crescente</option><option value="due-desc">Data limite: decrescente</option></Select></label>
+      {!today && <Popup className={`task-bulk-popup ${selecting ? "is-selecting" : ""}`} onToggle={(event) => {
+        if (event.currentTarget.open) setSelecting(true);
+      }}>
+        <summary aria-disabled={Boolean(busy) || Boolean(editingTask)} onClick={(event) => {
+          if (busy || editingTask) event.preventDefault();
+        }}>Selecionar tarefas{selecting && <span className="bulk-selection-count">{selectedTasks.length}</span>}</summary>
+        <div className="task-bulk-controls"><strong>{selectedTasks.length} selecionadas</strong><button type="button" className="text-button" disabled={Boolean(busy) || !visible.length} onClick={() => setSelectedIds(visible.map((task) => task.id))}>Selecionar todas as filtradas</button><button type="button" className="text-button" disabled={Boolean(busy) || !selectedTasks.length} onClick={() => { setSelectedIds([]); setBulkLabels([]); }}>Limpar seleção</button>
+        <div className="bulk-label-picker"><MultiSelect label="Etiquetas para adicionar às tarefas selecionadas" options={compatibleLabels} value={applicableLabels} disabled={Boolean(busy) || !selectedTasks.length} onChange={setBulkLabels}/></div>
+        <button type="button" className="secondary-action" disabled={Boolean(busy) || !selectedTasks.length || !applicableLabels.length} onClick={() => applyBulk("add_labels")}>Adicionar labels</button>
+        <button type="button" className="primary-action" disabled={Boolean(busy) || !selectedTasks.some((task) => task.status !== "done")} onClick={() => applyBulk("close")}>{busy === "bulk" && <Spinner/>}Fechar selecionadas</button>
+          <button type="button" className="text-button" disabled={Boolean(busy)} onClick={endSelection}>Terminar seleção</button>
+        </div>
+      </Popup>}
     </div>
     {showSections && <details className="label-view-manager"><summary>Gerir vistas por etiqueta</summary><form className="new-task-section" onSubmit={createSection}>
       <Select aria-label="Etiqueta da vista" value={columnTag} onChange={(event) => setColumnTag(event.target.value)}><option value="">Criar nova etiqueta…</option>{tags.filter((tag) => !sections.some((section) => section.tag === tag.id)).map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}</Select>
       {!columnTag && <input aria-label="Nome da nova etiqueta" placeholder="Nome da etiqueta…" maxLength={120} value={sectionName} onChange={(event) => setSectionName(event.target.value)}/>}
       <button disabled={(!sectionName.trim() && !columnTag) || Boolean(busy)}>Adicionar vista</button></form>
-      {sections.map((section) => <div className="label-view-row" key={section.id}><span>{section.name}</span><button type="button" className="text-button" disabled={Boolean(busy)} onClick={() => run(`remove-view-${section.id}`, () => api(`/task-sections/${section.id}/`, { method: "DELETE" }))}>Remover vista</button></div>)}<small>Remover uma vista preserva a etiqueta e as tarefas.</small></details>}
+      {orderedSections.map((section) => <div className="label-view-row" key={section.id}><span>{section.name}</span><button type="button" className="text-button" disabled={Boolean(busy)} onClick={() => run(`remove-view-${section.id}`, () => api(`/task-sections/${section.id}/`, { method: "DELETE" }))}>Remover vista</button></div>)}<small>Arrasta os cabeçalhos das vistas por etiqueta para mudar a ordem. Remover uma vista preserva a etiqueta e as tarefas.</small></details>}
     {today ? <div className="today-groups">{["Atrasadas", "Hoje", "Próximos sete dias", "Sem prazo"].map((group) => {
       const groupTasks = visible.filter((task) => !["done", "cancelled"].includes(task.status) && deadlineGroup(task) === group);
       return <section key={group}><h2>{group} <small>({groupTasks.length})</small></h2><div className="card-list">{groupTasks.length ? groupTasks.map((task) => renderTask(task)) : <p className="empty">Sem tarefas.</p>}</div></section>;
@@ -379,10 +553,24 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
       const key = section.id ?? "unassigned";
       const sectionTasks = tasksForLabelView(layout === "board" && section.id !== "done" ? visible.filter((task) => task.status !== "done") : visible, section, sections);
       return <section className={`task-section ${dropTarget === key ? "drop-target" : ""}`} key={key}
-        onDragOver={(event) => { if (draggedTask.current === null || busy) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropTarget(key); }}
+        onDragOver={(event) => {
+          if (busy || (draggedTask.current === null && draggedSection.current === null)) return;
+          if (draggedSection.current !== null && section.tag == null) return;
+          event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropTarget(key);
+        }}
         onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDropTarget((current) => current === key ? null : current); }}
-        onDrop={(event) => moveTask(event, section)}>
-        <button type="button" className="task-section-heading" aria-expanded={!section.collapsed} aria-controls={`task-section-${key}`} disabled={Boolean(busy)} onClick={() => toggleSection(section)}><span aria-hidden="true">{section.collapsed ? "▸" : "▾"}</span><strong>{section.name}</strong><span className="task-section-count">{sectionTasks.length}</span></button>
+        onDrop={(event) => draggedSection.current !== null ? reorderSections(event, section) : moveTask(event, section)}>
+        <button type="button" className="task-section-heading" aria-expanded={!section.collapsed} aria-controls={`task-section-${key}`} disabled={Boolean(busy)}
+          draggable={section.tag != null && !busy}
+          title={section.tag != null ? "Arrastar para reorganizar este separador" : undefined}
+          onDragStart={(event) => {
+            if (busy || section.tag == null) { event.preventDefault(); return; }
+            event.stopPropagation(); draggedTask.current = null; draggedSection.current = section.id;
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("application/x-notetaker-section", String(section.id));
+          }}
+          onDragEnd={() => { draggedSection.current = null; setDropTarget(null); }}
+          onClick={() => toggleSection(section)}><span aria-hidden="true">{section.collapsed ? "▸" : "▾"}</span><strong>{section.name}</strong><span className="task-section-count">{sectionTasks.length}</span></button>
         <div id={`task-section-${key}`} className="card-list task-section-body" hidden={section.collapsed && !sectionTasks.some((task) => task.id === targetId)}>{sectionTasks.length ? sectionTasks.map((task) => renderTask(task, section)) : <div className="empty">Sem tarefas nesta vista. Arrasta uma tarefa para aqui.</div>}</div>
       </section>;
     })}</div> : <div className="card-list">{visible.length ? visible.map((task) => renderTask(task)) : <div className="empty">Não existem tarefas nesta vista.</div>}</div>}
@@ -545,7 +733,7 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
     </section><section className="meeting-panel" hidden={meetingPanel !== "Notas"}>
     <article className="card notes"><h3>Notas pessoais</h3>{selected.notes.map((item) => <div id={`note-${item.id}`} className={target?.noteId === item.id ? "highlighted-segment" : ""} key={item.id}><p>{item.body}</p><OrganizationMenu item={item} projects={projects} tags={tags} onSave={(changes) => run(`note-${item.id}`, () => api(`/notes/${item.id}/`, { method: "PATCH", body: JSON.stringify(changes) }))}/></div>)}<textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="Adicionar uma nota…"/><button onClick={addNote} disabled={busy === "note"}>{busy === "note" && <Spinner/>}Guardar nota</button></article>
     </section><section className="meeting-panel" hidden={meetingPanel !== "Tarefas"}>
-      <TaskList key={selected.id} {...taskProps} targetId={null} tasks={tasks.filter((task) => task.session === selected.id)} defaultProject={selected.project} defaultSession={selected.id}/>
+      <TaskList key={selected.id} {...taskProps} targetId={null} tasks={tasks.filter((task) => task.session === selected.id)} defaultSession={selected.id}/>
     </section><section className="meeting-panel" hidden={meetingPanel !== "Transcrição"}>
     {!groupedSegments.length && <p className="empty">A transcrição aparecerá quando estiver disponível.</p>}
     <div className="transcript">{groupedSegments.map((group) => {
@@ -740,7 +928,7 @@ export default function App() {
         setTaskTarget({ id: task.id, nonce: Date.now() }); setView("Tarefas"); setContentDetail(null);
       } else if (source.kind === "note" && !source.meeting_id) {
         const note = await api(`/notes/${source.object_id}/`);
-        setContentDetail(note); setView("Pesquisa");
+        setContentDetail(note); setView("Notas");
       } else if (source.meeting_id) {
         await api(`/sessions/${source.meeting_id}/`);
         setMeetingTarget({ meetingId: source.meeting_id, segmentId: source.segment_id, noteId: source.kind === "note" ? source.object_id : null, nonce: Date.now() });
@@ -762,7 +950,7 @@ export default function App() {
     event.currentTarget.closest("details")?.removeAttribute("open");
     generateDaily(dailyDate);
   };
-  const organizationTasks = tasks.filter((item) => matchesOrganization(item, projectFilter, tagFilter, sessions));
+  const organizationTasks = tasks.filter((item) => matchesOrganization(item, projectFilter, tagFilter, sessions, true));
   const organizationSessions = sessions.filter((item) => matchesOrganization(item, projectFilter, "", []));
   const taskProps = { gitlabStatus, sections: taskSections, refresh, onError: setError, projects, tags, sessions, onOpenSource: openSource, targetId: taskTarget?.id, targetKey: taskTarget?.nonce };
   const latestDaily = useMemo(() => summaries.find((item) => item.kind === "daily"), [summaries]);
@@ -775,7 +963,8 @@ export default function App() {
       {view === "Pesquisa" && <><label>Participante<Select value={participantFilter} onChange={(event) => setParticipantFilter(event.target.value)}><option value="">Todos</option>{participants.map((item) => <option key={item.id} value={item.id}>{item.label} · {sessions.find((session) => session.id === item.session)?.title || "Reunião"}</option>)}</Select></label><label>Desde<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)}/></label><label>Até<input type="date" value={dateTo} min={dateFrom} onChange={(event) => setDateTo(event.target.value)}/></label></>}
       <button type="button" className="text-button" onClick={() => { setProjectFilter(""); setTagFilter(""); setParticipantFilter(""); setDateFrom(""); setDateTo(""); }}>Limpar filtros</button>
     </div></Popup>{view === "Tarefas" && <TaskCreateButton open={taskCreateOpen} onClick={() => setTaskCreateOpen((value) => !value)}/>}</div>}
-    {view === "Projetos" && <Projects projects={projects} tags={tags} sessions={sessions} tasks={tasks} notes={notes} summaries={summaries} refresh={refresh} onError={setError} onOpen={openSource} onProjectSaved={(item) => setProjects((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))} onTagSaved={(item) => setTags((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))}/>}
+    {view === "Notas" && <Notes notes={notes} sessions={sessions} projects={projects} tags={tags} refresh={refresh} onError={setError} onOpenSource={openSource} targetId={contentDetail?.id} OrganizationMenu={OrganizationMenu}/>}
+    {view === "Projetos" && <Projects taskProps={taskProps} projects={projects} tags={tags} sessions={sessions} tasks={tasks} notes={notes} summaries={summaries} refresh={refresh} onError={setError} onOpen={openSource} onProjectSaved={(item) => setProjects((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))} onTagSaved={(item) => setTags((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))}/>}
     {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList {...taskProps} tasks={organizationTasks} today={view === "Hoje"} showSections={view === "Tarefas"} createOpen={view === "Tarefas" ? taskCreateOpen : undefined} onCreateOpenChange={view === "Tarefas" ? setTaskCreateOpen : undefined}/>} {view === "Reuniões" && <Meetings tasks={tasks} taskProps={taskProps} projects={projects} tags={tags} key={meetingsKey} sessions={organizationSessions} refresh={refresh} onError={setError} target={meetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{contentDetail && <article className="card"><h3>{contentDetail.title || "Nota pessoal"}</h3><p>{contentDetail.body}</p><OrganizationMenu item={contentDetail} projects={projects} tags={tags} onSave={async (changes) => {
       try { const saved = await api(`/notes/${contentDetail.id}/`, { method: "PATCH", body: JSON.stringify(changes) }); setContentDetail(saved); await refresh(); }
       catch (nextError) { setError(nextError.message); }

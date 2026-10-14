@@ -364,7 +364,6 @@ def _persist_meeting_tasks(job, segments, transcript, items):
                 session=job.session,
                 title=title,
                 defaults={
-                    "project": session.project,
                     "description": str(item.get("description", "")).strip(),
                     "owner": owner,
                     "owner_name": str(item.get("owner_name", ""))[:120],
