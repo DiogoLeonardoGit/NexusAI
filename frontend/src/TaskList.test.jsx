@@ -87,7 +87,7 @@ describe("GitLab settings", () => {
     await act(async () => root.render(<GitLabSettings onError={vi.fn()} refresh={vi.fn()}/>));
     expect(element.textContent).toContain("Sincronização desativada");
     expect(element.textContent).toContain("Escritas remotas bloqueadas");
-    expect([...element.querySelectorAll("button")].find((item) => item.textContent === "Sincronizar agora").disabled).toBe(true);
+    expect([...element.querySelectorAll("button")].find((item) => item.textContent === "Forçar sincronização").disabled).toBe(true);
     expect(api.mock.calls.every(([path]) => path === "/gitlab/")).toBe(true);
   });
 
@@ -106,7 +106,8 @@ describe("GitLab settings", () => {
     await click("Tarefas");
     expect(element.querySelector(".quick-task")).toBeNull();
     expect(element.querySelector('[aria-label="Adicionar tarefa"]')).toBeTruthy();
-    expect(element.textContent).toContain("Sincronização GitLab desativada");
+    expect(element.querySelector('aside [role="switch"][aria-label="Sincronização GitLab"]').getAttribute("aria-checked")).toBe("false");
+    expect(element.querySelector(".gitlab-status")).toBeNull();
     await click("Definições");
     expect(element.querySelector(".gitlab-settings")).toBeTruthy();
     expect(element.textContent).toContain("serviceunit/django-apps/twinportal");

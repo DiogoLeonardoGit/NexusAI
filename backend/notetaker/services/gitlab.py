@@ -1,4 +1,4 @@
-"""GitLab REST client with persistent opt-in and a manual-request write barrier."""
+"""GitLab REST client with persistent opt-in and per-client write permission."""
 
 import json
 import os
@@ -75,7 +75,7 @@ class GitLabClient:
         if not self.connection.enabled:
             raise GitLabDisabled("Sincronização desativada.")
         if method != "GET" and (not self.allow_writes or not writes_enabled()):
-            raise GitLabError("Escrita desativada ou envio manual não autorizado.")
+            raise GitLabError("Escrita desativada ou pedido de escrita não autorizado.")
         with _credential_lock:
             credential = _token
         if not credential:
@@ -142,6 +142,16 @@ class GitLabClient:
 
     def update_task(self, link, changes):
         """Send only field deltas; never replace unrelated remote labels."""
+        estimate_updated = False
+        if "estimate_seconds" in changes:
+            # An absolute estimate can be retried without incrementing spent time.
+            estimate = changes["estimate_seconds"]
+            stats = self.request(f"/projects/{link.project_id}/issues/{link.issue_iid}/time_estimate", "POST", {
+                "duration": f"{estimate}s",
+            })[0]
+            if not isinstance(stats, dict) or stats.get("time_estimate") != estimate:
+                raise GitLabError("Não foi possível confirmar a estimativa no GitLab.")
+            estimate_updated = True
         payload = {key: value for key, value in changes.items() if key in {"title", "description"}}
         if "state" in changes:
             payload["state_event"] = "close" if changes["state"] == "closed" else "reopen"
@@ -155,5 +165,5 @@ class GitLabClient:
             if removed:
                 payload["remove_labels"] = ",".join(removed)
         if not payload:
-            return None
+            return self.get(f"/projects/{link.project_id}/issues/{link.issue_iid}") if estimate_updated else None
         return self.request(f"/projects/{link.project_id}/issues/{link.issue_iid}", "PUT", payload)[0]

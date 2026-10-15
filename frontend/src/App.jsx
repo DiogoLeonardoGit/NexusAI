@@ -14,11 +14,34 @@ const VIEWS = ["Hoje", "Tarefas", "Projetos", "Reuniões", "Notas", "Pesquisa", 
 const REMINDER_OPTIONS = [[0, "Na hora"], [5, "5 minutos antes"], [15, "15 minutos antes"], [30, "30 minutos antes"], [60, "1 hora antes"], [1440, "1 dia antes"]];
 const GITLAB_PRIMARY_LABELS = new Set(["To Do", "On Going", "On Testing / Pending Deploy"]);
 
-// Format stored seconds without losing precision in imported GitLab totals.
+// GitLab uses working days: a month is four weeks, a week five eight-hour days.
+const GITLAB_TIME_UNITS = [["mo", 576000], ["w", 144000], ["d", 28800], ["h", 3600], ["m", 60]];
+
+// Preserve seconds in imported totals while displaying larger GitLab units.
 function formatTrackedTime(seconds = 0) {
-  const value = Math.max(0, Math.floor(Number(seconds) || 0));
-  const hours = Math.floor(value / 3600), minutes = Math.floor(value % 3600 / 60), remainder = value % 60;
-  return [hours && `${hours}h`, minutes && `${minutes}m`, remainder && `${remainder}s`].filter(Boolean).join(" ") || "0m";
+  let remaining = Math.max(0, Math.floor(Number(seconds) || 0));
+  const parts = [];
+  for (const [unit, size] of [...GITLAB_TIME_UNITS, ["s", 1]]) {
+    const amount = Math.floor(remaining / size);
+    if (amount) parts.push(`${amount}${unit}`);
+    remaining %= size;
+  }
+  return parts.join(" ") || "0m";
+}
+
+// Consume the entire duration, rejecting stray text and totals below minute precision.
+function parseGitLabDuration(value) {
+  const input = value.trim();
+  if (!input || input.length > 256) return null;
+  const units = Object.fromEntries(GITLAB_TIME_UNITS);
+  let end = 0, seconds = 0;
+  for (const match of input.matchAll(/(\d+(?:[.,]\d+)?)\s*(mo|w|d|h|m)/g)) {
+    if (input.slice(end, match.index).trim()) return null;
+    seconds += Number(match[1].replace(",", ".")) * units[match[2]];
+    end = match.index + match[0].length;
+  }
+  const rounded = Math.round(seconds / 60) * 60;
+  return !input.slice(end).trim() && Number.isSafeInteger(rounded) && rounded >= 60 && rounded <= 2147483647 && Math.abs(seconds - rounded) < 0.000001 ? rounded : null;
 }
 
 // Explicit date orders override the default; missing deadlines always stay last.
@@ -244,7 +267,7 @@ function readTaskSectionOrder() {
   }
 }
 
-export function TaskList({ tasks, sections = [], showSections, refresh, onError, today, projects = [], tags = [], onOpenSource, targetId, targetKey, defaultSession = null, sessions = [], gitlabStatus, createOpen, onCreateOpenChange, initialFilter = "todo", compactCreate = false }) {
+export function TaskList({ tasks, sections = [], showSections, refresh, onError, today, projects = [], tags = [], onOpenSource, targetId, targetKey, defaultSession = null, sessions = [], gitlabStatus, createOpen, onCreateOpenChange, initialFilter = "todo", compactCreate = false, settingsFilters = null, activeFilterCount = 0 }) {
   const localFormId = useId();
   const formId = showSections ? "new-task-form" : `new-task-${localFormId}`;
   const [title, setTitle] = useState(""), [description, setDescription] = useState("");
@@ -260,11 +283,13 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const draggedTask = useRef(null);
   const draggedSection = useRef(null);
   const orderedSections = [...sectionOrder.map((id) => sections.find((section) => section.id === id)).filter(Boolean), ...sections.filter((section) => !sectionOrder.includes(section.id))];
-  const [filter, setFilter] = useState(initialFilter), [editingTask, setEditingTask] = useState(null), [scheduleTask, setScheduleTask] = useState(null);
+  const [filter, setFilter] = useState(initialFilter), [editingTask, setEditingTask] = useState(null);
   const [dueAt, setDueAt] = useState(""), [minutesBefore, setMinutesBefore] = useState(15), [busy, setBusy] = useState(null);
   const [selecting, setSelecting] = useState(false), [selectedIds, setSelectedIds] = useState([]), [bulkLabels, setBulkLabels] = useState([]);
   const [actionResult, setActionResult] = useState("");
-  const [timeTask, setTimeTask] = useState(null), [timeHours, setTimeHours] = useState(""), [timeMinutes, setTimeMinutes] = useState("");
+  const [timeDuration, setTimeDuration] = useState("");
+  const [estimateDuration, setEstimateDuration] = useState("");
+  const draftEstimateSeconds = editingTask ? (estimateDuration.trim() === editingTask.original.estimateDuration ? editingTask.original.estimateSeconds : parseGitLabDuration(estimateDuration)) : 0;
   const run = async (key, operation) => {
     if (busy) return false;
     setBusy(key);
@@ -277,20 +302,6 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     if (!title.trim()) return;
     const saved = await run("new", () => api("/tasks/", { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim(), owner: "self", status: "todo", session: newSession ? Number(newSession) : null }) }));
     if (saved) { setTitle(""); setDescription(""); setShowCreate(false); }
-  };
-  // Each save appends one local record; it never overwrites an existing time total.
-  const registerTime = async (event, task) => {
-    event.preventDefault();
-    if (busy) return;
-    const hours = Number(timeHours || 0), minutes = Number(timeMinutes || 0);
-    const duration = hours * 3600 + minutes * 60;
-    if (!Number.isInteger(hours) || hours < 0 || !Number.isInteger(minutes) || minutes < 0 || minutes > 59 || duration < 60 || duration > 2147483647) {
-      onError("Indica um tempo positivo, com horas inteiras e minutos entre 0 e 59."); return;
-    }
-    const saved = await run(`time-${task.id}`, () => api(`/tasks/${task.id}/time/`, {
-      method: "POST", body: JSON.stringify({ duration_seconds: duration }),
-    }));
-    if (saved) { setTimeTask(null); setTimeHours(""); setTimeMinutes(""); }
   };
   // Persist section changes through the same API/refresh flow as task edits.
   const createSection = async (event) => {
@@ -333,30 +344,54 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     if (dragged.done) changes.status = "todo";
     await run(`move-${task.id}`, () => api(`/tasks/${task.id}/`, { method: "PATCH", body: JSON.stringify(changes) }));
   };
-  const editSchedule = (task) => {
-    setScheduleTask(task.id);
-    setMinutesBefore(task.reminder_minutes_before ?? 15);
+  // Snapshot the editable values so background refreshes do not turn untouched fields into edits.
+  const beginTaskEdit = (task) => {
+    let initialDueAt = "";
     if (task.due_at) {
       const date = new Date(task.due_at);
       date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
-      setDueAt(date.toISOString().slice(0, 16));
-    } else setDueAt("");
+      initialDueAt = date.toISOString().slice(0, 16);
+    }
+    const initialEstimate = task.estimate_seconds ? formatTrackedTime(task.estimate_seconds) : "";
+    const initialMinutes = task.reminder_minutes_before ?? 15;
+    setEditingTask({ id: task.id, title: task.title, description: task.description || "", owner: task.owner, owner_name: task.owner_name || "",
+      tags: [...(task.tags || [])], session: task.session ?? null,
+      original: { dueAt: initialDueAt, minutesBefore: initialMinutes, estimateDuration: initialEstimate, estimateSeconds: task.estimate_seconds || 0, tags: [...(task.tags || [])], session: task.session ?? null } });
+    setDueAt(initialDueAt); setMinutesBefore(initialMinutes);
+    setEstimateDuration(initialEstimate); setTimeDuration("");
   };
-  const saveSchedule = async (task) => {
-    if (!dueAt) return;
-    const saved = await run(`schedule-${task.id}`, () => api(`/tasks/${task.id}/schedule/`, {
-      method: "POST",
-      body: JSON.stringify({ due_at: new Date(dueAt).toISOString(), minutes_before: Number(minutesBefore) }),
-    }));
-    if (saved) setScheduleTask(null);
-  };
-  const beginTaskEdit = (task) => setEditingTask({ id: task.id, title: task.title, description: task.description || "", owner: task.owner, owner_name: task.owner_name || "" });
+  // Commit every draft field together; the API validates and saves the edit atomically.
   const saveTask = async () => {
-    if (!editingTask?.title.trim()) return;
-    const saved = await run(`edit-${editingTask.id}`, () => api(`/tasks/${editingTask.id}/`, { method: "PATCH", body: JSON.stringify({
-      title: editingTask.title.trim(), description: editingTask.description.trim(), owner: editingTask.owner,
-      owner_name: editingTask.owner === "other" ? editingTask.owner_name.trim() : "",
-    }) }));
+    if (busy || !editingTask?.title.trim()) return;
+    const original = editingTask.original;
+    const changes = { title: editingTask.title.trim(), description: editingTask.description.trim(), owner: editingTask.owner,
+      owner_name: editingTask.owner === "other" ? editingTask.owner_name.trim() : "" };
+    let estimate = original.estimateSeconds;
+    if (estimateDuration.trim() !== original.estimateDuration) {
+      estimate = parseGitLabDuration(estimateDuration);
+      if (estimate === null) { onError("Indica uma estimativa válida, como 1w ou 1h 30m, em minutos inteiros positivos."); return; }
+      changes.estimate_seconds = estimate;
+    }
+    if (timeDuration.trim()) {
+      const duration = parseGitLabDuration(timeDuration);
+      if (duration === null) { onError("Indica um tempo válido, como 1h 30m, em minutos inteiros positivos."); return; }
+      if (!estimate) { onError("Define uma estimativa antes de registar tempo."); return; }
+      changes.time_entry = { duration_seconds: duration };
+    }
+    if (dueAt !== original.dueAt || Number(minutesBefore) !== original.minutesBefore) {
+      const date = dueAt ? new Date(dueAt) : null;
+      if (date && Number.isNaN(date.getTime())) { onError("Indica uma data limite válida."); return; }
+      if (!date && !original.dueAt && Number(minutesBefore) !== original.minutesBefore) { onError("Define uma data limite para o lembrete."); return; }
+      changes.due_at = date ? date.toISOString() : null;
+      changes.reminder_offset_minutes = Number(minutesBefore);
+    }
+    if (editingTask.session !== original.session) changes.session = editingTask.session;
+    if ([...editingTask.tags].sort((a, b) => a - b).join(",") !== [...original.tags].sort((a, b) => a - b).join(",")) changes.tags = editingTask.tags;
+    const saved = await run(`edit-${editingTask.id}`, async () => {
+      await api(`/tasks/${editingTask.id}/`, { method: "PATCH", body: JSON.stringify(changes) });
+      // Once acknowledged, a refresh error must not append this time entry again.
+      setTimeDuration("");
+    });
     if (saved) setEditingTask(null);
   };
   const deleteTask = async (task) => {
@@ -384,16 +419,14 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     const allowed = new Set(selectableKey ? selectableKey.split(",").map(Number) : []);
     setSelectedIds((current) => current.filter((id) => allowed.has(id)));
   }, [selectableKey]);
-  const endSelection = (event) => {
+  const endSelection = () => {
     setSelecting(false); setSelectedIds([]); setBulkLabels([]); setActionResult("");
-    const popup = event.currentTarget.closest("details");
-    if (popup) popup.open = false;
   };
-  // One backend transaction applies the whole batch; GitLab writes remain manual.
+  // One backend transaction applies the batch; the sync worker delivers linked changes.
   const applyBulk = async (action) => {
     if (busy || !selectedTaskIds.length || (action === "add_labels" && !applicableLabels.length)) return;
     const openCount = selectedTasks.filter((task) => task.status !== "done").length;
-    if (action === "close" && (!openCount || !window.confirm(`Fechar ${openCount} tarefa(s) selecionada(s)? Os lembretes serão cancelados e as labels de progresso serão removidas. As alterações GitLab ficam pendentes de envio.`))) return;
+    if (action === "close" && (!openCount || !window.confirm(`Fechar ${openCount} tarefa(s) selecionada(s)? Os lembretes serão cancelados e as labels de progresso serão removidas. As alterações GitLab serão sincronizadas automaticamente quando a escrita estiver ativa.`))) return;
     setActionResult("");
     const saved = await run("bulk", async () => {
       const response = await api("/tasks/bulk/", { method: "POST", body: JSON.stringify({
@@ -402,13 +435,6 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
       setActionResult(`${response.updated} tarefa(s) atualizadas${response.skipped ? ` · ${response.skipped} já concluídas` : ""}.`);
     });
     if (saved) { setSelectedIds([]); setBulkLabels([]); }
-  };
-  const uploadChanges = async () => {
-    setActionResult("");
-    await run("gitlab-push", async () => {
-      const response = await api("/gitlab/push/", { method: "POST" });
-      setActionResult(response.busy ? "Já existe uma sincronização em curso. Tenta novamente." : response.disabled ? "A sincronização está desativada." : `${response.sent} tarefa(s) enviadas · ${response.time_entries_sent ?? 0} registos de tempo · ${response.failed} falhas · ${response.pending} pendentes · ${response.conflicts} conflitos`);
-    });
   };
   // Frontend preflight explains disabled publishing; the API revalidates live labels.
   const publishDisabledReason = (task) => {
@@ -473,79 +499,100 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
         <div className="task-body">
           <div className="task-card-header">
 
-            {isEditing ? <input className="task-title-input" value={editingTask.title} onChange={(event) => setEditingTask({ ...editingTask, title: event.target.value })}/> : <h3>{task.title}</h3>}
+            {isEditing ? <input className="task-title-input" disabled={Boolean(busy)} value={editingTask.title} onChange={(event) => setEditingTask({ ...editingTask, title: event.target.value })}/> : <h3>{task.title}</h3>}
             <div className="item-actions">{task.gitlab && <button type="button" className="gitlab-origin" title="Abrir tarefa no GitLab" onClick={() => {
               if (window.notetaker?.openGitLab) window.notetaker.openGitLab(task.gitlab.web_url).catch((error) => onError(error.message));
               else window.open(task.gitlab.web_url, "_blank", "noopener,noreferrer");
             }}><GitLabIcon/></button>}{!task.gitlab && <button type="button" className="gitlab-publish" aria-label="Enviar ticket para o GitLab"
               title={publishDisabledReason(task) || "Enviar ticket para o GitLab"} disabled={Boolean(busy) || Boolean(publishDisabledReason(task))}
-              onClick={() => publishLocalTask(task)}>{busy === `publish-${task.id}` ? <Spinner/> : <LocalToGitLabIcon/>}</button>}{!isEditing && <OrganizationMenu item={task} allowProject={false} showTags sessions={sessions} projects={projects} tags={task.gitlab ? tags.filter((tag) => task.gitlab.available_tag_ids.includes(tag.id) || task.tags?.includes(tag.id)) : tags} onSave={(changes) => run(`organization-${task.id}`, () => api(`/tasks/${task.id}/`, { method: "PATCH", body: JSON.stringify(changes) }))}/>} {isEditing ? <><button className="text-button" onClick={saveTask} disabled={!editingTask.title.trim() || busy === `edit-${task.id}`}>{busy === `edit-${task.id}` && <Spinner/>}Concluir</button><button className="text-button secondary-text" onClick={() => setEditingTask(null)}>Cancelar</button></> : <><button className="text-button" onClick={() => beginTaskEdit(task)}>Editar</button><button className="text-button danger" onClick={() => deleteTask(task)} disabled={busy === `delete-${task.id}`}>{busy === `delete-${task.id}` && <Spinner/>}{task.gitlab ? "Ocultar nesta app" : "Eliminar"}</button></>}</div>
+              onClick={() => publishLocalTask(task)}>{busy === `publish-${task.id}` ? <Spinner/> : <LocalToGitLabIcon/>}</button>} {isEditing ? <><button className="text-button" onClick={saveTask} disabled={!editingTask.title.trim() || Boolean(busy)}>{busy === `edit-${task.id}` && <Spinner/>}Concluir</button><button className="text-button secondary-text" disabled={Boolean(busy)} onClick={() => setEditingTask(null)}>Cancelar</button></> : <><button className="text-button" disabled={Boolean(busy)} onClick={() => beginTaskEdit(task)}>Editar</button><button className="text-button danger" onClick={() => deleteTask(task)} disabled={busy === `delete-${task.id}`}>{busy === `delete-${task.id}` && <Spinner/>}{task.gitlab ? "Ocultar nesta app" : "Eliminar"}</button></>}</div>
           </div>
-          {isEditing ? <AutoSizeTextarea className="task-description-input" value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <p className="task-description">{task.description}</p>}
+          {isEditing ? <AutoSizeTextarea className="task-description-input" disabled={Boolean(busy)} value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <p className="task-description">{task.description}</p>}
 
           
           <div className="task-labels">{tags.filter((tag) => task.tags?.includes(tag.id)).map((tag) => <span className="label-chip" key={tag.id}><i style={{ backgroundColor: tag.color || "#6699cc" }}/>{tag.name}</span>)}</div>
           {task.gitlab?.pending && <small className="sync-pending">Alterações locais pendentes de envio</small>}
           {task.gitlab && Object.keys(task.gitlab.conflicts).length > 0 && <div className="sync-conflict" role="alert"><strong>Conflito com o GitLab</strong><p>{Object.keys(task.gitlab.conflicts).join(", ")}</p>
-            {Object.entries(task.gitlab.conflicts).map(([field, values]) => <div className="conflict-values" key={field}><strong>{field === "title" ? "Título" : field === "description" ? "Descrição" : "Estado"}</strong><p>Na app: {String(values.local)}</p><p>No GitLab: {String(values.remote)}</p></div>)}
+            {Object.entries(task.gitlab.conflicts).map(([field, values]) => <div className="conflict-values" key={field}><strong>{field === "title" ? "Título" : field === "description" ? "Descrição" : field === "estimate_seconds" ? "Estimativa (segundos)" : "Estado"}</strong><p>Na app: {String(values.local)}</p><p>No GitLab: {String(values.remote)}</p></div>)}
             <button disabled={Boolean(busy)} onClick={() => run(`resolve-${task.id}`, () => api(`/tasks/${task.id}/resolve/`, { method: "POST", body: JSON.stringify({ choice: "local" }) }))}>Manter alterações locais</button>
             <button disabled={Boolean(busy)} onClick={() => run(`resolve-${task.id}`, () => api(`/tasks/${task.id}/resolve/`, { method: "POST", body: JSON.stringify({ choice: "remote" }) }))}>Usar versão GitLab</button></div>}
           <div className={`task-meta ${isEditing ? "editing" : ""}`}>
+            <span className="task-time-total">Estimativa: {task.estimate_seconds ? formatTrackedTime(task.estimate_seconds) : "Por definir"}</span>
             <span className="task-time-total">Tempo: {formatTrackedTime(task.time_tracking?.total_seconds)}</span>
             {task.gitlab && task.time_tracking?.pending_seconds > 0 && <small className="task-time-pending">{formatTrackedTime(task.time_tracking.pending_seconds)} pendentes de envio</small>}
             {task.time_tracking?.uncertain_seconds > 0 && <small className="task-time-uncertain" role="alert">Envio de {formatTrackedTime(task.time_tracking.uncertain_seconds)} por confirmar. Verifica o GitLab.</small>}
-            <button type="button" className="text-button" disabled={Boolean(busy) || Boolean(task.gitlab && (!task.gitlab.active || task.gitlab.hidden))} onClick={() => {
-              setTimeTask(timeTask === task.id ? null : task.id); setTimeHours(""); setTimeMinutes("");
-            }}>Registar tempo</button>
-            {timeTask === task.id && <form className="task-time-editor" onSubmit={(event) => registerTime(event, task)}>
-              <label>Horas<input type="number" min="0" max="596523" step="1" value={timeHours} disabled={Boolean(busy)} onChange={(event) => setTimeHours(event.target.value)} placeholder="0"/></label>
-              <label>Minutos<input type="number" min="0" max="59" step="1" value={timeMinutes} disabled={Boolean(busy)} onChange={(event) => setTimeMinutes(event.target.value)} placeholder="0"/></label>
-              <button type="submit" className="text-button" disabled={Boolean(busy) || !(Number(timeHours || 0) > 0 || Number(timeMinutes || 0) > 0)}>{busy === `time-${task.id}` && <Spinner/>}Guardar tempo</button>
-              <button type="button" className="text-button secondary-text" disabled={Boolean(busy)} onClick={() => setTimeTask(null)}>Cancelar</button>
-            </form>}
-            {(task.evidence || task.source_segment || task.session) && <ReferenceInfo>{task.evidence && <span className="reference-text">{task.evidence}</span>}{(task.source_segment || task.session) && <button type="button" className="text-button" onClick={() => onOpenSource?.({ kind: "segment", meeting_id: task.source_meeting_id || task.session, segment_id: task.source_segment })}>Ver na reunião{task.source_start_ms != null ? ` · ${formatTranscriptTime(task.source_start_ms)}` : ""}</button>}</ReferenceInfo>}
-            {isEditing ? <><Select aria-label="Responsável da tarefa" disabled={Boolean(task.gitlab)} value={editingTask.owner} onChange={(event) => setEditingTask({ ...editingTask, owner: event.target.value })}><option value="self">Eu</option><option value="other">Outro interveniente</option><option value="unknown">Por definir</option></Select>{editingTask.owner === "other" && <input value={editingTask.owner_name} onChange={(event) => setEditingTask({ ...editingTask, owner_name: event.target.value })} placeholder="Nome do responsável"/>}</> : <span>{task.owner === "self" ? "Eu" : task.owner_name || "Outro interveniente"}</span>}
+          </div>
+          <div className={`task-meta task-details ${isEditing ? "editing" : ""}`}>
+            {isEditing ? <><Select aria-label="Responsável da tarefa" disabled={Boolean(busy) || Boolean(task.gitlab)} value={editingTask.owner} onChange={(event) => setEditingTask({ ...editingTask, owner: event.target.value })}><option value="self">Eu</option><option value="other">Outro interveniente</option><option value="unknown">Por definir</option></Select>{editingTask.owner === "other" && <input value={editingTask.owner_name} onChange={(event) => setEditingTask({ ...editingTask, owner_name: event.target.value })} placeholder="Nome do responsável"/>}</> : <span>{task.owner === "self" ? "Eu" : task.owner_name || "Outro interveniente"}</span>}
             {!isEditing && <span>· Criada a {new Date(task.created_at).toLocaleString()} {task.creation_source === "gitlab" ? "no GitLab" : task.creation_source === "system" ? "pelo Sistema" : "por ti"}</span>}
             {task.due_at && <span>· Limite: {new Date(task.due_at).toLocaleString()}</span>}
             {task.reminder_at && <span>· Lembrete: {new Date(task.reminder_at).toLocaleString()}</span>}
-            <button className="text-button" onClick={() => editSchedule(task)}>{task.due_at || task.reminder_at ? "Alterar" : "Definir data e lembrete"}</button>
             {task.due_is_ambiguous && <span className="warning">Data por confirmar</span>}
-            {scheduleTask === task.id && <div className="schedule-editor"><input type="datetime-local" value={dueAt} onChange={(event) => setDueAt(event.target.value)}/><Select value={minutesBefore} onChange={(event) => setMinutesBefore(event.target.value)}>{REMINDER_OPTIONS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</Select><button onClick={() => saveSchedule(task)} disabled={!dueAt || busy === `schedule-${task.id}`}>{busy === `schedule-${task.id}` && <Spinner/>}Guardar</button><button className="secondary" onClick={() => setScheduleTask(null)}>Cancelar</button></div>}
           </div>
+            {(task.evidence || task.source_segment || task.session) && <ReferenceInfo>{task.evidence && <span className="reference-text">{task.evidence}</span>}{(task.source_segment || task.session) && <button type="button" className="text-button" onClick={() => onOpenSource?.({ kind: "segment", meeting_id: task.source_meeting_id || task.session, segment_id: task.source_segment })}>Ver na reunião{task.source_start_ms != null ? ` · ${formatTranscriptTime(task.source_start_ms)}` : ""}</button>}</ReferenceInfo>}
+          {isEditing && <fieldset className="task-edit-fields" disabled={Boolean(busy) || Boolean(task.gitlab && (!task.gitlab.active || task.gitlab.hidden))}>
+            <OrganizationFields item={editingTask} allowProject={false} showTags sessions={sessions} projects={projects}
+              tags={task.gitlab ? tags.filter((tag) => task.gitlab.available_tag_ids.includes(tag.id) || task.tags?.includes(tag.id)) : tags}
+              onSave={(changes) => setEditingTask((current) => ({ ...current, ...changes }))}/>
+            <div className="schedule-editor" role="group" aria-label="Data limite e lembrete">
+              <label>Data limite<input type="datetime-local" value={dueAt} disabled={Boolean(busy)} onChange={(event) => setDueAt(event.target.value)}/></label>
+              <label>Lembrete<Select value={minutesBefore} disabled={Boolean(busy)} onChange={(event) => setMinutesBefore(event.target.value)}>{REMINDER_OPTIONS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</Select></label>
+            </div>
+            <div className="task-time-fields">
+              <div className="task-time-editor" role="group" aria-label="Estimativa">
+                <label>Estimativa<input type="text" aria-label="Duração estimada" maxLength={256} value={estimateDuration} disabled={Boolean(busy)} onChange={(event) => setEstimateDuration(event.target.value)} placeholder="Ex.: 1w ou 1h 30m"/></label>
+              </div>
+              <div className="task-time-editor" role="group" aria-label="Registar tempo">
+                <label>Registar tempo<input type="text" aria-label="Duração a registar" maxLength={256} value={timeDuration} disabled={Boolean(busy) || !draftEstimateSeconds} onChange={(event) => setTimeDuration(event.target.value)} placeholder="Ex.: 1h 30m"/></label>
+                {!draftEstimateSeconds && <small>Define uma estimativa antes de registar tempo.</small>}
+              </div>
+            </div>
+          </fieldset>}
         </div>
       </article>;
   };
   const groups = [{ id: null, tag: null, name: "Sem etiqueta de vista", collapsed: unassignedCollapsed }, ...orderedSections, ...(layout === "board" ? [{ id: "done", tag: null, name: "Concluídas", collapsed: false }] : [])];
-  return <>
-    {showSections && gitlabStatus && <div className="gitlab-status"><span><GitLabIcon/> {gitlabStatus.enabled ? "Consulta GitLab ativa" : "Sincronização GitLab desativada"} · {gitlabStatus.read_only ? "Escritas bloqueadas" : "Escrita manual"} · {gitlabStatus.pending} pendentes</span>
-      {gitlabStatus.enabled && <button type="button" className="text-button" disabled={Boolean(busy)} onClick={() => run("disable-sync", () => api("/gitlab/", { method: "PATCH", body: JSON.stringify({ enabled: false }) }))}>Desativar sincronização</button>}
-      <button type="button" className="text-button" disabled={Boolean(busy) || !gitlabStatus.enabled || gitlabStatus.read_only || !gitlabStatus.has_token || !gitlabStatus.pending} onClick={uploadChanges}>{busy === "gitlab-push" && <Spinner/>}Upload changes to GitLab</button>
-      {gitlabStatus.error && <small role="alert">{gitlabStatus.error}</small>}</div>}
-    {actionResult && <p className="task-action-result" role="status">{actionResult}</p>}
-    {((!showSections && !compactCreate) || showCreate) && <form id={formId} className="quick-task" onSubmit={createTask}><input aria-label="Título da nova tarefa" autoFocus={showSections || compactCreate} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><AutoSizeTextarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><label className="new-task-meeting">Reunião<Select aria-label="Reunião da nova tarefa" disabled={Boolean(busy) || Boolean(defaultSession)} value={newSession} onChange={(event) => setNewSession(event.target.value)}><option value="">Sem reunião</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title || "Reunião sem título"}</option>)}</Select></label><button disabled={Boolean(busy) || !title.trim()}>{busy === "new" && <Spinner/>}Adicionar</button>{(showSections || compactCreate) && <button type="button" className="secondary" onClick={() => setShowCreate(false)}>Cancelar</button>}</form>}
-    <div className="task-filter-row"><div className="filters">{[["todo", "A fazer"], ["mine", "Minhas tarefas"], ["others", "Pendentes de outros intervenientes"], ["done", "Concluídas"], ["all", "Todas"]].map(([value, label]) => <button type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div>{showSections && <div className="view-switch" aria-label="Apresentação das tarefas">{[["list", "Lista"], ["board", "Quadro"]].map(([value, text]) => <button type="button" key={value} aria-pressed={layout === value} className={layout === value ? "active" : ""} onClick={() => { setLayout(value); localStorage.setItem("taskLayout", value); }}>{text}</button>)}</div>}{(showSections || compactCreate) && !onCreateOpenChange && <TaskCreateButton formId={formId} open={showCreate} onClick={() => setShowCreate((value) => !value)}/>}</div>
+  // Keep bulk actions available while task checkboxes are used outside the panel.
+  const taskSelectionControl = !today && <details className={`task-bulk-popup ${selecting ? "is-selecting" : ""}`} open={selecting}
+    onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); endSelection(); } }}>
+        <summary aria-expanded={selecting} aria-disabled={Boolean(busy) || Boolean(editingTask)} onClick={(event) => {
+          event.preventDefault();
+          if (busy || editingTask) return;
+          if (selecting) endSelection();
+          else setSelecting(true);
+        }}>{selecting ? "Terminar seleção" : "Selecionar tarefas"}{selecting && <span className="bulk-selection-count">{selectedTasks.length}</span>}</summary>
+        <div className="task-bulk-controls"><strong>{selectedTasks.length} selecionadas</strong><button type="button" className="text-button" disabled={Boolean(busy) || !visible.length} onClick={() => setSelectedIds(visible.map((task) => task.id))}>Selecionar todas as filtradas</button><button type="button" className="text-button" disabled={Boolean(busy) || !selectedTasks.length} onClick={() => { setSelectedIds([]); setBulkLabels([]); }}>Limpar seleção</button>
+        <div className="bulk-label-actions"><div className="bulk-label-picker">{!selectedTasks.length && <small>Seleciona pelo menos uma tarefa</small>}<MultiSelect label="Etiquetas para adicionar às tarefas selecionadas" options={compatibleLabels} value={applicableLabels} disabled={Boolean(busy)} emptyMessage="Não existem etiquetas compatíveis com as tarefas selecionadas." onChange={setBulkLabels}/></div>
+        <button type="button" className="secondary-action" disabled={Boolean(busy) || !selectedTasks.length || !applicableLabels.length} onClick={() => applyBulk("add_labels")}>Adicionar labels</button></div>
+        <div className="bulk-completion-actions"><button type="button" className="primary-action" disabled={Boolean(busy) || !selectedTasks.some((task) => task.status !== "done")} onClick={() => applyBulk("close")}>{busy === "bulk" && <Spinner/>}Fechar selecionadas</button>
+        </div>
+        </div>
+      </details>;
+  const taskFilterControls = <>
+    <div className="task-filter-row"><div className="filters">{[["todo", "A fazer"], ["mine", "Minhas tarefas"], ["others", "Pendentes de outros intervenientes"], ["done", "Concluídas"], ["all", "Todas"]].map(([value, label]) => <button type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div>{showSections && <div className="view-switch" aria-label="Apresentação das tarefas">{[["list", "Lista"], ["board", "Quadro"]].map(([value, text]) => <button type="button" key={value} aria-pressed={layout === value} className={layout === value ? "active" : ""} onClick={() => { setLayout(value); localStorage.setItem("taskLayout", value); }}>{text}</button>)}</div>}{!settingsFilters && (showSections || compactCreate) && !onCreateOpenChange && <TaskCreateButton formId={formId} open={showCreate} onClick={() => setShowCreate((value) => !value)}/>}</div>
     <div className="task-search-filters">
       <label className="task-search-field">Pesquisar tarefas<input type="search" placeholder="Pesquisar no título ou descrição…" value={taskSearch} onChange={(event) => setTaskSearch(event.target.value)}/></label>
       <label>Ordenar por<Select value={taskOrder} onChange={(event) => setTaskOrder(event.target.value)}><option value="default">Predefinido</option><option value="created-asc">Data de criação: crescente</option><option value="created-desc">Data de criação: decrescente</option><option value="due-asc">Data limite: crescente</option><option value="due-desc">Data limite: decrescente</option></Select></label>
-      {!today && <Popup className={`task-bulk-popup ${selecting ? "is-selecting" : ""}`} onToggle={(event) => {
-        if (event.currentTarget.open) setSelecting(true);
-      }}>
-        <summary aria-disabled={Boolean(busy) || Boolean(editingTask)} onClick={(event) => {
-          if (busy || editingTask) event.preventDefault();
-        }}>Selecionar tarefas{selecting && <span className="bulk-selection-count">{selectedTasks.length}</span>}</summary>
-        <div className="task-bulk-controls"><strong>{selectedTasks.length} selecionadas</strong><button type="button" className="text-button" disabled={Boolean(busy) || !visible.length} onClick={() => setSelectedIds(visible.map((task) => task.id))}>Selecionar todas as filtradas</button><button type="button" className="text-button" disabled={Boolean(busy) || !selectedTasks.length} onClick={() => { setSelectedIds([]); setBulkLabels([]); }}>Limpar seleção</button>
-        <div className="bulk-label-picker"><MultiSelect label="Etiquetas para adicionar às tarefas selecionadas" options={compatibleLabels} value={applicableLabels} disabled={Boolean(busy) || !selectedTasks.length} onChange={setBulkLabels}/></div>
-        <button type="button" className="secondary-action" disabled={Boolean(busy) || !selectedTasks.length || !applicableLabels.length} onClick={() => applyBulk("add_labels")}>Adicionar labels</button>
-        <button type="button" className="primary-action" disabled={Boolean(busy) || !selectedTasks.some((task) => task.status !== "done")} onClick={() => applyBulk("close")}>{busy === "bulk" && <Spinner/>}Fechar selecionadas</button>
-          <button type="button" className="text-button" disabled={Boolean(busy)} onClick={endSelection}>Terminar seleção</button>
-        </div>
-      </Popup>}
+      {taskSelectionControl}
     </div>
+  </>;
+  const labelViewControls = <>
     {showSections && <details className="label-view-manager"><summary>Gerir vistas por etiqueta</summary><form className="new-task-section" onSubmit={createSection}>
       <Select aria-label="Etiqueta da vista" value={columnTag} onChange={(event) => setColumnTag(event.target.value)}><option value="">Criar nova etiqueta…</option>{tags.filter((tag) => !sections.some((section) => section.tag === tag.id)).map((tag) => <option key={tag.id} value={tag.id}>{tag.name}</option>)}</Select>
       {!columnTag && <input aria-label="Nome da nova etiqueta" placeholder="Nome da etiqueta…" maxLength={120} value={sectionName} onChange={(event) => setSectionName(event.target.value)}/>}
       <button disabled={(!sectionName.trim() && !columnTag) || Boolean(busy)}>Adicionar vista</button></form>
       {orderedSections.map((section) => <div className="label-view-row" key={section.id}><span>{section.name}</span><button type="button" className="text-button" disabled={Boolean(busy)} onClick={() => run(`remove-view-${section.id}`, () => api(`/task-sections/${section.id}/`, { method: "DELETE" }))}>Remover vista</button></div>)}<small>Arrasta os cabeçalhos das vistas por etiqueta para mudar a ordem. Remover uma vista preserva a etiqueta e as tarefas.</small></details>}
+  </>;
+  return <>
+    {settingsFilters && <div className="organization-toolbar with-task-action"><Popup className="filter-panel task-settings-panel">
+      <summary>Filtros e configurações <span className="filter-indicator">{activeFilterCount || ""}</span></summary>
+      {settingsFilters}
+      {labelViewControls}
+    </Popup><TaskCreateButton formId={formId} open={showCreate} onClick={() => setShowCreate((value) => !value)}/></div>}
+    {actionResult && <p className="task-action-result" role="status">{actionResult}</p>}
+    {((!showSections && !compactCreate) || showCreate) && <form id={formId} className="quick-task" onSubmit={createTask}><input aria-label="Título da nova tarefa" autoFocus={showSections || compactCreate} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><AutoSizeTextarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><label className="new-task-meeting">Reunião<Select aria-label="Reunião da nova tarefa" disabled={Boolean(busy) || Boolean(defaultSession)} value={newSession} onChange={(event) => setNewSession(event.target.value)}><option value="">Sem reunião</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title || "Reunião sem título"}</option>)}</Select></label><button disabled={Boolean(busy) || !title.trim()}>{busy === "new" && <Spinner/>}Adicionar</button>{(showSections || compactCreate) && <button type="button" className="secondary" onClick={() => setShowCreate(false)}>Cancelar</button>}</form>}
+    {taskFilterControls}
+    {!settingsFilters && labelViewControls}
     {today ? <div className="today-groups">{["Atrasadas", "Hoje", "Próximos sete dias", "Sem prazo"].map((group) => {
       const groupTasks = visible.filter((task) => !["done", "cancelled"].includes(task.status) && deadlineGroup(task) === group);
       return <section key={group}><h2>{group} <small>({groupTasks.length})</small></h2><div className="card-list">{groupTasks.length ? groupTasks.map((task) => renderTask(task)) : <p className="empty">Sem tarefas.</p>}</div></section>;
@@ -579,6 +626,26 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
 
 function ListeningLogs({ logs }) {
   return <div className="card-list logs-list">{logs.length === 0 ? <div className="empty">Não existem registos recentes da escuta ativa.</div> : logs.map((log) => <article className="card log-entry" key={log.id}><time>{new Date(log.recorded_at).toLocaleString()}</time><span>{log.language?.toUpperCase() || "Idioma desconhecido"}</span><p>{log.text}</p></article>)}</div>;
+}
+
+// The date picker always includes recent summaries, separate from the Today summary.
+function DailySummaryPicker({ summaries, date, onDateChange, busy, onGenerate }) {
+  const [selectedId, setSelectedId] = useState(null);
+  const selected = summaries.find((item) => item.id === selectedId);
+  return <Popup><summary aria-label="Escolher data do resumo">▾</summary>
+    <div className="daily-summary-menu">
+      <strong>Escolher outro dia</strong>
+      <form onSubmit={onGenerate}><input aria-label="Data do resumo" type="date" max={localDateValue()} value={date} onChange={(event) => onDateChange(event.target.value)}/><button disabled={!date || busy}>Gerar resumo</button></form>
+      <section className="daily-summary-history" aria-label="Últimos cinco resumos diários">
+        {!summaries.length && <p className="muted">Ainda não existem resumos diários.</p>}
+        <div className="daily-history-list">{summaries.map((item) => <button type="button" aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>
+          <strong>{item.summary_date ? `Resumo de ${formatCalendarDate(item.summary_date)}` : "Resumo diário"}</strong>
+          <small>Gerado em {new Date(item.created_at).toLocaleString("pt-PT")}</small>
+        </button>)}</div>
+        {selected && <SummaryCard summary={selected} title={selected.summary_date ? `Resumo de ${formatCalendarDate(selected.summary_date)}` : "Resumo diário"}/>}
+      </section>
+    </div>
+  </Popup>;
 }
 
 function SummaryCard({ summary, title = "Resumo" }) {
@@ -774,7 +841,7 @@ function Settings({ microphoneId, setMicrophoneId, keepDisplayAwake, setKeepDisp
 export default function App() {
   const [view, setView] = useState("Hoje"), [tasks, setTasks] = useState([]), [taskSections, setTaskSections] = useState([]), [sessions, setSessions] = useState([]), [summaries, setSummaries] = useState([]), [logs, setLogs] = useState([]), [meetingCapture, setMeetingCapture] = useState(null), [activeListening, setActiveListening] = useState(null), [activeEnabled, setActiveEnabled] = useState(() => localStorage.getItem("activeListeningEnabled") !== "false"), [error, setError] = useState(""), [query, setQuery] = useState(""), [results, setResults] = useState(null), [chatAnswer, setChatAnswer] = useState(null), [notice, setNotice] = useState(""), [asking, setAsking] = useState(false), [dailyJob, setDailyJob] = useState(null), [dailyDate, setDailyDate] = useState(localDateValue), [captureBusy, setCaptureBusy] = useState(false), [microphoneId, setMicrophoneId] = useState(() => localStorage.getItem("microphoneDeviceId") || ""), [meetingTarget, setMeetingTarget] = useState(null), [meetingsKey, setMeetingsKey] = useState(0);
   const [projects, setProjects] = useState([]), [tags, setTags] = useState([]), [notes, setNotes] = useState([]), [participants, setParticipants] = useState([]);
-  const [gitlabStatus, setGitlabStatus] = useState(null);
+  const [gitlabStatus, setGitlabStatus] = useState(null), [gitlabBusy, setGitlabBusy] = useState(false);
   const [projectFilter, setProjectFilter] = useState(""), [tagFilter, setTagFilter] = useState(""), [participantFilter, setParticipantFilter] = useState(""), [dateFrom, setDateFrom] = useState(""), [dateTo, setDateTo] = useState("");
   const [taskTarget, setTaskTarget] = useState(null), [contentDetail, setContentDetail] = useState(null);
   const [taskCreateOpen, setTaskCreateOpen] = useState(false);
@@ -865,6 +932,17 @@ export default function App() {
     catch (nextError) { setError(nextError.message); }
     finally { setCaptureBusy(false); }
   };
+  // The sidebar switch controls synchronization only; write permission stays in Settings.
+  const toggleGitLab = async () => {
+    if (gitlabBusy || !gitlabStatus) return;
+    setGitlabBusy(true); setError("");
+    try {
+      const status = await api("/gitlab/", { method: "PATCH", body: JSON.stringify({ enabled: !gitlabStatus.enabled }) });
+      setGitlabStatus(status);
+      await refresh();
+    } catch (nextError) { setError(nextError.message); }
+    finally { setGitlabBusy(false); }
+  };
   const toggleMeeting = async () => {
     setError(""); setCaptureBusy(true);
     try {
@@ -953,19 +1031,32 @@ export default function App() {
   const organizationTasks = tasks.filter((item) => matchesOrganization(item, projectFilter, tagFilter, sessions, true));
   const organizationSessions = sessions.filter((item) => matchesOrganization(item, projectFilter, "", []));
   const taskProps = { gitlabStatus, sections: taskSections, refresh, onError: setError, projects, tags, sessions, onOpenSource: openSource, targetId: taskTarget?.id, targetKey: taskTarget?.nonce };
-  const latestDaily = useMemo(() => summaries.find((item) => item.kind === "daily"), [summaries]);
-  return <main className="shell"><aside><div className="brand"><span className="brand-mark">N</span><strong>My AI Notetaker</strong></div><nav>{VIEWS.map((item) => <button className={view === item ? "active" : ""} onClick={() => selectView(item)} key={item}>{item}</button>)}</nav><div className="privacy"><span className={activeListening || meetingCapture ? "live-dot" : "idle-dot"}/>{meetingCapture ? "Reunião em curso" : activeListening ? "Escuta ativa" : "Captura pausada"}</div></aside><section className="content"><header><div><p className="eyebrow">LOCAL · PRIVADO</p><h1>{view}</h1></div><div className="header-actions"><div className="daily-summary-button"><button onClick={() => generateDaily(localDateValue())} disabled={Boolean(dailyJob)}>{dailyJob && <Spinner/>}Resumo do dia</button><Popup><summary aria-label="Escolher data do resumo">▾</summary><form onSubmit={generateSelectedDaily}><strong>Escolher outro dia</strong><input type="date" max={localDateValue()} value={dailyDate} onChange={(event) => setDailyDate(event.target.value)}/><button disabled={!dailyDate || Boolean(dailyJob)}>Gerar resumo</button></form></Popup></div><button className={`listening ${activeListening ? "active" : ""}`} onClick={toggleActiveListening} disabled={captureBusy || Boolean(meetingCapture)}>{activeEnabled ? "Desativar escuta" : "Ativar escuta"}</button><button className={`capture ${meetingCapture ? "active" : ""}`} onClick={toggleMeeting} disabled={captureBusy}>{captureBusy && <Spinner/>}{meetingCapture ? "Terminar reunião" : "Iniciar reunião"}</button></div></header>
-    {error && <div className="error">{error}<button onClick={() => setError("")}>×</button></div>}{notice && <div className="notice">{notice}<button onClick={() => setNotice("")}>×</button></div>}
-    {["Hoje", "Tarefas", "Reuniões", "Pesquisa"].includes(view) && <div className={`organization-toolbar ${view === "Tarefas" ? "with-task-action" : ""}`}><Popup className="filter-panel"><summary>Filtros <span className="filter-indicator">{[projectFilter, ...(view === "Reuniões" ? [] : [tagFilter]), ...(view === "Pesquisa" ? [participantFilter, dateFrom, dateTo] : [])].filter(Boolean).length || ""}</span></summary>
+  // Creation time controls freshness; summary_date identifies the day being summarized.
+  const dailySummaries = useMemo(() => summaries.filter((item) => item.kind === "daily")
+    .sort((left, right) => (Date.parse(right.created_at) || 0) - (Date.parse(left.created_at) || 0) || right.id - left.id), [summaries]);
+  const todayKey = localDateValue();
+  const latestDaily = dailySummaries.find((item) => item.created_at && !Number.isNaN(Date.parse(item.created_at)) && localDateValue(new Date(item.created_at)) === todayKey);
+  const activeOrganizationFilterCount = [projectFilter, ...(view === "Reuniões" ? [] : [tagFilter]), ...(view === "Pesquisa" ? [participantFilter, dateFrom, dateTo] : [])].filter(Boolean).length;
+  const organizationFilters = <>
       <div className="search-filters">
       <label>Projeto<Select value={projectFilter} onChange={(event) => setProjectFilter(event.target.value)}><option value="">Todos</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</Select></label>
       {view !== "Reuniões" && <label>Etiqueta<Select value={tagFilter} onChange={(event) => setTagFilter(event.target.value)}><option value="">Todas</option>{tags.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</Select></label>}
       {view === "Pesquisa" && <><label>Participante<Select value={participantFilter} onChange={(event) => setParticipantFilter(event.target.value)}><option value="">Todos</option>{participants.map((item) => <option key={item.id} value={item.id}>{item.label} · {sessions.find((session) => session.id === item.session)?.title || "Reunião"}</option>)}</Select></label><label>Desde<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)}/></label><label>Até<input type="date" value={dateTo} min={dateFrom} onChange={(event) => setDateTo(event.target.value)}/></label></>}
       <button type="button" className="text-button" onClick={() => { setProjectFilter(""); setTagFilter(""); setParticipantFilter(""); setDateFrom(""); setDateTo(""); }}>Limpar filtros</button>
-    </div></Popup>{view === "Tarefas" && <TaskCreateButton open={taskCreateOpen} onClick={() => setTaskCreateOpen((value) => !value)}/>}</div>}
+    </div>  </>;
+  return <main className="shell"><aside><div className="brand"><span className="brand-mark">N</span><strong>My AI Notetaker</strong></div><nav>{VIEWS.map((item) => <button className={view === item ? "active" : ""} onClick={() => selectView(item)} key={item}>{item}</button>)}</nav><div className="sidebar-controls">
+      <button type="button" className="sidebar-control" role="switch" aria-label="Escuta ativa" aria-checked={activeEnabled} disabled={captureBusy || Boolean(meetingCapture)} onClick={toggleActiveListening} title={meetingCapture ? "Reunião em curso" : activeListening ? "Escuta ativa" : "Captura pausada"}>
+        <span aria-hidden="true" className={activeListening || meetingCapture ? "live-dot" : "idle-dot"}/><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg><span className="sidebar-control-label">{meetingCapture ? "Reunião em curso" : "Escuta ativa"}</span><span aria-hidden="true" className="sidebar-toggle"/>
+      </button>
+      <button type="button" className="sidebar-control" role="switch" aria-label="Sincronização GitLab" aria-checked={Boolean(gitlabStatus?.enabled)} disabled={gitlabBusy || !gitlabStatus || (!gitlabStatus.enabled && !gitlabStatus.has_token)} onClick={toggleGitLab} title={gitlabStatus?.error || (!gitlabStatus?.has_token ? "Configura o token GitLab nas Definições." : gitlabStatus.enabled ? "Sincronização GitLab ativa" : "Sincronização GitLab desativada")}>
+        <span aria-hidden="true" className={gitlabStatus?.enabled && gitlabStatus.has_token && !gitlabStatus.error ? "live-dot" : "idle-dot"}/><span aria-hidden="true"><GitLabIcon/></span><span className="sidebar-control-label">GitLab</span><span aria-hidden="true" className="sidebar-toggle"/>
+      </button>
+    </div></aside><section className="content"><header><div><p className="eyebrow">LOCAL · PRIVADO</p><h1>{view}</h1></div><div className="header-actions"><div className="daily-summary-button"><button onClick={() => generateDaily(localDateValue())} disabled={Boolean(dailyJob)}>{dailyJob && <Spinner/>}Resumo do dia</button><DailySummaryPicker summaries={dailySummaries.slice(0, 5)} date={dailyDate} onDateChange={setDailyDate} busy={Boolean(dailyJob)} onGenerate={generateSelectedDaily}/></div><button className={`capture ${meetingCapture ? "active" : ""}`} onClick={toggleMeeting} disabled={captureBusy}>{captureBusy && <Spinner/>}{meetingCapture ? "Terminar reunião" : "Iniciar reunião"}</button></div></header>
+    {error && <div className="error">{error}<button onClick={() => setError("")}>×</button></div>}{notice && <div className="notice">{notice}<button onClick={() => setNotice("")}>×</button></div>}
+    {["Hoje", "Reuniões", "Pesquisa"].includes(view) && <div className="organization-toolbar"><Popup className="filter-panel"><summary>Filtros <span className="filter-indicator">{activeOrganizationFilterCount || ""}</span></summary>{organizationFilters}</Popup></div>}
     {view === "Notas" && <Notes notes={notes} sessions={sessions} projects={projects} tags={tags} refresh={refresh} onError={setError} onOpenSource={openSource} targetId={contentDetail?.id} OrganizationMenu={OrganizationMenu}/>}
     {view === "Projetos" && <Projects taskProps={taskProps} projects={projects} tags={tags} sessions={sessions} tasks={tasks} notes={notes} summaries={summaries} refresh={refresh} onError={setError} onOpen={openSource} onProjectSaved={(item) => setProjects((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))} onTagSaved={(item) => setTags((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))}/>}
-    {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList {...taskProps} tasks={organizationTasks} today={view === "Hoje"} showSections={view === "Tarefas"} createOpen={view === "Tarefas" ? taskCreateOpen : undefined} onCreateOpenChange={view === "Tarefas" ? setTaskCreateOpen : undefined}/>} {view === "Reuniões" && <Meetings tasks={tasks} taskProps={taskProps} projects={projects} tags={tags} key={meetingsKey} sessions={organizationSessions} refresh={refresh} onError={setError} target={meetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{contentDetail && <article className="card"><h3>{contentDetail.title || "Nota pessoal"}</h3><p>{contentDetail.body}</p><OrganizationMenu item={contentDetail} projects={projects} tags={tags} onSave={async (changes) => {
+    {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList {...taskProps} settingsFilters={view === "Tarefas" ? organizationFilters : null} activeFilterCount={activeOrganizationFilterCount} tasks={organizationTasks} today={view === "Hoje"} showSections={view === "Tarefas"} createOpen={view === "Tarefas" ? taskCreateOpen : undefined} onCreateOpenChange={view === "Tarefas" ? setTaskCreateOpen : undefined}/>} {view === "Reuniões" && <Meetings tasks={tasks} taskProps={taskProps} projects={projects} tags={tags} key={meetingsKey} sessions={organizationSessions} refresh={refresh} onError={setError} target={meetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{contentDetail && <article className="card"><h3>{contentDetail.title || "Nota pessoal"}</h3><p>{contentDetail.body}</p><OrganizationMenu item={contentDetail} projects={projects} tags={tags} onSave={async (changes) => {
       try { const saved = await api(`/notes/${contentDetail.id}/`, { method: "PATCH", body: JSON.stringify(changes) }); setContentDetail(saved); await refresh(); }
       catch (nextError) { setError(nextError.message); }
     }}/><button onClick={() => setContentDetail(null)}>Fechar</button></article>}{chatAnswer && <article className="card answer"><h3>Resposta</h3><p>{chatAnswer.answer}</p>{chatAnswer.warning && <small>{chatAnswer.warning}</small>}<ReferenceInfo label="Fontes da resposta">{chatAnswer.sources?.length ? <span className="answer-sources">{chatAnswer.sources.map((source) => <button key={source.id} onClick={() => openSource(source)}><span>{source.meeting_title} · {source.speaker}</span><small>{source.text}</small></button>)}</span> : <span className="reference-text">Sem evidência suficiente.</span>}</ReferenceInfo></article>}{results && <div className="card-list search-results">{results.sources?.length ? results.sources.map((source) => <button className="card search-result" key={source.id} onClick={() => openSource(source)}><div className="search-result-meta"><span>{{segment: "Transcrição", summary: "Resumo", note: "Nota", task: "Tarefa", session: "Reunião"}[source.kind]}</span><span>{source.title || source.meeting_title}</span></div><p>{source.text}</p></button>) : <div className="empty">Não foram encontrados resultados locais.</div>}</div>}</>} {view === "Definições" && <Settings microphoneId={microphoneId} setMicrophoneId={setMicrophoneId}

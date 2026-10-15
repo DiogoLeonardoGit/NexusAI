@@ -202,7 +202,7 @@ class GitLabTests(TestCase):
         self.assertEqual(GitLabTask.objects.get().pending, {"state": "closed"})
         self.assertEqual(self.client.get("/api/gitlab/").data["error"], "Sem VPN")
 
-    def test_manual_write_path_acknowledges_only_simulated_success(self):
+    def test_automatic_write_path_acknowledges_only_simulated_success(self):
         self.enable_import()
         task = Task.objects.get()
         self.client.post(f"/api/tasks/{task.pk}/complete/")
@@ -212,11 +212,8 @@ class GitLabTests(TestCase):
         settings = self.client.patch("/api/gitlab/", {"write_enabled": True}, format="json")
         self.assertEqual(settings.status_code, 200)
         self.assertFalse(settings.data["read_only"])
-        synchronize()
-        self.fake.update_task.assert_not_called()
-        response = self.client.post("/api/gitlab/push/")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["sent"], 1)
+        response = synchronize()
+        self.assertEqual(response["sent"], 1)
         self.fake.update_task.assert_called_once()
         link = GitLabTask.objects.get()
         self.assertEqual(link.pending, {})

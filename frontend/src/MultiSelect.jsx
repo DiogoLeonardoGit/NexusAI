@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { usePopupOwners } from "./Popup";
 
 // Searchable label picker. A portal keeps the menu visible inside organization popovers.
-export default function MultiSelect({ options, value = [], onChange, disabled, label = "Etiquetas" }) {
+export default function MultiSelect({ options, value = [], onChange, disabled, label = "Etiquetas", emptyMessage = "Cria etiquetas em Projetos." }) {
   const [open, setOpen] = useState(false), [query, setQuery] = useState(""), [position, setPosition] = useState({});
   const trigger = useRef(null), menu = useRef(null), search = useRef(null), pending = useRef(false);
   const id = useId();
@@ -60,6 +60,6 @@ export default function MultiSelect({ options, value = [], onChange, disabled, l
       </label>)}{!filtered.length && <p className="muted">Nenhuma etiqueta encontrada.</p>}</div>
       <button type="button" className="text-button" onClick={close}>Concluir</button>
     </div>, document.body)}
-    {!options.length && <small>Cria etiquetas em Projetos.</small>}
+    {!options.length && <small>{emptyMessage}</small>}
   </span>;
 }

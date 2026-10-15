@@ -91,16 +91,19 @@ def publish_task(task):
 def state_of(issue):
     values = {"title": issue["title"], "description": issue.get("description") or "",
               "state": issue["state"], "labels": sorted(issue.get("labels", []))}
-    # Time is independent of editable task fields and must never enter scalar conflicts.
+    # Spent time is additive; only the estimate participates in scalar conflicts.
     total = (issue.get("time_stats") or {}).get("total_time_spent", 0)
     values["total_time_spent"] = total if type(total) is int and total >= 0 else 0
+    estimate = (issue.get("time_stats") or {}).get("time_estimate", 0)
+    values["estimate_seconds"] = estimate if type(estimate) is int and estimate >= 0 else 0
     return values
 
 
 def local_state(task):
     return {"title": task.title, "description": task.description,
             "state": "closed" if task.status == Task.Status.DONE else "opened",
-            "labels": sorted(task.tags.values_list("name", flat=True))}
+            "labels": sorted(task.tags.values_list("name", flat=True)),
+            "estimate_seconds": task.estimate_seconds}
 
 
 def queue_task(task):
@@ -112,7 +115,7 @@ def queue_task(task):
     if not link.active or link.hidden:
         raise ValidationError({"detail": "Esta tarefa já não está disponível para sincronização."})
     current = local_state(task)
-    link.pending = {key: value for key, value in current.items() if value != link.snapshot.get(key)}
+    link.pending = {key: value for key, value in current.items() if value != link.snapshot.get(key, 0 if key == "estimate_seconds" else None)}
     # Editing an already conflicted field updates its local alternative.
     for key in list(link.conflicts):
         if key not in link.pending:
@@ -126,7 +129,8 @@ def merge_states(baseline, pending, remote, existing_conflicts=None):
     """Merge independent fields and label deltas; report competing scalar edits."""
     result, remaining, conflicts = dict(remote), {}, {}
     for key, wanted in pending.items():
-        previous, actual = baseline.get(key), remote.get(key)
+        previous = baseline.get(key, 0 if key == "estimate_seconds" else None)
+        actual = remote.get(key)
         if key == "labels":
             old, local, external = set(previous or []), set(wanted), set(actual or [])
             wanted = sorted((external - (old - local)) | (local - old))
@@ -136,7 +140,7 @@ def merge_states(baseline, pending, remote, existing_conflicts=None):
         result[key] = wanted
         if wanted != actual:
             remaining[key] = wanted
-    # Closing locally also removes progress labels added remotely before manual send.
+    # Closing locally also removes progress labels added remotely before delivery.
     # Restrict this rule to a pending close; imported closed history stays unchanged.
     if pending.get("state") == "closed":
         result["labels"] = sorted(set(result["labels"]) - COMPLETION_LABELS)
@@ -150,6 +154,7 @@ def merge_states(baseline, pending, remote, existing_conflicts=None):
 def apply_state(task, values, label_ids):
     """Apply reconciled remote fields without touching projects or meeting links."""
     task.title, task.description = values["title"], values["description"]
+    task.estimate_seconds = values.get("estimate_seconds", 0)
     done = values["state"] == "closed"
     was_done = task.status == Task.Status.DONE
     task.status = Task.Status.DONE if done else Task.Status.TODO
@@ -186,14 +191,19 @@ def check_enabled(config):
     return config.enabled
 
 
-def synchronize(*, send_updates=False):
-    """Import automatically; send deltas only for an explicit manual request."""
+def synchronize(*, send_updates=None):
+    """Reconcile linked tasks automatically when the user permits remote writes.
+
+    Local task creation stays exclusively in publish_task, never in this worker.
+    """
     if not sync_lock.acquire(blocking=False):
         return {"busy": True}
     try:
         config = connection()
         if not config.enabled:
             return {"disabled": True}
+        if send_updates is None:
+            send_updates = gitlab.writes_enabled()
         if send_updates and not gitlab.writes_enabled():
             raise ValidationError({"detail": "Ativa o modo de escrita nas definições GitLab."})
         client = gitlab.GitLabClient(config, allow_writes=send_updates)
@@ -307,12 +317,12 @@ def resolve_conflicts(link, choice):
     label_ids = {tag.name: tag.pk for tag in Tag.objects.filter(name__in=current["labels"])}
     apply_state(link.task, current, label_ids)
     link.conflicts = {}
-    link.pending = {key: value for key, value in current.items() if value != link.snapshot.get(key)}
+    link.pending = {key: value for key, value in current.items() if value != link.snapshot.get(key, 0 if key == "estimate_seconds" else None)}
     link.save(update_fields=["pending", "conflicts"])
 
 
 def push_pending(link, config, client, labels):
-    """Recheck assignment and conflicts before manually emitting field deltas."""
+    """Recheck assignment and conflicts before emitting permitted field deltas."""
     latest = client.get(f"/projects/{link.project_id}/issues/{link.issue_iid}")
     if not any(person["id"] == config.user_id for person in latest.get("assignees", [])):
         link.active = False
@@ -360,6 +370,8 @@ def push_time_entries(link, config, client):
         link.active = False
         link.save(update_fields=["active"])
         return 0
+    if state_of(latest)["estimate_seconds"] <= 0:
+        raise gitlab.GitLabError("Define e sincroniza uma estimativa antes de enviar tempo ao GitLab.")
     sent = 0
     for entry in entries.filter(sync_state=TaskTimeEntry.SyncState.PENDING):
         if not check_enabled(config):

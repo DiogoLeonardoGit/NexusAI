@@ -192,6 +192,8 @@ class Task(models.Model):
     owner = models.CharField(max_length=16, choices=Owner.choices, default=Owner.UNKNOWN)
     owner_name = models.CharField(max_length=120, blank=True)
     status = models.CharField(max_length=24, choices=Status.choices, default=Status.TODO)
+    # Zero means no estimate; existing time records remain intact.
+    estimate_seconds = models.PositiveIntegerField(default=0)
     due_at = models.DateTimeField(null=True, blank=True)
     due_is_ambiguous = models.BooleanField(default=False)
     date_phrase = models.CharField(max_length=240, blank=True)

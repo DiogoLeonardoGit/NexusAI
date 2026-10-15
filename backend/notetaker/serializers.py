@@ -322,6 +322,9 @@ class TaskSerializer(serializers.ModelSerializer):
     gitlab = serializers.SerializerMethodField()
     gitlab_export = serializers.SerializerMethodField()
     time_tracking = serializers.SerializerMethodField()
+    estimate_seconds = serializers.IntegerField(min_value=60, max_value=2147483647, required=False)
+    reminder_offset_minutes = serializers.IntegerField(min_value=0, max_value=365 * 24 * 60, required=False, write_only=True)
+    time_entry = TaskTimeEntrySerializer(required=False, write_only=True)
     source_meeting_id = serializers.IntegerField(source="source_segment.session_id", read_only=True)
     source_start_ms = serializers.IntegerField(source="source_segment.timeline_start_ms", read_only=True)
     meeting_title = serializers.CharField(source="session.title", read_only=True)
@@ -330,6 +333,12 @@ class TaskSerializer(serializers.ModelSerializer):
     reminder_status = serializers.SerializerMethodField()
     reminder_notified_at = serializers.SerializerMethodField()
     reminder_minutes_before = serializers.SerializerMethodField()
+
+    def validate_estimate_seconds(self, value):
+        """Estimates use the same whole-minute precision as manual time records."""
+        if value % 60:
+            raise serializers.ValidationError("Define a estimativa em minutos inteiros.")
+        return value
 
     def get_time_tracking(self, instance):
         """Combine confirmed remote totals with pending increments without double counting.
@@ -368,6 +377,10 @@ class TaskSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         if "project" in self.initial_data:
             raise serializers.ValidationError({"project": "Associa a tarefa a uma reunião. O projeto é determinado pela reunião."})
+        # A single task edit may include planning and an additive time entry.
+        if self.instance is None and ("reminder_offset_minutes" in attrs or "time_entry" in attrs):
+            raise serializers.ValidationError("Cria a tarefa antes de definir lembretes ou registar tempo.")
+        self._validate_edit_details(attrs)
         if self.instance is None or not hasattr(self.instance, "gitlab"):
             return attrs
         link = self.instance.gitlab
@@ -384,9 +397,22 @@ class TaskSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({"tags": "Escolhe etiquetas existentes neste projeto GitLab."})
         return attrs
 
+    def _validate_edit_details(self, attrs):
+        """Validate the whole edit before any task, reminder or time write occurs."""
+        if "reminder_offset_minutes" in attrs:
+            due_at = attrs.get("due_at", self.instance.due_at)
+            if due_at and due_at - timedelta(minutes=attrs["reminder_offset_minutes"]) <= timezone.now():
+                raise serializers.ValidationError({"reminder_offset_minutes": "A hora do lembrete já passou. Escolhe uma data posterior ou menos antecedência."})
+        if "time_entry" in attrs and not attrs.get("estimate_seconds", self.instance.estimate_seconds):
+            raise serializers.ValidationError({"time_entry": "Define uma estimativa antes de registar tempo."})
+
     def update(self, instance, validated_data):
         from .services.gitlab_sync import COMPLETION_LABELS, queue_task, sync_lock
         with sync_lock, transaction.atomic():
+            # Recheck time-sensitive validation under the synchronization lock.
+            self._validate_edit_details(validated_data)
+            reminder_offset = validated_data.pop("reminder_offset_minutes", None)
+            time_entry = validated_data.pop("time_entry", None)
             instance = super().update(instance, validated_data)
             if "status" in validated_data:
                 instance.completed_at = (instance.completed_at or timezone.now()) if instance.status == "done" else None
@@ -395,6 +421,14 @@ class TaskSerializer(serializers.ModelSerializer):
                     # Remove only task memberships; keep the reusable label catalogue.
                     instance.tags.remove(*instance.tags.filter(name__in=COMPLETION_LABELS))
                     instance.reminders.update(status=Reminder.Status.CANCELLED)
+            if reminder_offset is not None:
+                instance.due_is_ambiguous = False
+                instance.save(update_fields=["due_is_ambiguous"])
+                instance.reminders.filter(status__in=[Reminder.Status.SCHEDULED, Reminder.Status.SNOOZED]).update(status=Reminder.Status.CANCELLED)
+                if instance.due_at and instance.status not in {Task.Status.DONE, Task.Status.CANCELLED}:
+                    Reminder.objects.create(task=instance, remind_at=instance.due_at - timedelta(minutes=reminder_offset))
+            if time_entry is not None:
+                TaskTimeEntry.objects.create(task=instance, **time_entry)
             queue_task(instance)
             return instance
 

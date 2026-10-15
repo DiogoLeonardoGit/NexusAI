@@ -10,8 +10,7 @@ export function LocalToGitLabIcon() {
 }
 
 export default function GitLabSettings({ onError, refresh }) {
-  const [config, setConfig] = useState(null), [token, setToken] = useState(""), [busy, setBusy] = useState(false);
-  const [result, setResult] = useState("");
+  const [config, setConfig] = useState(null), [busy, setBusy] = useState(false);
   const load = useCallback(async () => setConfig(await api("/gitlab/")), []);
   useEffect(() => {
     load().catch((error) => onError(error.message));
@@ -30,7 +29,7 @@ export default function GitLabSettings({ onError, refresh }) {
   return <article className="card gitlab-settings" aria-busy={busy}>
     <div className="gitlab-settings-heading">
       <div className="gitlab-settings-brand"><div><h2>GitLab</h2><p>As tuas tarefas, ligadas ao teu projeto.</p></div><span className="gitlab-brand-icon"><GitLabIcon/></span></div>
-      <div className="gitlab-settings-badges"><span className={`gitlab-connection-badge ${config.enabled ? "is-enabled" : ""}`}><i aria-hidden="true"/>{config.enabled ? "Sincronização ativa" : "Sincronização desativada"}</span><span className="gitlab-mode-badge">{config.read_only ? "Só leitura" : "Escrita manual"}</span></div>
+      <div className="gitlab-settings-badges"><span className={`gitlab-connection-badge ${config.enabled ? "is-enabled" : ""}`}><i aria-hidden="true"/>{config.enabled ? "Sincronização ativa" : "Sincronização desativada"}</span><span className="gitlab-mode-badge">{config.read_only ? "Só leitura" : "Escrita automática"}</span></div>
     </div>
 
     <dl className="gitlab-connection-details">
@@ -44,33 +43,12 @@ export default function GitLabSettings({ onError, refresh }) {
     </dl>
     {config.error && <div role="alert" className="gitlab-settings-error"><strong>Não foi possível sincronizar</strong><p>{config.error}</p></div>}
 
-    <section className="gitlab-credentials" aria-label="Credenciais GitLab">
-      <div className="gitlab-credentials-heading"><h3>Ligação à conta</h3><span className={`gitlab-token-state ${config.has_token ? "is-configured" : ""}`}>{config.has_token ? "Token configurado" : "Token por configurar"}</span></div>
-      <p>Usa um token pessoal com permissão <code>api</code>. Guardado com proteção do Windows.</p>
-      <form className="gitlab-token-form" onSubmit={(event) => { event.preventDefault(); run(async () => {
-      if (!window.notetaker?.saveGitLabToken) throw new Error("Usa a aplicação desktop para guardar o token protegido pelo Windows.");
-      await window.notetaker.saveGitLabToken(token); setToken("");
-    }); }}><label>Token pessoal<input type="password" autoComplete="new-password" value={token} onChange={(event) => setToken(event.target.value)} placeholder={config.has_token ? "Introduz um novo token para substituir" : "Introduz o token da tua conta"}/></label>
-      <button className="primary-action" disabled={busy || !token.trim()}>Guardar token</button>
-      {config.has_token && <button type="button" className="secondary-action" disabled={busy} onClick={() => run(async () => {
-        await api("/gitlab/", { method: "PATCH", body: JSON.stringify({ enabled: false }) });
-        if (!window.notetaker?.saveGitLabToken) throw new Error("Usa a aplicação desktop para remover a credencial.");
-        await window.notetaker.saveGitLabToken(""); setToken("");
-      })}>Remover token</button>}
-    </form>
-    </section>
-
-    <label className="gitlab-write-toggle"><input type="checkbox" checked={!config.read_only} disabled={busy} onChange={(event) => { setResult(""); run(() => api("/gitlab/", { method: "PATCH", body: JSON.stringify({ write_enabled: event.target.checked }) })); }}/><span>Permitir escrita no GitLab<small>As alterações só são enviadas ao clicar em “Enviar alterações pendentes”.</small></span></label>
-    {result && <p className="project-success" role="status">{result}</p>}
+    <label className="gitlab-write-toggle"><input type="checkbox" checked={!config.read_only} disabled={busy} onChange={(event) => { run(() => api("/gitlab/", { method: "PATCH", body: JSON.stringify({ write_enabled: event.target.checked }) })); }}/><span>Permitir escrita no GitLab<small>As alterações e os tempos são enviados automaticamente. Publicar tarefas locais continua a exigir o botão da tarefa.</small></span></label>
     <div className="gitlab-settings-footer">
-      <div className="gitlab-sync-explanation"><strong>{config.read_only ? "Apenas consulta e importação" : "Envio manual ativo"}</strong><p>{config.read_only ? "Escritas remotas bloqueadas. As alterações locais ficam pendentes até ativares a escrita e enviares." : "Título, descrição, estado e etiquetas são enviados apenas pelo botão. Tarefas com conflitos ficam pendentes."}</p><small>{config.enabled ? "Consulta automaticamente com a app em execução, incluindo minimizada." : "Enquanto desativada, não são feitos pedidos ao GitLab."}</small></div>
+      <div className="gitlab-sync-explanation"><strong>{config.read_only ? "Apenas consulta e importação" : "Envio automático ativo"}</strong><p>{config.read_only ? "Escritas remotas bloqueadas. As alterações locais ficam pendentes até ativares a escrita." : "Título, descrição, estado, etiquetas, estimativas e tempos são enviados a cada sincronização. Tarefas com conflitos ficam pendentes."}</p><small>{config.enabled ? "Consulta automaticamente com a app em execução, incluindo minimizada." : "Enquanto desativada, não são feitos pedidos ao GitLab."}</small></div>
       <div className="gitlab-sync-actions"><button type="button" className="secondary-action" disabled={busy || (!config.enabled && !config.has_token)} onClick={() => run(() => api("/gitlab/", { method: "PATCH", body: JSON.stringify({ enabled: !config.enabled }) }))}>{config.enabled ? "Desativar sincronização" : "Ativar sincronização"}</button>
 
-        <button type="button" className="primary-action" disabled={busy || config.read_only || !config.enabled || !config.has_token || !config.pending} onClick={() => { setResult(""); run(async () => {
-          const response = await api("/gitlab/push/", { method: "POST" });
-          setResult(response.busy ? "Já existe uma sincronização em curso. Tenta novamente." : response.disabled ? "A sincronização está desativada." : `${response.sent} tarefa(s) enviadas · ${response.time_entries_sent ?? 0} registos de tempo · ${response.failed} falhas · ${response.pending} pendentes · ${response.conflicts} conflitos`);
-        }); }}>{busy ? "A processar…" : "Enviar alterações pendentes"}</button>
-        <button type="button" className="secondary-action" disabled={busy || !config.enabled || !config.has_token} onClick={() => run(() => api("/gitlab/sync/", { method: "POST" }))}>Sincronizar agora</button></div>
+        <button type="button" className="secondary-action" disabled={busy || !config.enabled || !config.has_token} onClick={() => run(() => api("/gitlab/sync/", { method: "POST" }))}>Forçar sincronização</button></div>
     </div>
   </article>;
 }

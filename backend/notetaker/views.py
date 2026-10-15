@@ -106,7 +106,7 @@ def gitlab_sync(request):
 
 @api_view(["POST"])
 def gitlab_push(request):
-    """Only this explicit card action authorizes remote task updates."""
+    """Force delivery of pending updates, respecting the persistent write permission."""
     from .services import gitlab
     from .services.gitlab_sync import synchronize
     try:
@@ -537,7 +537,7 @@ class TaskViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get", "post"], url_path="time")
     def time_entries(self, request, pk=None):
-        """Record manual time locally; only the existing manual GitLab push sends it."""
+        """Append time only after an estimate; linked records enter automatic delivery."""
         task = self.get_object()
         if request.method == "GET":
             return Response(TaskTimeEntrySerializer(task.time_entries.all(), many=True).data)
@@ -545,9 +545,17 @@ class TaskViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Esta tarefa não está disponível para registar tempo."}, status=400)
         if not isinstance(request.data, dict) or set(request.data) != {"duration_seconds"}:
             return Response({"detail": "Indica apenas duration_seconds, em minutos inteiros positivos."}, status=400)
-        serializer = TaskTimeEntrySerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        serializer.save(task=task)
+        from .services.gitlab_sync import sync_lock
+        # Recheck after acquiring the worker's lock: a remote estimate may change.
+        with sync_lock, transaction.atomic():
+            task = self.get_object()
+            if hasattr(task, "gitlab") and (task.gitlab.hidden or not task.gitlab.active):
+                return Response({"detail": "Esta tarefa não está disponível para registar tempo."}, status=400)
+            if task.estimate_seconds <= 0:
+                return Response({"detail": "Define uma estimativa antes de registar tempo."}, status=400)
+            serializer = TaskTimeEntrySerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            serializer.save(task=task)
         return Response(self.get_serializer(self.get_object()).data, status=201)
 
     def destroy(self, request, *args, **kwargs):
