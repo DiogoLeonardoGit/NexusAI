@@ -1,6 +1,6 @@
 # My AI Notetaker
 
-Assistente pessoal desktop para Windows. Captura microfone e áudio do sistema, transcreve português e inglês com Faster Whisper e usa o `gemma4:12b` local através do Ollama para criar resumos, tarefas e lembretes.
+Assistente pessoal desktop para Windows. Captura microfone e áudio do sistema, transcreve português e inglês com Faster Whisper e usa um modelo local através do LM Studio (por defeito, `qwen2.5-14b-instruct`) ou do Ollama para criar resumos, tarefas e lembretes.
 
 Áudio, transcrições e notas permanecem no computador. O frontend comunica apenas com o backend local, que escuta em `127.0.0.1`. A integração GitLab opcional consulta tarefas na instância empresarial através do backend e permite enviar alterações manualmente, após ativar o modo de escrita.
 
@@ -9,7 +9,7 @@ Assistente pessoal desktop para Windows. Captura microfone e áudio do sistema, 
 - Windows 11
 - Python 3.12
 - Node.js 24 e npm
-- Ollama em execução com `gemma4:12b`
+- LM Studio com `Qwen2.5-14B-Instruct-GGUF` em Q4_K_M, ou Ollama com `gemma4:12b`
 
 ## Preparação
 
@@ -24,11 +24,40 @@ O download do Whisper acontece apenas durante a preparação. A utilização nor
 
 ## Desenvolvimento
 
-Inicia o Ollama numa consola:
+No LM Studio, carrega `Qwen2.5-14B-Instruct` (sem `Coder` nem `1M`) com contexto de
+8192 tokens e inicia o servidor em **Model Server / Developer → Local Server**.
+O endereço predefinido é `http://127.0.0.1:1234`, sem autenticação. O backend usa
+`/v1/chat/completions` com JSON Schema e valida também o conteúdo devolvido.
+Não é necessário ativar CORS nem **Serve on Local Network**, porque o backend faz
+os pedidos localmente. Mantém o servidor em execução durante a utilização.
+
+As seguintes variáveis de ambiente são opcionais (também podem ser definidas no
+`.env` da raiz em desenvolvimento):
+
+```dotenv
+AI_PROVIDER=lmstudio
+LMSTUDIO_URL=http://127.0.0.1:1234
+LMSTUDIO_MODEL=qwen2.5-14b-instruct
+```
+
+O valor de `LMSTUDIO_MODEL` tem de corresponder exatamente ao identificador
+apresentado no servidor; confirma-o em `http://127.0.0.1:1234/v1/models`.
+Nas definições da aplicação são apresentados o fornecedor, modelo e disponibilidade.
+A disponibilidade confirma que o modelo consta da lista do servidor; a primeira
+geração pode ainda precisar de o carregar. Não é efetuada inferência na verificação.
+Reinicia a aplicação depois de alterar estas variáveis. Na aplicação instalada,
+define-as no ambiente do processo/Windows antes de iniciar a aplicação.
+
+Para voltar ao Ollama, define `AI_PROVIDER=ollama` e inicia-o numa consola:
 
 ```powershell
 ollama serve
 ```
+
+Nesta opção continuam disponíveis `OLLAMA_URL` (por defeito
+`http://127.0.0.1:11434`) e `OLLAMA_MODEL` (por defeito `gemma4:12b`).
+Esta configuração usa apenas inferência local, sem API cloud, chave ou mensalidade.
+O Whisper e os dados existentes não são alterados pela escolha do servidor de IA.
 
 Depois inicia a aplicação:
 
@@ -70,7 +99,7 @@ O backend é empacotado como pasta para evitar o atraso de extração de execut�
 ## Limitações conhecidas
 
 - A identificação robusta é `Eu` para o microfone e `Outros` para o áudio do sistema. Separar automaticamente cada participante remoto não é fiável em todas as chamadas.
-- O primeiro pedido ao `gemma4:12b` pode demorar alguns minutos enquanto o Ollama carrega o modelo.
+- O primeiro pedido de IA pode demorar enquanto o LM Studio ou Ollama carrega o modelo.
 - A aplicação só consegue captar áudio que o Windows e a aplicação de origem permitam disponibilizar por loopback.
 
 ## Projetos, etiquetas e trabalho diário

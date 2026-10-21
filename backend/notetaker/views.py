@@ -50,7 +50,7 @@ from .serializers import (
     TranscriptSegmentSerializer,
 )
 from .services.ollama import health as ollama_health
-from .services.ollama import CHAT_SYSTEM_PROMPT, OllamaError, generate_json
+from .services.ollama import CHAT_SYSTEM_PROMPT, OllamaError, configured_model, generate_json
 from .services.pipeline import finalize_session_language
 from .services.retention import delete_audio_file
 from .services.search import retrieve, search_filters
@@ -58,7 +58,19 @@ from .services.search import retrieve, search_filters
 
 @api_view(["GET"])
 def health(request):
-    return Response({"status": "ok", "ollama": ollama_health(), "model": settings.OLLAMA_MODEL})
+    """Report the selected AI provider and model without performing generation."""
+    available = ollama_health()
+    try:
+        model = configured_model()
+    except OllamaError:
+        model = ""
+    return Response({
+        "status": "ok",
+        "provider": settings.AI_PROVIDER,
+        "ai_available": available,
+        "ollama": available if settings.AI_PROVIDER == "ollama" else False,
+        "model": model,
+    })
 
 
 @api_view(["GET", "PATCH"])

@@ -64,6 +64,10 @@ REST_FRAMEWORK = {
 LOCAL_API_TOKEN = os.getenv("NOTETAKER_API_TOKEN", "development-token")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:12b")
+# Select the local inference server without changing the transcription pipeline.
+AI_PROVIDER = os.getenv("AI_PROVIDER", "lmstudio").strip().lower()
+LMSTUDIO_URL = os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234")
+LMSTUDIO_MODEL = os.getenv("LMSTUDIO_MODEL", "qwen2.5-14b-instruct")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", str(PROJECT_DIR / "models" / "faster-whisper-medium"))
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
