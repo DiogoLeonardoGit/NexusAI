@@ -94,12 +94,33 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 .task-card-header > h3 { min-width: 0; overflow-wrap: anywhere; }
 .task-title-input, .task-description-input, .task-meta input, .task-meta select { padding: var(--field-padding); border: 0; outline: none; border-radius: 0; color: #e8edf4; background: transparent; }
 .task-title-input { width: min(620px, 100%); min-width: 0; font-weight: 700; }
-.task-description { margin: 2px 0 6px; color: #cbd4df; white-space: pre-wrap; }
+.task-description { margin: 2px 0 6px; color: #cbd4df; white-space: pre-wrap; line-height: 1.5; overflow-wrap: anywhere; }
+.task-description.is-clamped { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 10; overflow: hidden; }
+.task-description-preview > button { margin-bottom: 6px; }
+.task-comment { margin: 8px 0; }
+/* Keep the comment composer consistent with the existing dark fields and actions. */
+.task-comment > summary { display: flex; align-items: center; gap: 7px; width: fit-content; padding: 5px 0; border-radius: 4px; cursor: pointer; color: #98a4b5; font-size: 12px; list-style: none; }
+.task-comment > summary::-webkit-details-marker { display: none; }
+.task-comment > summary::before { content: ""; width: 6px; height: 6px; border-right: 1px solid currentColor; border-bottom: 1px solid currentColor; transform: rotate(-45deg); }
+.task-comment[open] > summary::before { transform: rotate(45deg); }
+.task-comment > summary:hover, .task-comment[open] > summary { color: #cbd4df; }
+.task-comment > summary:focus-visible, .task-comment button:focus-visible { outline: 2px solid #c9f27b; outline-offset: 3px; }
+.task-comment form { display: flex; flex-direction: column; align-items: stretch; gap: 10px; width: 100%; margin-top: 7px; }
+.task-comment textarea { display: block; width: 100%; min-height: 88px; padding: 12px 14px; border: 1px solid #303949; border-radius: 9px; color: #e8edf4; background: #0f141c; line-height: 1.5; resize: vertical; }
+.task-comment textarea::placeholder { color: #788597; }
+.task-comment textarea:focus-visible { outline: 2px solid #c9f27b66; outline-offset: 2px; border-color: #a6c76b; }
+.task-comment textarea:disabled { opacity: .65; cursor: not-allowed; }
+.task-comment button.primary-action { display: inline-flex; align-items: center; justify-content: center; align-self: flex-end; gap: 7px; min-width: 100px; padding: 7px 20px; font-size: 12px; }
+.task-comment button:disabled { cursor: not-allowed; }
+.task-comment small { color: #94a0b1; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .task-description-input { display: block; width: 100%; min-height: var(--field-height); margin: 2px 0 6px; line-height: var(--field-line-height); resize: none; overflow-y: hidden; }
 .task-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: #94a0b1; line-height: 1.5; }
 .task-meta .warning { margin-top: 0; }
 .task-details { margin-top: 6px; }
+.task-owner-fixed { cursor: default; }
 .task-edit-fields { display: grid; min-width: 0; gap: 12px; margin: 14px 0 0; padding: 0; border: 0; }
+.milestone-field { display: grid; justify-items: start; gap: 6px; min-width: 0; }
+.milestone-field .custom-select { max-width: 100%; }
 .task-edit-fields > .organization-fields { flex-wrap: wrap; }
 .task-edit-fields .schedule-editor { align-items: flex-end; margin-top: 0; }
 .task-edit-fields .schedule-editor label { display: grid; gap: 5px; color: #94a0b1; font-size: 12px; }
@@ -251,13 +272,15 @@ button.search-result:hover { border-color: #526f35; }
 }
 
 /* Shared organization controls and focused daily task groups. */
-.search-filters, .organization-fields { display: flex; flex-wrap: wrap; gap: 14px; align-items: start; margin: 12px 0 20px; }
+.search-filters, .organization-fields { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; margin: 12px 0 20px; }
 .search-filters label, .organization-fields > label { display: grid; gap: 5px; }
 .organization-fields fieldset { border: 1px solid #303949; border-radius: 8px; display: flex; flex-wrap: wrap; gap: 12px; }
 .organization-label-field { display: grid; gap: 5px; flex: 1 1 280px; min-width: 0; }
 .organization-label-field .multi-select { display: grid; width: 100%; min-width: 0; }
-.multi-select .select-trigger > .selected-labels { display: flex; flex-wrap: wrap; gap: 5px; white-space: normal; }
-.multi-select .label-chip { font-size: 12px; }
+/* Scroll selected labels on one line so adjacent controls keep the shared height. */
+.custom-select.multi-select .select-trigger { padding-block: 5px; }
+.multi-select .select-trigger > .selected-labels { display: flex; align-items: center; flex: 1; min-width: 0; height: 100%; gap: 5px; overflow-x: auto; white-space: nowrap; scrollbar-width: thin; }
+.multi-select .label-chip { flex-shrink: 0; font-size: 12px; line-height: 18px; }
 .multi-select-menu { display: flex; flex-direction: column; gap: 8px; overflow: hidden; }
 .multi-select-menu > input { width: 100%; flex-shrink: 0; padding: var(--field-padding); border: 1px solid #303949; border-radius: 7px; color: #dce4ee; background: #131922; }
 .multi-select-options { overflow-y: auto; min-height: 0; }
@@ -298,7 +321,7 @@ button.search-result:hover { border-color: #526f35; }
 
 /* Custom selectors share the app palette, including their expanded menus. */
 .custom-select { display: inline-flex; min-width: 110px; max-width: 100%; }
-.custom-select .select-trigger { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-height: var(--field-height); padding: var(--field-padding); border: 1px solid #303949; border-radius: 9px; color: #dce4ee; background: #131922; font-weight: 400; text-align: left; }
+.custom-select .select-trigger { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; height: var(--field-height); min-height: var(--field-height); padding: var(--field-padding); border: 1px solid #303949; border-radius: 9px; color: #dce4ee; background: #131922; font-weight: 400; text-align: left; }
 .select-trigger > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .select-trigger svg { flex-shrink: 0; transition: transform .15s; }
 .select-trigger[aria-expanded="true"] svg { transform: rotate(180deg); }
@@ -449,6 +472,14 @@ button.search-result:hover { border-color: #526f35; }
 .task-board-card[draggable="true"] { cursor: grab; }
 .task-board-card[draggable="true"]:active { cursor: grabbing; }
 .task-board-card > h3 { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; line-height: 1.5; }
+.task-board-card.is-expanded { flex-wrap: wrap; }
+.task-board-toggle { width: 100%; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-align: left; overflow-wrap: anywhere; }
+.task-board-toggle:focus-visible { outline: 2px solid #c9f27b; outline-offset: 4px; }
+.task-board-details { flex-basis: 100%; min-width: 0; }
+.task-board-details > .task { padding: 14px 0 0; border: 0; box-shadow: none; flex-wrap: wrap; }
+.task-board-details .task-body { flex-basis: 100%; min-width: 0; }
+.task-board-details .task-card-header, .task-board-details .item-actions { flex-wrap: wrap; }
+.task-board-details .schedule-editor, .task-board-details .task-time-fields { display: grid; grid-template-columns: minmax(0, 1fr); }
 .task-labels { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
 .label-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border: 1px solid #46525e; border-radius: 14px; font-size: 12px; }
 .label-chip i { width: 9px; height: 9px; border-radius: 50%; }
@@ -515,6 +546,9 @@ button.search-result:hover { border-color: #526f35; }
 .gitlab-write-toggle small { display: block; margin-top: 5px; color: #8f9bac; }
 .tag-management-item { display: flex; align-items: center; gap: 8px; }
 .notes-workspace { display: grid; gap: 18px; }
+.notes-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; border-bottom: 1px solid #303949; padding-bottom: 10px; }
+.notes-toolbar .section-tabs { margin: 0; padding: 0; border: 0; flex-wrap: wrap; }
+.notes-toolbar > .primary-action { margin-left: auto; }
 .notes-filters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .notes-filters label, .note-editor > label { display: grid; gap: 8px; color: #aab6c6; font-size: 13px; }
 .notes-filters input, .note-editor input, .note-editor textarea { width: 100%; padding: var(--field-padding); border: 1px solid #303949; border-radius: 8px; color: #e8edf4; background: #0f141c; }

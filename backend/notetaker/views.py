@@ -94,6 +94,24 @@ def gitlab_credentials(request):
     return Response({"has_token": gitlab.has_token()})
 
 
+@api_view(["GET"])
+def gitlab_milestones(request):
+    """Read the live catalogue without enabling writes or starting synchronization."""
+    from .services import gitlab
+    from .services.gitlab_sync import connection, sync_lock
+    with sync_lock:
+        config = connection()
+        if not config.enabled:
+            return Response({"detail": "Ativa a sincronização GitLab para consultar milestones."}, status=400)
+        try:
+            client = gitlab.GitLabClient(config)
+            project_id = config.project_id or client.project()["id"]
+            return Response([{"id": item["id"], "title": item["title"], "state": item.get("state", "active")}
+                             for item in client.milestones(project_id)])
+        except gitlab.GitLabError as exc:
+            return Response({"detail": str(exc)}, status=502)
+
+
 @api_view(["POST"])
 def gitlab_sync(request):
     from .services import gitlab
@@ -532,6 +550,33 @@ class TaskViewSet(viewsets.ModelViewSet):
         try:
             task = publish_task(self.get_object())
             return Response(self.get_serializer(task).data)
+        except gitlab.GitLabError as exc:
+            return Response({"detail": str(exc)}, status=502)
+
+    @action(detail=True, methods=["post"])
+    def comments(self, request, pk=None):
+        """Send a user-written comment once, respecting sync and identity checks."""
+        from .services import gitlab
+        task = self.get_object()
+        if not hasattr(task, "gitlab") or not task.gitlab.active or task.gitlab.hidden:
+            return Response({"detail": "Só podes comentar tarefas ativas ligadas ao GitLab."}, status=400)
+        if not isinstance(request.data, dict) or set(request.data) != {"body"}:
+            return Response({"detail": "Indica apenas o texto do comentário em body."}, status=400)
+        body = request.data["body"]
+        if not isinstance(body, str) or not body.strip() or len(body) > 100000:
+            return Response({"detail": "Escreve um comentário com até 100000 caracteres."}, status=400)
+        link = task.gitlab
+        if not link.connection.enabled or not gitlab.writes_enabled() or not gitlab.has_token():
+            return Response({"detail": "Ativa a sincronização e a escrita e configura o token GitLab."}, status=400)
+        client = gitlab.GitLabClient(link.connection, allow_writes=True)
+        try:
+            user = client.get("/user")
+            if user.get("email", "").lower() != gitlab.EXPECTED_EMAIL:
+                raise gitlab.GitLabError("O token tem de pertencer a diogo.leonardo@warpcom.com.")
+            latest = client.get(f"/projects/{link.project_id}/issues/{link.issue_iid}")
+            if not any(person["id"] == user["id"] for person in latest.get("assignees", [])):
+                return Response({"detail": "Esta tarefa já não te está atribuída no GitLab."}, status=400)
+            return Response(client.add_comment(link, body.strip()), status=201)
         except gitlab.GitLabError as exc:
             return Response({"detail": str(exc)}, status=502)
 

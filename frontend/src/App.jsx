@@ -267,6 +267,57 @@ function readTaskSectionOrder() {
   }
 }
 
+// Measure rendered lines so wrapping also counts towards the ten-line preview.
+function TaskDescription({ text }) {
+  const paragraph = useRef(null);
+  const id = useId();
+  const [expanded, setExpanded] = useState(false), [overflows, setOverflows] = useState(false);
+  useLayoutEffect(() => {
+    setExpanded(false);
+  }, [text]);
+  useLayoutEffect(() => {
+    const node = paragraph.current;
+    const measure = () => {
+      const lineHeight = parseFloat(window.getComputedStyle(node).lineHeight);
+      setOverflows(node.scrollHeight > lineHeight * 10 + 1);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [text]);
+  return <div className="task-description-preview">
+    <p ref={paragraph} id={id} className={`task-description ${expanded ? "" : "is-clamped"}`}>{text}</p>
+    {overflows && <button type="button" className="text-button" aria-expanded={expanded} aria-controls={id} onClick={() => setExpanded((value) => !value)}>{expanded ? "Ver menos" : "Ver mais"}</button>}
+  </div>;
+}
+
+// Comments are sent only by this form; drafts remain available after failures.
+function GitLabTaskComment({ task, gitlabStatus, onError, disabled }) {
+  const [body, setBody] = useState(""), [sending, setSending] = useState(false), [result, setResult] = useState("");
+  const submitting = useRef(false);
+  const reason = !task.gitlab.active || task.gitlab.hidden ? "Esta tarefa não está disponível para comentários."
+    : !gitlabStatus?.enabled || gitlabStatus.read_only || !gitlabStatus.has_token ? "Ativa a sincronização e a escrita e configura o token GitLab." : "";
+  const submit = async (event) => {
+    event.preventDefault();
+    if (submitting.current || disabled || reason || !body.trim()) return;
+    submitting.current = true; setSending(true); setResult("");
+    try {
+      await api(`/tasks/${task.id}/comments/`, { method: "POST", body: JSON.stringify({ body: body.trim() }) });
+      setBody(""); setResult("Comentário enviado para o GitLab.");
+    } catch (error) { setResult(error.message); onError(error.message); }
+    finally { submitting.current = false; setSending(false); }
+  };
+  return <details className="task-comment"><summary>Comentar no GitLab</summary>
+    <form onSubmit={submit}>
+      <textarea aria-label={`Comentário para o GitLab: ${task.title}`} placeholder="Escreve um comentário…" rows={3} maxLength={100000} value={body} disabled={sending || disabled || Boolean(reason)} onChange={(event) => { setBody(event.target.value); setResult(""); }}/>
+      {reason && <small>{reason}</small>}
+      <button type="submit" className="primary-action" disabled={sending || disabled || Boolean(reason) || !body.trim()}>{sending && <Spinner/>}{sending ? "A enviar…" : "Enviar"}</button>
+      {result && <small role="status">{result}</small>}
+    </form>
+  </details>;
+}
+
 export function TaskList({ tasks, sections = [], showSections, refresh, onError, today, projects = [], tags = [], onOpenSource, targetId, targetKey, defaultSession = null, sessions = [], gitlabStatus, createOpen, onCreateOpenChange, initialFilter = "todo", compactCreate = false, settingsFilters = null, activeFilterCount = 0 }) {
   const localFormId = useId();
   const formId = showSections ? "new-task-form" : `new-task-${localFormId}`;
@@ -281,9 +332,26 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const [unassignedCollapsed, setUnassignedCollapsed] = useState(false), [dropTarget, setDropTarget] = useState(null);
   const [sectionOrder, setSectionOrder] = useState(readTaskSectionOrder);
   const draggedTask = useRef(null);
+  const boardDragEnded = useRef(0);
+  const [expandedCards, setExpandedCards] = useState([]);
+  const [filter, setFilter] = useState(initialFilter), [editingTask, setEditingTask] = useState(null);
+  const [milestones, setMilestones] = useState([]), [milestonesLoading, setMilestonesLoading] = useState(false);
+  const [milestonesError, setMilestonesError] = useState(""), [milestonesRetry, setMilestonesRetry] = useState(0);
+  // Fetch the live catalogue only while editing a linked task; ignore stale replies.
+  useEffect(() => {
+    if (!editingTask?.gitlabLinked) return;
+    let cancelled = false;
+    setMilestones([]); setMilestonesError(""); setMilestonesLoading(true);
+    api("/gitlab/milestones/").then((items) => {
+      if (!Array.isArray(items)) throw new Error("Resposta inválida ao consultar milestones.");
+      if (!cancelled) setMilestones(items);
+    })
+      .catch((error) => { if (!cancelled) setMilestonesError(error.message); })
+      .finally(() => { if (!cancelled) setMilestonesLoading(false); });
+    return () => { cancelled = true; };
+  }, [editingTask?.id, editingTask?.gitlabLinked, milestonesRetry]);
   const draggedSection = useRef(null);
   const orderedSections = [...sectionOrder.map((id) => sections.find((section) => section.id === id)).filter(Boolean), ...sections.filter((section) => !sectionOrder.includes(section.id))];
-  const [filter, setFilter] = useState(initialFilter), [editingTask, setEditingTask] = useState(null);
   const [dueAt, setDueAt] = useState(""), [minutesBefore, setMinutesBefore] = useState(15), [busy, setBusy] = useState(null);
   const [selecting, setSelecting] = useState(false), [selectedIds, setSelectedIds] = useState([]), [bulkLabels, setBulkLabels] = useState([]);
   const [actionResult, setActionResult] = useState("");
@@ -355,8 +423,9 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     const initialEstimate = task.estimate_seconds ? formatTrackedTime(task.estimate_seconds) : "";
     const initialMinutes = task.reminder_minutes_before ?? 15;
     setEditingTask({ id: task.id, title: task.title, description: task.description || "", owner: task.owner, owner_name: task.owner_name || "",
+      gitlabLinked: Boolean(task.gitlab), milestone_id: task.gitlab?.milestone?.id ?? null,
       tags: [...(task.tags || [])], session: task.session ?? null,
-      original: { dueAt: initialDueAt, minutesBefore: initialMinutes, estimateDuration: initialEstimate, estimateSeconds: task.estimate_seconds || 0, tags: [...(task.tags || [])], session: task.session ?? null } });
+      original: { milestone_id: task.gitlab?.milestone?.id ?? null, dueAt: initialDueAt, minutesBefore: initialMinutes, estimateDuration: initialEstimate, estimateSeconds: task.estimate_seconds || 0, tags: [...(task.tags || [])], session: task.session ?? null } });
     setDueAt(initialDueAt); setMinutesBefore(initialMinutes);
     setEstimateDuration(initialEstimate); setTimeDuration("");
   };
@@ -386,6 +455,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
       changes.reminder_offset_minutes = Number(minutesBefore);
     }
     if (editingTask.session !== original.session) changes.session = editingTask.session;
+    if (editingTask.gitlabLinked && editingTask.milestone_id !== original.milestone_id) changes.milestone_id = editingTask.milestone_id;
     if ([...editingTask.tags].sort((a, b) => a - b).join(",") !== [...original.tags].sort((a, b) => a - b).join(",")) changes.tags = editingTask.tags;
     const saved = await run(`edit-${editingTask.id}`, async () => {
       await api(`/tasks/${editingTask.id}/`, { method: "PATCH", body: JSON.stringify(changes) });
@@ -464,33 +534,41 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     const frame = requestAnimationFrame(() => document.querySelector(`[data-task-id="${targetId}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }));
     return () => cancelAnimationFrame(frame);
   }, [targetId, targetKey, tasks, filter, taskSearch]);
-  const renderTask = (task, column = null) => {
+  const renderTask = (task, column = null, boardDetail = false) => {
         const overdue = task.status !== "done" && task.due_at && new Date(task.due_at).getTime() < Date.now();
         const reminderFired = task.status !== "done" && task.reminder_status === "notified";
         const alertClass = overdue ? "overdue" : reminderFired ? "reminder-fired" : "";
         const isEditing = editingTask?.id === task.id;
-        // Board cards keep only the title; the whole card retains the existing
-        // column drag behaviour and bulk selection is shown only when enabled.
-        if (showSections && !today && layout === "board") {
+        // Reuse the full task UI inside an expandable card without duplicating actions.
+        if (showSections && !today && layout === "board" && !boardDetail) {
+          const cardKey = `${task.id}-${column?.id ?? "unassigned"}`;
+          const expanded = expandedCards.includes(cardKey) || isEditing;
+          const toggle = () => {
+            if (isEditing || Date.now() - boardDragEnded.current < 250) return;
+            setExpandedCards((current) => current.includes(cardKey) ? current.filter((key) => key !== cardKey) : [...current, cardKey]);
+          };
           return <article id={`task-${task.id}-column-${column?.id ?? "unassigned"}`} data-task-id={task.id}
-            className={`card task task-board-card ${targetId === task.id ? "highlighted-segment" : ""}`} key={task.id}
-            draggable={!busy && !isEditing}
+            className={`card task task-board-card ${expanded ? "is-expanded" : ""} ${targetId === task.id ? "highlighted-segment" : ""}`} key={task.id}
+            onClick={(event) => { if (!event.target.closest("button, input, select, textarea, a, summary, .task-board-details")) toggle(); }}
+            draggable={!busy && !expanded}
             onDragStart={(event) => {
-              if (busy || isEditing) { event.preventDefault(); return; }
+              if (event.target !== event.currentTarget) return;
+              if (busy || expanded) { event.preventDefault(); return; }
               draggedTask.current = { id: task.id, tag: column?.tag ?? null, done: column?.id === "done" };
               event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", String(task.id));
             }}
-            onDragEnd={() => { draggedTask.current = null; setDropTarget(null); }}>
+            onDragEnd={() => { boardDragEnded.current = Date.now(); draggedTask.current = null; setDropTarget(null); }}>
             {selecting && <input type="checkbox" className="task-selection" aria-label={`Selecionar tarefa ${task.title}`}
               checked={selectedTaskIds.includes(task.id)} disabled={Boolean(busy)}
               onDragStart={(event) => { event.preventDefault(); event.stopPropagation(); }}
               onChange={(event) => { const checked = event.target.checked; setSelectedIds((current) => checked ? [...new Set([...current, task.id])] : current.filter((id) => id !== task.id)); }}/>
             }
-            <h3>{task.title}</h3>
+            <h3><button type="button" className="task-board-toggle" aria-expanded={expanded} aria-controls={`task-details-${cardKey}`} disabled={isEditing} onClick={toggle}>{task.title}</button></h3>
+            {expanded && <div id={`task-details-${cardKey}`} className="task-board-details">{renderTask(task, column, true)}</div>}
           </article>;
         }
-        return <article id={column ? `task-${task.id}-column-${column.id ?? "unassigned"}` : `task-${task.id}`} data-task-id={task.id} className={`card task ${alertClass} ${targetId === task.id ? "highlighted-segment" : ""}`} key={task.id}>
-        {selecting && <input type="checkbox" className="task-selection" aria-label={`Selecionar tarefa ${task.title}`} checked={selectedTaskIds.includes(task.id)} disabled={Boolean(busy)} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...new Set([...current, task.id])] : current.filter((id) => id !== task.id))}/>}
+        return <article id={boardDetail ? undefined : column ? `task-${task.id}-column-${column.id ?? "unassigned"}` : `task-${task.id}`} data-task-id={boardDetail ? undefined : task.id} className={`card task ${alertClass} ${targetId === task.id ? "highlighted-segment" : ""}`} key={task.id}>
+        {selecting && !boardDetail && <input type="checkbox" className="task-selection" aria-label={`Selecionar tarefa ${task.title}`} checked={selectedTaskIds.includes(task.id)} disabled={Boolean(busy)} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...new Set([...current, task.id])] : current.filter((id) => id !== task.id))}/>}
         {showSections && <button type="button" className="task-drag-handle" aria-label={`Arrastar tarefa ${task.title}`} title="Arrastar para outra vista de etiqueta" disabled={Boolean(busy) || isEditing} draggable={!busy && !isEditing}
           onDragStart={(event) => { draggedTask.current = { id: task.id, tag: column?.tag ?? null, done: column?.id === "done" }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", String(task.id)); }}
           onDragEnd={() => { draggedTask.current = null; setDropTarget(null); }}>⠿</button>}
@@ -507,13 +585,14 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
               title={publishDisabledReason(task) || "Enviar ticket para o GitLab"} disabled={Boolean(busy) || Boolean(publishDisabledReason(task))}
               onClick={() => publishLocalTask(task)}>{busy === `publish-${task.id}` ? <Spinner/> : <LocalToGitLabIcon/>}</button>} {isEditing ? <><button className="text-button" onClick={saveTask} disabled={!editingTask.title.trim() || Boolean(busy)}>{busy === `edit-${task.id}` && <Spinner/>}Concluir</button><button className="text-button secondary-text" disabled={Boolean(busy)} onClick={() => setEditingTask(null)}>Cancelar</button></> : <><button className="text-button" disabled={Boolean(busy)} onClick={() => beginTaskEdit(task)}>Editar</button><button className="text-button danger" onClick={() => deleteTask(task)} disabled={busy === `delete-${task.id}`}>{busy === `delete-${task.id}` && <Spinner/>}{task.gitlab ? "Ocultar nesta app" : "Eliminar"}</button></>}</div>
           </div>
-          {isEditing ? <AutoSizeTextarea className="task-description-input" disabled={Boolean(busy)} value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <p className="task-description">{task.description}</p>}
+          {isEditing ? <AutoSizeTextarea className="task-description-input" disabled={Boolean(busy)} value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <TaskDescription text={task.description}/>}
 
           
           <div className="task-labels">{tags.filter((tag) => task.tags?.includes(tag.id)).map((tag) => <span className="label-chip" key={tag.id}><i style={{ backgroundColor: tag.color || "#6699cc" }}/>{tag.name}</span>)}</div>
           {task.gitlab?.pending && <small className="sync-pending">Alterações locais pendentes de envio</small>}
+          {task.gitlab && !isEditing && <GitLabTaskComment task={task} gitlabStatus={gitlabStatus} onError={onError} disabled={Boolean(busy)}/>}
           {task.gitlab && Object.keys(task.gitlab.conflicts).length > 0 && <div className="sync-conflict" role="alert"><strong>Conflito com o GitLab</strong><p>{Object.keys(task.gitlab.conflicts).join(", ")}</p>
-            {Object.entries(task.gitlab.conflicts).map(([field, values]) => <div className="conflict-values" key={field}><strong>{field === "title" ? "Título" : field === "description" ? "Descrição" : field === "estimate_seconds" ? "Estimativa (segundos)" : "Estado"}</strong><p>Na app: {String(values.local)}</p><p>No GitLab: {String(values.remote)}</p></div>)}
+            {Object.entries(task.gitlab.conflicts).map(([field, values]) => <div className="conflict-values" key={field}><strong>{{ title: "Título", description: "Descrição", estimate_seconds: "Estimativa (segundos)", start_date: "Data de início", due_date: "Data limite", milestone_id: "Milestone", state: "Estado" }[field] || field}</strong><p>Na app: {String(values.local)}</p><p>No GitLab: {String(values.remote)}</p></div>)}
             <button disabled={Boolean(busy)} onClick={() => run(`resolve-${task.id}`, () => api(`/tasks/${task.id}/resolve/`, { method: "POST", body: JSON.stringify({ choice: "local" }) }))}>Manter alterações locais</button>
             <button disabled={Boolean(busy)} onClick={() => run(`resolve-${task.id}`, () => api(`/tasks/${task.id}/resolve/`, { method: "POST", body: JSON.stringify({ choice: "remote" }) }))}>Usar versão GitLab</button></div>}
           <div className={`task-meta ${isEditing ? "editing" : ""}`}>
@@ -523,14 +602,25 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
             {task.time_tracking?.uncertain_seconds > 0 && <small className="task-time-uncertain" role="alert">Envio de {formatTrackedTime(task.time_tracking.uncertain_seconds)} por confirmar. Verifica o GitLab.</small>}
           </div>
           <div className={`task-meta task-details ${isEditing ? "editing" : ""}`}>
-            {isEditing ? <><Select aria-label="Responsável da tarefa" disabled={Boolean(busy) || Boolean(task.gitlab)} value={editingTask.owner} onChange={(event) => setEditingTask({ ...editingTask, owner: event.target.value })}><option value="self">Eu</option><option value="other">Outro interveniente</option><option value="unknown">Por definir</option></Select>{editingTask.owner === "other" && <input value={editingTask.owner_name} onChange={(event) => setEditingTask({ ...editingTask, owner_name: event.target.value })} placeholder="Nome do responsável"/>}</> : <span>{task.owner === "self" ? "Eu" : task.owner_name || "Outro interveniente"}</span>}
+            {isEditing && !task.gitlab ? <><Select aria-label="Responsável da tarefa" disabled={Boolean(busy)} value={editingTask.owner} onChange={(event) => setEditingTask({ ...editingTask, owner: event.target.value })}><option value="self">Eu</option><option value="other">Outro interveniente</option><option value="unknown">Por definir</option></Select>{editingTask.owner === "other" && <input value={editingTask.owner_name} onChange={(event) => setEditingTask({ ...editingTask, owner_name: event.target.value })} placeholder="Nome do responsável"/>}</> : <span className={task.gitlab ? "task-owner-fixed" : undefined} title={task.gitlab ? "Responsável gerido no GitLab" : undefined}>{task.gitlab || task.owner === "self" ? "Eu" : task.owner_name || "Outro interveniente"}</span>}
             {!isEditing && <span>· Criada a {new Date(task.created_at).toLocaleString()} {task.creation_source === "gitlab" ? "no GitLab" : task.creation_source === "system" ? "pelo Sistema" : "por ti"}</span>}
             {task.due_at && <span>· Limite: {new Date(task.due_at).toLocaleString()}</span>}
+            {task.gitlab?.start_date && <span>· Início: {formatCalendarDate(task.gitlab.start_date)}</span>}
+            {task.gitlab?.milestone && <span>· Milestone: {task.gitlab.milestone.title}</span>}
+            {task.gitlab?.error && <span className="warning" role="alert">{task.gitlab.error}</span>}
             {task.reminder_at && <span>· Lembrete: {new Date(task.reminder_at).toLocaleString()}</span>}
             {task.due_is_ambiguous && <span className="warning">Data por confirmar</span>}
           </div>
             {(task.evidence || task.source_segment || task.session) && <ReferenceInfo>{task.evidence && <span className="reference-text">{task.evidence}</span>}{(task.source_segment || task.session) && <button type="button" className="text-button" onClick={() => onOpenSource?.({ kind: "segment", meeting_id: task.source_meeting_id || task.session, segment_id: task.source_segment })}>Ver na reunião{task.source_start_ms != null ? ` · ${formatTranscriptTime(task.source_start_ms)}` : ""}</button>}</ReferenceInfo>}
           {isEditing && <fieldset className="task-edit-fields" disabled={Boolean(busy) || Boolean(task.gitlab && (!task.gitlab.active || task.gitlab.hidden))}>
+            {task.gitlab && <label className="milestone-field">Milestone<Select aria-label="Milestone da tarefa" value={editingTask.milestone_id ?? ""} disabled={milestonesLoading || Boolean(milestonesError)} onChange={(event) => setEditingTask((current) => ({ ...current, milestone_id: event.target.value ? Number(event.target.value) : null }))}>
+              <option value="">{milestonesLoading ? "A consultar milestones…" : milestonesError ? "Erro ao consultar milestones" : "Sem milestone"}</option>
+              {editingTask.milestone_id && !milestones.some((item) => item.id === editingTask.milestone_id) && <option value={editingTask.milestone_id}>{task.gitlab.milestone?.title || `#${editingTask.milestone_id}`}</option>}
+              {milestones.map((item) => <option key={item.id} value={item.id}>{item.title}{item.state === "closed" ? " (fechada)" : ""}</option>)}
+            </Select>
+              {milestonesLoading ? <small role="status">A consultar milestones…</small> : milestonesError ? <small className="field-error" role="alert">{milestonesError}</small> : !milestones.length && <small role="status">O GitLab não devolveu milestones disponíveis para este projeto.</small>}
+              {!milestonesLoading && (milestonesError || !milestones.length) && <button type="button" className="text-button" onClick={() => setMilestonesRetry((value) => value + 1)}>Tentar novamente</button>}
+            </label>}
             <OrganizationFields item={editingTask} allowProject={false} showTags sessions={sessions} projects={projects}
               tags={task.gitlab ? tags.filter((tag) => task.gitlab.available_tag_ids.includes(tag.id) || task.tags?.includes(tag.id)) : tags}
               onSave={(changes) => setEditingTask((current) => ({ ...current, ...changes }))}/>

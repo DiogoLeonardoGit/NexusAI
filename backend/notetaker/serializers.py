@@ -317,6 +317,7 @@ class TaskTimeEntrySerializer(serializers.ModelSerializer):
 
 
 class TaskSerializer(serializers.ModelSerializer):
+    milestone_id = serializers.IntegerField(min_value=1, allow_null=True, required=False, write_only=True)
     # Project is derived from the meeting; the legacy model field is not exposed.
     project = serializers.IntegerField(source="session.project_id", read_only=True, allow_null=True, default=None)
     gitlab = serializers.SerializerMethodField()
@@ -367,7 +368,13 @@ class TaskSerializer(serializers.ModelSerializer):
             link = instance.gitlab
         except GitLabTask.DoesNotExist:
             return None
+        planning = {**link.snapshot, **link.pending}
+        milestone_id = planning.get("milestone_id")
+        milestone = link.snapshot.get("milestone")
+        if milestone_id and (not milestone or milestone.get("id") != milestone_id):
+            milestone = {"id": milestone_id, "title": f"#{milestone_id}"}
         return {"web_url": link.web_url, "issue_iid": link.issue_iid, "project_id": link.project_id,
+                "start_date": planning.get("start_date"), "milestone": milestone if milestone_id else None,
                 "active": link.active, "hidden": link.hidden, "pending": bool(link.pending) or any(
                     entry.sync_state != TaskTimeEntry.SyncState.SENT for entry in instance.time_entries.all()),
                 "conflicts": link.conflicts, "error": link.error,
@@ -375,6 +382,19 @@ class TaskSerializer(serializers.ModelSerializer):
                                                                        available=True).values_list("tag_id", flat=True))}
 
     def validate(self, attrs):
+        if "milestone_id" in attrs:
+            if self.instance is None or not hasattr(self.instance, "gitlab"):
+                raise serializers.ValidationError({"milestone_id": "Só podes associar milestones a tarefas ligadas ao GitLab."})
+            milestone_id = attrs["milestone_id"]
+            if milestone_id is not None:
+                from .services import gitlab
+                link = self.instance.gitlab
+                try:
+                    available = gitlab.GitLabClient(link.connection).milestones(link.project_id)
+                except gitlab.GitLabError as exc:
+                    raise serializers.ValidationError({"milestone_id": str(exc)}) from exc
+                if not any(item["id"] == milestone_id for item in available):
+                    raise serializers.ValidationError({"milestone_id": "Escolhe uma milestone disponível neste projeto GitLab."})
         if "project" in self.initial_data:
             raise serializers.ValidationError({"project": "Associa a tarefa a uma reunião. O projeto é determinado pela reunião."})
         # A single task edit may include planning and an additive time entry.
@@ -413,6 +433,11 @@ class TaskSerializer(serializers.ModelSerializer):
             self._validate_edit_details(validated_data)
             reminder_offset = validated_data.pop("reminder_offset_minutes", None)
             time_entry = validated_data.pop("time_entry", None)
+            # Remote-only metadata is durable in the same pending JSON as other edits.
+            if "milestone_id" in validated_data:
+                link = instance.gitlab
+                link.pending["milestone_id"] = validated_data.pop("milestone_id")
+                link.save(update_fields=["pending"])
             instance = super().update(instance, validated_data)
             if "status" in validated_data:
                 instance.completed_at = (instance.completed_at or timezone.now()) if instance.status == "done" else None

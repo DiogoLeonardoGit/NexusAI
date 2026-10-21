@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 sync_lock = threading.RLock()
 COMPLETION_LABELS = frozenset({"To Do", "On Going", "On Testing / Pending Deploy"})
 UNSENT_TIME_STATES = (TaskTimeEntry.SyncState.PENDING, TaskTimeEntry.SyncState.SENDING, TaskTimeEntry.SyncState.UNCERTAIN)
+LOCAL_START_DATE_NOTICE = "Data de início guardada apenas nesta app: esta tarefa não disponibiliza o campo pela API do GitLab."
 
 
 def connection():
@@ -96,14 +97,42 @@ def state_of(issue):
     values["total_time_spent"] = total if type(total) is int and total >= 0 else 0
     estimate = (issue.get("time_stats") or {}).get("time_estimate", 0)
     values["estimate_seconds"] = estimate if type(estimate) is int and estimate >= 0 else 0
+    values["start_date"] = issue.get("start_date") or None
+    if issue.get("_local_start_date"):
+        values["_local_start_date"] = issue["_local_start_date"]
+    values["due_date"] = issue.get("due_date") or None
+    milestone = issue.get("milestone") or {}
+    values["milestone_id"] = milestone.get("id")
+    values["milestone"] = {"id": milestone["id"], "title": milestone.get("title", "")} if milestone.get("id") else None
+    return values
+
+
+def remote_state(issue, link, client):
+    """Read GraphQL dates when REST omits them; retain unsupported dates locally."""
+    values = state_of(issue)
+    needs_date = "On Going" in values["labels"] or (link and (
+        link.pending.get("start_date") or link.snapshot.get("start_date")))
+    if "start_date" not in issue and needs_date:
+        dates = client.work_item_dates(issue)
+        if dates is not None and (dates["start_date"] is not None or dates["writable"]):
+            values["start_date"] = dates["start_date"]
+        elif link:
+            local_date = link.pending.get("start_date") or link.snapshot.get("_local_start_date")
+            if local_date:
+                values["start_date"] = values["_local_start_date"] = local_date
     return values
 
 
 def local_state(task):
+    """Calendar deadlines stay on Task; remote-only planning uses the existing outbox."""
+    link = getattr(task, "gitlab", None)
+    planning = {**link.snapshot, **link.pending} if link else {}
     return {"title": task.title, "description": task.description,
             "state": "closed" if task.status == Task.Status.DONE else "opened",
             "labels": sorted(task.tags.values_list("name", flat=True)),
-            "estimate_seconds": task.estimate_seconds}
+            "estimate_seconds": task.estimate_seconds,
+            "due_date": timezone.localtime(task.due_at).date().isoformat() if task.due_at else None,
+            "start_date": planning.get("start_date"), "milestone_id": planning.get("milestone_id")}
 
 
 def queue_task(task):
@@ -115,6 +144,9 @@ def queue_task(task):
     if not link.active or link.hidden:
         raise ValidationError({"detail": "Esta tarefa já não está disponível para sincronização."})
     current = local_state(task)
+    # Stamp the local label change now, so offline delivery retains its actual date.
+    if "On Going" in current["labels"] and "On Going" not in link.snapshot.get("labels", []) and not current["start_date"]:
+        current["start_date"] = timezone.localdate().isoformat()
     link.pending = {key: value for key, value in current.items() if value != link.snapshot.get(key, 0 if key == "estimate_seconds" else None)}
     # Editing an already conflicted field updates its local alternative.
     for key in list(link.conflicts):
@@ -127,10 +159,17 @@ def queue_task(task):
 
 def merge_states(baseline, pending, remote, existing_conflicts=None):
     """Merge independent fields and label deltas; report competing scalar edits."""
+    # A date retained locally is desired state, not a confirmed remote baseline.
+    # Queue it again when support returns and retain conflicts with remote dates.
+    if baseline.get("_local_start_date"):
+        pending = {"start_date": baseline["_local_start_date"], **pending}
+        baseline = {**baseline, "start_date": None}
     result, remaining, conflicts = dict(remote), {}, {}
     for key, wanted in pending.items():
         previous = baseline.get(key, 0 if key == "estimate_seconds" else None)
         actual = remote.get(key)
+        if key == "start_date" and remote.get("_local_start_date"):
+            actual = None
         if key == "labels":
             old, local, external = set(previous or []), set(wanted), set(actual or [])
             wanted = sorted((external - (old - local)) | (local - old))
@@ -155,6 +194,16 @@ def apply_state(task, values, label_ids):
     """Apply reconciled remote fields without touching projects or meeting links."""
     task.title, task.description = values["title"], values["description"]
     task.estimate_seconds = values.get("estimate_seconds", 0)
+    # Keep the local clock time when only the remote calendar date changes.
+    if "due_date" in values:
+        date = parse_date(values.get("due_date") or "")
+        local_due = timezone.localtime(task.due_at) if task.due_at else None
+        if date is None:
+            task.due_at = None
+        elif not local_due or local_due.date() != date:
+            from datetime import datetime, time
+            clock = local_due.time() if local_due else time(23, 59)
+            task.due_at = timezone.make_aware(datetime.combine(date, clock))
     done = values["state"] == "closed"
     was_done = task.status == Task.Status.DONE
     task.status = Task.Status.DONE if done else Task.Status.TODO
@@ -238,7 +287,7 @@ def synchronize(*, send_updates=None):
                 for name in issue.get("labels", []):
                     if name not in labels:
                         labels[name] = Tag.objects.get_or_create(name=name)[0].pk
-                remote = state_of(issue)
+                remote = remote_state(issue, link, client)
                 with transaction.atomic():
                     if link is None:
                         task = Task.objects.create(title=issue["title"], owner=Task.Owner.SELF, creation_source=Task.CreationSource.GITLAB)
@@ -252,6 +301,13 @@ def synchronize(*, send_updates=None):
                     seen.add(link.pk)
                     link.active = True
                     if not link.hidden:
+                        # Seed the new baseline without discarding existing app deadlines.
+                        if "due_date" not in link.snapshot:
+                            link.snapshot["due_date"] = remote["due_date"]
+                            if link.task.due_at:
+                                local_due = timezone.localtime(link.task.due_at).date().isoformat()
+                                if local_due != remote["due_date"]:
+                                    link.pending.setdefault("due_date", local_due)
                         merged, link.pending, link.conflicts = merge_states(link.snapshot, link.pending, remote, link.conflicts)
                         for name in merged["labels"]:
                             if name not in labels:
@@ -261,15 +317,14 @@ def synchronize(*, send_updates=None):
                         if closed and merged["state"] == "closed" and "state" not in link.pending:
                             link.task.completed_at = closed
                             link.task.save(update_fields=["completed_at"])
-                        # Only the remote calendar date is imported; reminder times stay local.
-                        date = parse_date(issue.get("due_date") or "")
-                        if date and link.task.due_at is None:
-                            from datetime import datetime, time
-                            link.task.due_at = timezone.make_aware(datetime.combine(date, time(23, 59)))
-                            link.task.save(update_fields=["due_at"])
+                        # Recover history only for pre-existing labels with no start date.
+                        if "On Going" in merged["labels"] and not merged.get("start_date") and "start_date" not in link.pending:
+                            date = client.ongoing_date(link)
+                            if date:
+                                link.pending["start_date"] = date
                     link.snapshot = remote
                     link.remote_updated_at = parse_datetime(issue.get("updated_at") or "")
-                    link.error = ""
+                    link.error = LOCAL_START_DATE_NOTICE if remote.get("_local_start_date") else ""
                     link.web_url = issue["web_url"]
                     link.save()
                 has_time = link.task.time_entries.filter(sync_state__in=UNSENT_TIME_STATES).exists() if send_updates else False
@@ -328,29 +383,36 @@ def push_pending(link, config, client, labels):
         link.active = False
         link.save(update_fields=["active"])
         return
-    remote = state_of(latest)
+    remote = remote_state(latest, link, client)
     merged, pending, conflicts = merge_states(link.snapshot, link.pending, remote, link.conflicts)
     for name in merged["labels"]:
         if name not in labels:
             labels[name] = Tag.objects.get_or_create(name=name)[0].pk
     with transaction.atomic():
         link.snapshot, link.pending, link.conflicts = remote, pending, conflicts
+        link.error = LOCAL_START_DATE_NOTICE if remote.get("_local_start_date") else ""
         apply_state(link.task, merged, labels)
         link.save()
     if not pending or conflicts or not check_enabled(config):
         return
     updated = client.update_task(link, pending)
     if updated:
+        confirmed = remote_state(updated, link, client)
+        for key in ("start_date", "due_date", "milestone_id"):
+            if key in pending and confirmed.get(key) != pending[key]:
+                raise gitlab.GitLabError("O GitLab não confirmou o campo de planeamento: " + key)
         with transaction.atomic():
-            link.snapshot, link.pending = state_of(updated), {}
+            link.snapshot = confirmed
+            # Never acknowledge a local-only date as delivered to GitLab.
+            link.pending = {"start_date": pending["start_date"]} if confirmed.get("_local_start_date") and "start_date" in pending else {}
             link.remote_updated_at = parse_datetime(updated.get("updated_at") or "")
             for name in link.snapshot["labels"]:
                 if name not in labels:
                     labels[name] = Tag.objects.get_or_create(name=name)[0].pk
             apply_state(link.task, link.snapshot, labels)
-            link.error = ""
+            link.error = LOCAL_START_DATE_NOTICE if confirmed.get("_local_start_date") else ""
             link.save()
-        return True
+        return not confirmed.get("_local_start_date") or any(key != "start_date" for key in pending)
     return False
 
 
