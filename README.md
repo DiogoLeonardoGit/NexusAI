@@ -1,4 +1,14 @@
-# My AI Notetaker
+# Nexus AI
+
+Na interface, na janela e na bandeja, a aplicação apresenta-se como **Nexus**;
+o instalador usa **Nexus AI**. O símbolo e a paleta vêm da pasta `media/`.
+Para regenerar os ícones Windows a partir do símbolo fornecido, executa
+`powershell -File scripts/generate_icon.ps1` antes de empacotar.
+
+A barra de perguntas à IA mantém a resposta visível até clicares em
+**Fechar resposta**, mesmo ao abrir uma fonte ou mudar de página. Abrir uma tarefa
+citada desloca a página uma única vez; as atualizações automáticas permitem
+continuar a fazer scroll livremente. Uma nova pergunta substitui a resposta anterior.
 
 Assistente pessoal desktop para Windows. Captura microfone e áudio do sistema, transcreve português e inglês com Faster Whisper e usa um modelo local através do LM Studio (por defeito, `qwen2.5-14b-instruct`) ou do Ollama para criar resumos, tarefas e lembretes.
 
@@ -167,6 +177,11 @@ Tarefas que deixem de estar atribuídas a ti são retiradas das vistas ativas e 
 alterações. Os registos locais são preservados. `Ocultar nesta app` conserva a identidade
 externa e evita reimportação; não elimina nem fecha tarefas no GitLab.
 
+Para consultar as tarefas ocultas, abre **Definições → GitLab → Ocultas**.
+O botão **Voltar a mostrar** repõe a visibilidade local e atualiza a lista e os
+contadores, sem enviar alterações ao GitLab. Se a tarefa estiver sem atribuição ou
+acesso, só regressa às listas normais quando essa situação for resolvida.
+
 As tarefas importadas mostram o ícone GitLab, que abre a origem no browser. As locais
 continuam locais. As tarefas podem ser associadas a reuniões locais e herdam o projeto
 dessas reuniões; esta organização é independente do projeto GitLab.
@@ -234,6 +249,13 @@ continuam pendentes. Definições mostra última sincronização, pendentes, con
 Datas e horas de lembretes permanecem locais; a data limite remota é usada inicialmente
 quando não existe data local. Não são sincronizados comentários, participantes ou reuniões.
 
+A **data de início (`start_date`) é exclusivamente local**: não é consultada nem enviada
+ao GitLab. Ao passar uma tarefa para `On Going`, a app continua a guardar a data local.
+Datas de início anteriormente pendentes são preservadas na app e deixam de contar como
+alterações por enviar durante a sincronização normal. A data local não acompanha futuras
+alterações desse campo no GitLab. Títulos, descrições, etiquetas, estado, prazo, milestones,
+estimativas e tempo gasto mantêm a sincronização existente. Esta mudança não exige migrations.
+
 A migration `0011_label_views_gitlab` converte prioridades e separadores antes de remover
 os campos antigos, acrescenta as tabelas da integração e mantém projetos/reuniões/notas.
 Foi aplicada à base local com uma cópia SQLite consistente em `data/backups/`.
@@ -244,8 +266,13 @@ Os testes de sincronismo simulam o GitLab e não fazem pedidos à instância rea
 ## Notas e organização
 
 A aba **Notas** reúne as notas existentes de reuniões e as notas pessoais sem reunião.
-Permite criar e editar título/conteúdo, associar reunião, projeto e etiquetas, pesquisar,
-filtrar por origem/projeto/etiqueta e abrir a reunião de origem. Não duplica as notas.
+Permite criar e editar título/conteúdo, associar reunião e projeto, pesquisar,
+filtrar por origem/projeto e abrir a reunião de origem. Não duplica as notas.
+As notas não usam etiquetas na interface; associações antigas ficam preservadas na base.
+Arrasta a pega ⠿ de uma nota para a posição pretendida, ou usa as setas para cima/baixo
+com a pega focada. A ordem fica guardada nesta instalação, incluindo após reiniciar,
+e mantém-se nas atualizações. Com filtros, só são reorganizadas as posições das notas
+visíveis. Novas notas aparecem depois das que já têm posição guardada.
 O fluxo de organização das tarefas é **Projeto → Reuniões → Tarefas**. Uma tarefa só
 pode ser associada a uma reunião, que determina o seu projeto. Os cartões e contagens
 na aba **Projetos**, os filtros e a pesquisa seguem essa relação. Nas reuniões do projeto,
@@ -278,3 +305,37 @@ desse projeto no menu **Organizar → Reunião e etiquetas** da tarefa.
 Em **Projetos > Gerir etiquetas**, **Eliminar** pede confirmação antes de remover uma
 etiqueta local, as suas associações e a vista de tarefas correspondente. As tarefas,
 reuniões e notas são preservadas. Etiquetas importadas permanecem geridas no GitLab.
+
+## Início automático de reuniões Teams/Webex
+
+A deteção automática está ativa por defeito e pode ser desligada em **Definições →
+Iniciar reunião ao entrar no Teams ou Webex**. A preferência é aplicada imediatamente
+e fica guardada nesta instalação. Requer o Nexus em execução, podendo estar
+minimizado ou na bandeja. Não deteta reuniões no navegador.
+
+Um processo PowerShell oculto usa o UI Automation do Windows para procurar os controlos
+de terminar/sair e de áudio nas aplicações instaladas do Teams/Webex. Não clica
+nesses controlos. São necessárias duas observações consecutivas, a intervalos de
+quatro segundos, antes do início. A deteção pode variar com a versão, idioma
+(controlos PT/EN) e disponibilidade da interface de acessibilidade dos clientes.
+Abrir a aplicação ou ficar no ecrã de pré-entrada não deve iniciar uma reunião.
+
+Ao detetar uma chamada, reutiliza a captura de microfone e áudio do sistema,
+pausa a escuta ativa e apresenta uma notificação. Só pode existir uma captura
+de reunião de cada vez. **Terminar reunião** continua a ser manual; sair do Teams
+ou Webex não termina a captura. Uma paragem manual ou falha de início não volta
+a tentar automaticamente na mesma chamada. Após três observações sem chamada,
+a deteção fica pronta para uma nova entrada. Para voltar a gravar a chamada atual,
+usa **Iniciar reunião**. Falhas de deteção ou permissões são apresentadas na aplicação.
+
+Se existir uma gravação ativa e uma chamada tiver sido detetada durante essa gravação,
+o fim da chamada gera um aviso na aplicação e uma notificação do Windows:
+**A chamada terminou. A gravação continua ativa — termina-a quando quiseres.**
+O aviso só aparece após três verificações consecutivas sem chamadas detetadas e
+uma única vez por gravação, mesmo que a chamada reapareça. Se Teams e Webex estiverem
+em chamada simultaneamente, aguarda que ambas terminem. Clicar na notificação abre
+o Nexus; a gravação continua até carregares em **Terminar reunião**.
+Falhas do detetor, desativar a deteção ou parar manualmente a gravação não geram
+este aviso. Ao reativar a deteção, é necessário observar uma chamada novamente.
+
+A ordenação das notas e a deteção não exigem dependências novas nem migrations.

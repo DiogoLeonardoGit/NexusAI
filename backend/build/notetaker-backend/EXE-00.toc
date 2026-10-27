@@ -71,7 +71,7 @@
  [],
  False,
  False,
- 1790689081,
+ 1793113481,
  [('runw.exe',
    'C:\\Dev\\MyNotetaker\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe',
    'EXECUTABLE')],

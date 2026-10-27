@@ -1,9 +1,11 @@
 """GitLab REST/GraphQL client with persistent opt-in and per-client write permission."""
 
 import json
+import logging
 import os
 import re
 import threading
+from logging.handlers import RotatingFileHandler
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -16,6 +18,58 @@ PROJECT_PATH = "serviceunit/django-apps/twinportal"
 WRITE_SETTING = "gitlab_write_enabled"
 _token = os.getenv("NOTETAKER_GITLAB_TOKEN", "")
 _credential_lock = threading.Lock()
+
+
+def _diagnose_graphql(operation, result, status):
+    """Record allowlisted response structure, never variables, text or credentials.
+
+    Temporary diagnostics are enabled by the desktop launcher. Each backend
+    process has its own bounded log to avoid competing rotations.
+    """
+    if os.getenv("NOTETAKER_DIAGNOSTICS") != "1":
+        return
+    try:
+        from django.conf import settings
+        destination = settings.DATA_DIR / "diagnostics"
+        destination.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger("notetaker.graphql.diagnostics")
+        if not logger.handlers:
+            handler = RotatingFileHandler(
+                destination / f"gitlab-graphql-{os.getpid()}.jsonl",
+                maxBytes=1024 * 1024, backupCount=1, encoding="utf-8",
+            )
+            handler.setFormatter(logging.Formatter('%(message)s'))
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+        envelope = result if isinstance(result, dict) else {}
+        data = envelope.get("data")
+        project = data.get("project") if isinstance(data, dict) else None
+        errors = envelope.get("errors")
+        known_codes = {"undefinedField", "undefinedType", "variableRequiresValidType", "ACCESS_DENIED", "FORBIDDEN"}
+        codes = []
+        if isinstance(errors, list):
+            for error in errors:
+                extensions = error.get("extensions") if isinstance(error, dict) else None
+                code = extensions.get("code") if isinstance(extensions, dict) else None
+                codes.append(code if isinstance(code, str) and code in known_codes else "other_or_missing")
+        # Deliberately do not persist server error messages: they can echo input.
+        from datetime import datetime, timezone
+        logger.info(json.dumps({
+            "time": datetime.now(timezone.utc).isoformat(),
+            "operation": operation, "http_status": status,
+            "response_is_object": isinstance(result, dict),
+            "data_is_object": isinstance(data, dict),
+            "data_fields_present": [key for key in ("currentUser", "project", "__schema")
+                                    if isinstance(data, dict) and key in data],
+            "authenticated": bool(data.get("currentUser")) if isinstance(data, dict) and "currentUser" in data else None,
+            "project_is_object": isinstance(project, dict),
+            "work_item_is_object": isinstance(project.get("workItem"), dict) if isinstance(project, dict) else False,
+            "error_count": len(errors) if isinstance(errors, list) else 0,
+            "error_codes": codes,
+        }))
+    except (OSError, ValueError):
+        logging.getLogger(__name__).warning("Could not write GraphQL diagnostics.")
 
 
 def writes_enabled():
@@ -101,7 +155,11 @@ class GitLabClient:
         })
         try:
             with self.opener.open(request, timeout=20) as response:
-                return json.load(response), response.headers.get("X-Next-Page", "")
+                result = json.load(response)
+                if graphql_read:
+                    operation = re.search(r"\bquery\s+(TaskDateAccess|TaskDateSchema|TaskDates)\b", data["query"])
+                    _diagnose_graphql(operation[1] if operation else "other_query", result, response.status)
+                return result, response.headers.get("X-Next-Page", "")
         except HTTPError as exc:
             if method == "POST" and path.endswith("/notes") and exc.code >= 500:
                 raise GitLabCommentUncertain("Envio do comentário sem confirmação. Verifica o GitLab antes de tentar novamente.") from exc
@@ -148,14 +206,6 @@ class GitLabClient:
         # Use only the current parameter; its deprecated alias must not be sent alongside it.
         return list(self.pages(f"/projects/{project_id}/milestones", include_ancestors="true"))
 
-    def supports_start_date(self):
-        """REST issue start dates require GitLab 19.1 or later."""
-        if not hasattr(self, "_start_date_supported"):
-            version = self.get("/version").get("version", "")
-            match = re.match(r"^(\d+)\.(\d+)", version)
-            self._start_date_supported = bool(match and tuple(map(int, match.groups())) >= (19, 1))
-        return self._start_date_supported
-
     def ongoing_date(self, link):
         """Recover the latest On Going addition from the issue's label history."""
         from django.utils import timezone
@@ -167,87 +217,6 @@ class GitLabClient:
                 if date:
                     dates.append(date)
         return timezone.localtime(max(dates)).date().isoformat() if dates else None
-
-    def work_item_dates(self, issue):
-        """Read older servers' date widget; distinguish absent support from failures."""
-        if getattr(self, "_graphql_dates_unsupported", False):
-            return None
-        if not hasattr(self, "_graphql_project_path"):
-            # Resolve the canonical path and prove GraphQL access before treating
-            # schema/widget availability as a limitation of the start-date field.
-            rest_project = self.project()
-            path = rest_project.get("path_with_namespace") if isinstance(rest_project, dict) else None
-            if not isinstance(path, str) or not path:
-                raise GitLabError("O GitLab não devolveu o caminho oficial do projeto.")
-            access = self.request("/graphql", "POST", {
-                "query": """query TaskDateAccess($path: ID!) {
-                  currentUser { username }
-                  project(fullPath: $path) { id }
-                }""",
-                "variables": {"path": path},
-            }, graphql=True)[0]
-            if access.get("errors"):
-                raise GitLabError("Não foi possível verificar o acesso ao projeto por GraphQL.")
-            access_data = access.get("data") or {}
-            if not access_data.get("currentUser"):
-                raise GitLabError("O token não autenticou o utilizador na API GraphQL do GitLab. Verifica as permissões do token.")
-            if not access_data.get("project"):
-                raise GitLabError("O projeto está acessível por REST, mas não por GraphQL. Não foi possível sincronizar a data de início.")
-            self._graphql_project_path = path
-        result = self.request("/graphql", "POST", {
-            "query": """query TaskDates($path: ID!, $iid: String!) {
-              updateInput: __type(name: "WorkItemUpdateInput") { inputFields { name } }
-              dateInput: __type(name: "WorkItemWidgetStartAndDueDateUpdateInput") { inputFields { name } }
-              project(fullPath: $path) { workItem(iid: $iid) { id widgets {
-                ... on WorkItemWidgetStartAndDueDate { startDate }
-              } } }
-            }""",
-            "variables": {"path": self._graphql_project_path, "iid": str(issue["iid"])},
-        }, graphql=True)[0]
-        errors = result.get("errors") or []
-        # Validation failures mean this schema lacks the work-item API/widget.
-        unsupported = {"undefinedField", "undefinedType", "variableRequiresValidType"}
-        if errors and all((error.get("extensions") or {}).get("code") in unsupported for error in errors):
-            self._graphql_dates_unsupported = True
-            return None
-        if errors:
-            raise GitLabError("Não foi possível consultar a data de início por GraphQL.")
-        data = result.get("data") or {}
-        update_fields = {field["name"] for field in (data.get("updateInput") or {}).get("inputFields", [])}
-        date_fields = {field["name"] for field in (data.get("dateInput") or {}).get("inputFields", [])}
-        writable = "startAndDueDateWidget" in update_fields and "startDate" in date_fields
-        project = data.get("project")
-        if not project:
-            raise GitLabError("O projeto deixou de estar acessível por GraphQL ao consultar a data de início.")
-        item = project.get("workItem")
-        if not item:
-            # Some older instances expose work items only for selected issue types.
-            return None
-        for widget in item.get("widgets", []):
-            if "startDate" in widget:
-                return {"id": item["id"], "start_date": widget["startDate"], "writable": writable}
-        return None
-
-    def update_start_date(self, link, date):
-        """Confirm a GraphQL date write, or explicitly preserve it only locally."""
-        dates = self.work_item_dates({"iid": link.issue_iid})
-        if dates is None or not dates["writable"]:
-            return False
-        result = self.request("/graphql", "POST", {
-            "query": """mutation TaskStartDate($input: WorkItemUpdateInput!) {
-              workItemUpdate(input: $input) { errors workItem { widgets {
-                ... on WorkItemWidgetStartAndDueDate { startDate }
-              } } }
-            }""",
-            "variables": {"input": {"id": dates["id"], "startAndDueDateWidget": {"startDate": date}}},
-        }, graphql=True)[0]
-        payload = (result.get("data") or {}).get("workItemUpdate") or {}
-        if result.get("errors") or payload.get("errors"):
-            raise GitLabError("O GitLab não permitiu atualizar a data de início por GraphQL.")
-        widgets = (payload.get("workItem") or {}).get("widgets", [])
-        if not any("startDate" in widget and widget["startDate"] == date for widget in widgets):
-            raise GitLabError("O GitLab não confirmou a data de início por GraphQL.")
-        return True
 
     def add_comment(self, link, body):
         """Post one comment on explicit submission; never retry additive requests."""
@@ -270,12 +239,8 @@ class GitLabClient:
         })[0]
 
     def update_task(self, link, changes):
-        """Send only field deltas; never replace unrelated remote labels."""
+        """Send supported REST deltas; start dates remain exclusively local."""
         estimate_updated = False
-        graphql_date = "start_date" in changes and not self.supports_start_date()
-        local_date = False
-        if graphql_date:
-            local_date = not self.update_start_date(link, changes["start_date"])
         if "estimate_seconds" in changes:
             # An absolute estimate can be retried without incrementing spent time.
             estimate = changes["estimate_seconds"]
@@ -288,9 +253,6 @@ class GitLabClient:
         payload = {key: value for key, value in changes.items() if key in {"title", "description", "due_date"}}
         if "milestone_id" in changes:
             payload["milestone_id"] = changes["milestone_id"] or 0
-        if "start_date" in changes:
-            if not graphql_date:
-                payload["start_date"] = changes["start_date"]
         if "state" in changes:
             payload["state_event"] = "close" if changes["state"] == "closed" else "reopen"
         if "labels" in changes:
@@ -304,12 +266,8 @@ class GitLabClient:
                 payload["remove_labels"] = ",".join(removed)
         if payload:
             issue = self.request(f"/projects/{link.project_id}/issues/{link.issue_iid}", "PUT", payload)[0]
-        elif estimate_updated or graphql_date:
+        elif estimate_updated:
             issue = self.get(f"/projects/{link.project_id}/issues/{link.issue_iid}")
         else:
             return None
-        if graphql_date:
-            issue["start_date"] = changes["start_date"]
-            if local_date:
-                issue["_local_start_date"] = changes["start_date"]
         return issue

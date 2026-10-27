@@ -1,5 +1,5 @@
 {
-  "name": "my-notetaker",
+  "name": "nexus-ai",
   "version": "0.1.0",
   "description": "Assistente pessoal offline para reuniões, notas, tarefas e lembretes.",
   "author": "Diogo Leonardo",
@@ -27,10 +27,11 @@
     "wait-on": "9.1.0"
   },
   "build": {
-    "appId": "local.mynotetaker.app",
-    "productName": "My AI Notetaker",
+    "appId": "local.nexusai.app",
+    "productName": "Nexus AI",
     "files": ["dist/**/*", "electron/**/*", "build/icon.ico", "package.json"],
     "extraResources": [
+      {"from": "build", "to": "icons", "filter": ["icon.ico", "icon.png"]},
       {"from": "../backend/dist/notetaker-backend", "to": "backend"},
       {"from": "../backend/template/notetaker.sqlite3", "to": "backend-template/notetaker.sqlite3"},
       {"from": "../models/faster-whisper-medium", "to": "models/faster-whisper-medium"},

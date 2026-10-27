@@ -6,6 +6,9 @@ import MultiSelect from "./MultiSelect";
 import Popup, { useOutsideDismiss } from "./Popup";
 import GitLabSettings, { GitLabIcon, LocalToGitLabIcon } from "./GitLabSettings";
 import Notes from "./Notes";
+import AIQuestionBar from "./AIQuestionBar";
+import nexusSymbol from "./assets/nexus-symbol.png";
+import AISetupGuide, { useAIAvailability } from "./AISetupGuide";
 import { moveTaskLabels, tasksForLabelView } from "./taskLabels";
 import { startActiveListening, startCapture } from "./capture";
 
@@ -332,6 +335,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const [unassignedCollapsed, setUnassignedCollapsed] = useState(false), [dropTarget, setDropTarget] = useState(null);
   const [sectionOrder, setSectionOrder] = useState(readTaskSectionOrder);
   const draggedTask = useRef(null);
+  const scrolledTarget = useRef(null);
   const boardDragEnded = useRef(0);
   const [expandedCards, setExpandedCards] = useState([]);
   const [filter, setFilter] = useState(initialFilter), [editingTask, setEditingTask] = useState(null);
@@ -529,9 +533,16 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   };
   // Targets override filters and folded groups so notification navigation is visible.
   useEffect(() => { if (targetId) { setFilter("all"); setTaskSearch(""); } }, [targetId, targetKey]);
+  // A source click scrolls once after the target is visible; polling must not pull the user back.
+  useEffect(() => { scrolledTarget.current = null; }, [targetId, targetKey]);
   useEffect(() => {
-    if (!targetId) return;
-    const frame = requestAnimationFrame(() => document.querySelector(`[data-task-id="${targetId}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }));
+    if (!targetId || filter !== "all" || taskSearch || scrolledTarget.current) return;
+    const frame = requestAnimationFrame(() => {
+      const card = document.querySelector(`[data-task-id="${targetId}"]`);
+      if (!card) return;
+      card.scrollIntoView({ behavior: "smooth", block: "center" });
+      scrolledTarget.current = { id: targetId, key: targetKey };
+    });
     return () => cancelAnimationFrame(frame);
   }, [targetId, targetKey, tasks, filter, taskSearch]);
   const renderTask = (task, column = null, boardDetail = false) => {
@@ -906,13 +917,12 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
   return <div className="card-list">{sessions.map((session) => <button className="card meeting-card" onClick={() => { setMeetingPanel("Resumo"); open(session.id); }} key={session.id}><div><h3>{session.title || "Reunião sem título"}</h3><p>{new Date(session.started_at).toLocaleString()} · {session.status} · {session.language?.toUpperCase() || "A detetar idioma"}</p></div><ProcessingBadge processing={session.processing}/></button>)}</div>;
 }
 
-function Settings({ microphoneId, setMicrophoneId, keepDisplayAwake, setKeepDisplayAwake, onError }) {
-  const [devices, setDevices] = useState([]), [launchAtLogin, setLaunchAtLogin] = useState(false), [retentionDays, setRetentionDays] = useState(7), [maxGb, setMaxGb] = useState(5), [logHours, setLogHours] = useState(24), [defaultLanguage, setDefaultLanguage] = useState("pt"), [glossary, setGlossary] = useState(""), [aiModel, setAiModel] = useState(""), [aiProvider, setAiProvider] = useState(""), [aiAvailable, setAiAvailable] = useState(false), [busy, setBusy] = useState(false);
+function Settings({ ai, onOpenAISetup, microphoneId, setMicrophoneId, keepDisplayAwake, setKeepDisplayAwake, autoMeetingEnabled, setAutoMeetingEnabled, onError }) {
+  const [devices, setDevices] = useState([]), [launchAtLogin, setLaunchAtLogin] = useState(false), [retentionDays, setRetentionDays] = useState(7), [maxGb, setMaxGb] = useState(5), [logHours, setLogHours] = useState(24), [defaultLanguage, setDefaultLanguage] = useState("pt"), [glossary, setGlossary] = useState(""), [busy, setBusy] = useState(false);
   useEffect(() => {
     navigator.mediaDevices?.enumerateDevices().then((items) => setDevices(items.filter((item) => item.kind === "audioinput"))).catch(console.error);
     window.notetaker?.getLaunchAtLogin().then(setLaunchAtLogin).catch(console.error);
     api("/settings/").then((items) => { const values = Object.fromEntries(items.map((item) => [item.key, item.value])); if (values.audio_retention_days) setRetentionDays(values.audio_retention_days); if (values.audio_max_bytes) setMaxGb(Math.max(1, Math.round(values.audio_max_bytes / 1024 ** 3))); if (values.active_log_window_hours) setLogHours(values.active_log_window_hours); if (["pt", "en"].includes(values.default_language)) setDefaultLanguage(values.default_language); if (typeof values.transcription_glossary === "string") setGlossary(values.transcription_glossary); }).catch((error) => onError(error.message));
-    api("/health/").then((health) => { setAiModel(health.model || "Não configurado"); setAiProvider(health.provider === "lmstudio" ? "LM Studio" : health.provider === "ollama" ? "Ollama" : ""); setAiAvailable(Boolean(health.ai_available ?? health.ollama)); }).catch((error) => onError(error.message));
   }, [onError]);
   const save = async () => {
     setBusy(true);
@@ -921,26 +931,51 @@ function Settings({ microphoneId, setMicrophoneId, keepDisplayAwake, setKeepDisp
       default_language: defaultLanguage, transcription_glossary: glossary,
     } }) }); } catch (error) { onError(error.message); } finally { setBusy(false); }
   };
-  return <article className="settings-grid card"><div><label>Modelo para resumos, tarefas e perguntas à IA</label><strong>{aiProvider ? `${aiProvider} · ` : ""}{aiModel || "A carregar…"} · {aiAvailable ? "Disponível" : "Indisponível"}</strong></div><div><label>Modelo de transcrição</label><strong>Faster Whisper Medium · PT/EN</strong></div><div><label>Microfone</label><Select value={microphoneId} onChange={(event) => setMicrophoneId(event.target.value)}><option value="">Predefinido do Windows</option>{devices.map((device) => <option value={device.deviceId} key={device.deviceId}>{device.label || "Microfone"}</option>)}</Select></div><div><label>Idioma para reuniões curtas</label><Select value={defaultLanguage} onChange={(event) => setDefaultLanguage(event.target.value)}><option value="pt">Português</option><option value="en">English</option></Select></div><div className="settings-limits wide"><label>Retenção máxima (dias)<input type="number" min="1" max="7" value={retentionDays} onChange={(event) => setRetentionDays(event.target.value)}/></label><label>Limite de áudio (GB)<input type="number" min="1" value={maxGb} onChange={(event) => setMaxGb(event.target.value)}/></label><label>Janela dos logs (horas)<input type="number" min="1" value={logHours} onChange={(event) => setLogHours(event.target.value)}/></label></div><div className="wide"><label>Glossário de nomes, empresas e siglas</label><textarea value={glossary} onChange={(event) => setGlossary(event.target.value)} placeholder="Warpcom, SecureNet, onboarding, Oracle…"/></div><label className="toggle"><input type="checkbox" checked={launchAtLogin} onChange={(event) => setLaunchAtLogin(event.target.checked)}/> Iniciar com o Windows</label><label className="toggle">
+  return <article className="settings-grid card"><div><div className="ai-model-heading"><span>Modelo para resumos, tarefas e perguntas à IA</span><div className="ai-model-actions"><button type="button" aria-label="Guia de instalação e configuração da IA" title="Guia de instalação e configuração da IA" onClick={onOpenAISetup}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><circle cx="12" cy="7.5" r=".7" fill="currentColor" stroke="none"/></svg></button><button type="button" aria-label={ai.checking ? "A verificar o modelo de IA" : "Verificar novamente o modelo de IA"} title={ai.checking ? "A verificar…" : "Verificar novamente"} disabled={ai.checking} aria-busy={ai.checking} onClick={() => ai.check()}><svg className={ai.checking ? "ai-retry-spinning" : undefined} aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></svg></button></div></div><strong>{ai.health ? `${ai.health.provider === "lmstudio" ? "LM Studio" : ai.health.provider === "ollama" ? "Ollama" : ai.health.provider} · ${ai.health.model || "Não configurado"} · ${ai.health.ai_available ? "Disponível" : "Indisponível"}` : ai.error ? "Não foi possível verificar o modelo" : "A verificar o modelo…"}</strong>{ai.error && <small role="status">{ai.error}</small>}</div><div><label>Modelo de transcrição</label><strong>Faster Whisper Medium · PT/EN</strong></div><div><label>Microfone</label><Select value={microphoneId} onChange={(event) => setMicrophoneId(event.target.value)}><option value="">Predefinido do Windows</option>{devices.map((device) => <option value={device.deviceId} key={device.deviceId}>{device.label || "Microfone"}</option>)}</Select></div><div><label>Idioma para reuniões curtas</label><Select value={defaultLanguage} onChange={(event) => setDefaultLanguage(event.target.value)}><option value="pt">Português</option><option value="en">English</option></Select></div><div className="settings-limits wide"><label>Retenção máxima (dias)<input type="number" min="1" max="7" value={retentionDays} onChange={(event) => setRetentionDays(event.target.value)}/></label><label>Limite de áudio (GB)<input type="number" min="1" value={maxGb} onChange={(event) => setMaxGb(event.target.value)}/></label><label>Janela dos logs (horas)<input type="number" min="1" value={logHours} onChange={(event) => setLogHours(event.target.value)}/></label></div><div className="wide"><label>Glossário de nomes, empresas e siglas</label><textarea value={glossary} onChange={(event) => setGlossary(event.target.value)} placeholder="Warpcom, SecureNet, onboarding, Oracle…"/></div><label className="toggle"><input type="checkbox" checked={launchAtLogin} onChange={(event) => setLaunchAtLogin(event.target.checked)}/> Iniciar com o Windows</label><label className="toggle">
   <input type="checkbox" checked={keepDisplayAwake}
     onChange={(event) => setKeepDisplayAwake(event.target.checked)}/>
   Manter o ecrã ativo
-</label><button className="save" onClick={save} disabled={busy}>{busy && <Spinner/>}Guardar definições</button></article>;
+</label><label className="toggle"><input type="checkbox" checked={autoMeetingEnabled} onChange={(event) => setAutoMeetingEnabled(event.target.checked)}/> Iniciar reunião ao entrar no Teams ou Webex</label><small>Deteção nas aplicações do Windows. Termina a captura pelo botão Terminar reunião.</small><button className="save" onClick={save} disabled={busy}>{busy && <Spinner/>}Guardar definições</button></article>;
 }
 
 export default function App() {
+  const aiQuestionPanel = useRef(null);
+  const ai = useAIAvailability();
+  const [aiSetupOpen, setAISetupOpen] = useState(false);
+  const aiStartupChecked = useRef(false);
+  // Show the automatic notice once per launch, only after a valid health response.
+  useEffect(() => {
+    if (!ai.health || aiStartupChecked.current) return;
+    aiStartupChecked.current = true;
+    if (!ai.health.ai_available) setAISetupOpen(true);
+  }, [ai.health]);
   const [view, setView] = useState("Hoje"), [tasks, setTasks] = useState([]), [taskSections, setTaskSections] = useState([]), [sessions, setSessions] = useState([]), [summaries, setSummaries] = useState([]), [logs, setLogs] = useState([]), [meetingCapture, setMeetingCapture] = useState(null), [activeListening, setActiveListening] = useState(null), [activeEnabled, setActiveEnabled] = useState(() => localStorage.getItem("activeListeningEnabled") !== "false"), [error, setError] = useState(""), [query, setQuery] = useState(""), [results, setResults] = useState(null), [chatAnswer, setChatAnswer] = useState(null), [notice, setNotice] = useState(""), [asking, setAsking] = useState(false), [dailyJob, setDailyJob] = useState(null), [dailyDate, setDailyDate] = useState(localDateValue), [captureBusy, setCaptureBusy] = useState(false), [microphoneId, setMicrophoneId] = useState(() => localStorage.getItem("microphoneDeviceId") || ""), [meetingTarget, setMeetingTarget] = useState(null), [meetingsKey, setMeetingsKey] = useState(0);
   const [projects, setProjects] = useState([]), [tags, setTags] = useState([]), [notes, setNotes] = useState([]), [participants, setParticipants] = useState([]);
   const [gitlabStatus, setGitlabStatus] = useState(null), [gitlabBusy, setGitlabBusy] = useState(false);
   const [projectFilter, setProjectFilter] = useState(""), [tagFilter, setTagFilter] = useState(""), [participantFilter, setParticipantFilter] = useState(""), [dateFrom, setDateFrom] = useState(""), [dateTo, setDateTo] = useState("");
   const [taskTarget, setTaskTarget] = useState(null), [contentDetail, setContentDetail] = useState(null);
   const [taskCreateOpen, setTaskCreateOpen] = useState(false);
+  const [autoMeetingEnabled, setAutoMeetingEnabled] = useState(() => localStorage.getItem("autoMeetingEnabled") !== "false");
+  const [detectedMeetings, setDetectedMeetings] = useState({ calls: [], error: "" });
+  const consumedMeetings = useRef(new Set()), captureTransition = useRef(false);
+  const meetingEndNotice = useRef(null);
+  const trayCommandHandler = useRef(null), trayState = useRef(null);
   const [keepDisplayAwake, setKeepDisplayAwake] = useState(
     () => localStorage.getItem("keepDisplayAwake") === "true"
   ); 
   const activeController = useRef(null), activeStarting = useRef(false), meetingStarting = useRef(false), activeRequested = useRef(activeEnabled);
   const answerRequest = useRef(0);
   const notificationState = useRef({ initialized: false, taskIds: new Set(), summaryIds: new Set() });
+  useEffect(() => {
+    let cancelled = false;
+    const receive = (state) => { if (!cancelled) setDetectedMeetings(state); };
+    const unsubscribe = window.notetaker?.onMeetingDetection?.(receive);
+    try { localStorage.setItem("autoMeetingEnabled", String(autoMeetingEnabled)); }
+    catch (error) { setError(`Não foi possível guardar a preferência de deteção: ${error.message}`); }
+    window.notetaker?.setMeetingDetection?.(autoMeetingEnabled).then(receive).catch((error) => { if (!cancelled) setError(error.message); });
+    return () => { cancelled = true; unsubscribe?.(); };
+  }, [autoMeetingEnabled]);
+  useEffect(() => { if (detectedMeetings.error) setError(detectedMeetings.error); }, [detectedMeetings.error]);
   useEffect(() => {
     localStorage.setItem("keepDisplayAwake", String(keepDisplayAwake));
     window.notetaker?.setDisplayAwake(keepDisplayAwake);
@@ -980,7 +1015,36 @@ export default function App() {
   }, []);  useEffect(() => { refresh(); }, [refresh]);
   useEffect(() => { const timer = setInterval(refresh, 5000); return () => clearInterval(timer); }, [refresh]);
   useEffect(() => { if (!notice) return undefined; const timer = setTimeout(() => setNotice(""), 30_000); return () => clearTimeout(timer); }, [notice]);
-  useEffect(() => { if (!dailyJob) return undefined; const check = async () => { try { const job = await api(`/jobs/${dailyJob.id}/`); if (job.status === "complete") { setDailyJob(null); setNotice(`Resumo de ${formatCalendarDate(dailyJob.date)} concluído.`); refresh(); } if (job.status === "failed") { setDailyJob(null); setError(job.error || "Não foi possível gerar o resumo diário."); } } catch (nextError) { setDailyJob(null); setError(nextError.message); } }; check(); const timer = setInterval(check, 2000); return () => clearInterval(timer); }, [dailyJob, refresh]);
+  // End only this job's processing notice, preserving newer unrelated notices.
+  useEffect(() => {
+    if (!dailyJob) return undefined;
+    let cancelled = false;
+    const clearProcessingNotice = () => setNotice((current) =>
+      current === `A processar as reuniões e tarefas de ${formatCalendarDate(dailyJob.date)} localmente.` ? "" : current);
+    const check = async () => {
+      try {
+        const job = await api(`/jobs/${dailyJob.id}/`);
+        if (cancelled) return;
+        if (job.status === "complete") {
+          setDailyJob(null);
+          setNotice(`Resumo de ${formatCalendarDate(dailyJob.date)} concluído.`);
+          refresh();
+        } else if (job.status === "failed") {
+          setDailyJob(null);
+          clearProcessingNotice();
+          setError(job.error || "Não foi possível gerar o resumo diário.");
+        }
+      } catch (nextError) {
+        if (cancelled) return;
+        setDailyJob(null);
+        clearProcessingNotice();
+        setError(nextError.message);
+      }
+    };
+    check();
+    const timer = setInterval(check, 2000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [dailyJob, refresh]);
   useEffect(() => { const check = async () => { try { const due = await api("/reminders/due/"); for (const reminder of due) { await window.notetaker?.notify({ title: "Lembrete", body: reminder.task_title, target: { kind: "task", object_id: reminder.task } }); await api(`/reminders/${reminder.id}/notified/`, { method: "POST" }); } } catch (nextError) { setError(nextError.message); } }; check(); const timer = setInterval(check, 30000); return () => clearInterval(timer); }, []);
   const startActiveMode = useCallback(async () => {
     if (activeController.current || activeStarting.current || meetingStarting.current) return;
@@ -1004,6 +1068,8 @@ export default function App() {
     if (activeEnabled && !meetingCapture && !meetingStarting.current) startActiveMode();
   }, [activeEnabled, meetingCapture, startActiveMode]);
   const toggleActiveListening = async () => {
+    if (captureTransition.current || captureBusy || meetingCapture) return;
+    captureTransition.current = true;
     setError(""); setCaptureBusy(true);
     try {
       if (activeEnabled) {
@@ -1020,7 +1086,7 @@ export default function App() {
       }
     }
     catch (nextError) { setError(nextError.message); }
-    finally { setCaptureBusy(false); }
+    finally { captureTransition.current = false; setCaptureBusy(false); }
   };
   // The sidebar switch controls synchronization only; write permission stays in Settings.
   const toggleGitLab = async () => {
@@ -1033,10 +1099,16 @@ export default function App() {
     } catch (nextError) { setError(nextError.message); }
     finally { setGitlabBusy(false); }
   };
-  const toggleMeeting = async () => {
+  // Manual and detected starts share one lock and the existing capture lifecycle.
+  const toggleMeeting = async (detectedCall = null, fromTray = false) => {
+    if (captureTransition.current || captureBusy || (detectedCall && meetingCapture)) return;
+    captureTransition.current = true;
     setError(""); setCaptureBusy(true);
     try {
       if (meetingCapture) {
+        // Suppress reminders as soon as a manual stop begins, including uploads.
+        meetingEndNotice.current = null;
+        detectedMeetings.calls.forEach((call) => consumedMeetings.current.add(call.id));
         await meetingCapture.stop();
         setMeetingCapture(null);
         await refresh();
@@ -1045,9 +1117,14 @@ export default function App() {
       } else {
         meetingStarting.current = true;
         await stopActiveMode();
-        const controller = await startCapture((nextError) => setError(nextError.message), microphoneId);
+        const controller = await startCapture((nextError) => setError(nextError.message), microphoneId, Boolean(detectedCall) || fromTray);
+        meetingEndNotice.current = { capture: controller, sawCall: Boolean(detectedCall) || detectedMeetings.calls.length > 0, notified: false };
         setMeetingCapture(controller);
         window.notetaker?.setCaptureState("meeting");
+        if (detectedCall) {
+          setNotice(`Reunião iniciada automaticamente: ${detectedCall.name}.`);
+          window.notetaker?.notify({ title: "Reunião iniciada", body: `Captura iniciada automaticamente: ${detectedCall.name}.` }).catch((error) => setError(error.message));
+        }
       }
     } catch (nextError) {
       setError(nextError.message);
@@ -1055,9 +1132,57 @@ export default function App() {
       if (activeEnabled && !meetingCapture) await startActiveMode();
     } finally {
       meetingStarting.current = false;
+      captureTransition.current = false;
       setCaptureBusy(false);
     }
   };
+  // A stable subscription reads the latest handlers/state without stale closures.
+  trayState.current = { recording: Boolean(meetingCapture), listeningEnabled: activeEnabled, busy: captureBusy };
+  trayCommandHandler.current = async (action) => {
+    try {
+      if (action === "start-meeting" && !meetingCapture) await toggleMeeting(null, true);
+      else if (action === "stop-meeting" && meetingCapture) await toggleMeeting();
+      else if (action === "toggle-listening" && !meetingCapture) await toggleActiveListening();
+    } finally {
+      // Acknowledge ignored/stale commands too, so the native menu cannot stay locked.
+      window.notetaker?.setTrayState?.(trayState.current);
+    }
+  };
+  useEffect(() => window.notetaker?.onTrayCommand?.((action) => trayCommandHandler.current?.(action)), []);
+  useEffect(() => {
+    window.notetaker?.setTrayState?.(trayState.current);
+  }, [meetingCapture, activeEnabled, captureBusy]);
+  useEffect(() => {
+    if (!autoMeetingEnabled || detectedMeetings.error) return;
+    const present = new Set(detectedMeetings.calls.map((call) => call.id));
+    for (const id of consumedMeetings.current) { if (!present.has(id)) consumedMeetings.current.delete(id); }
+    if (meetingCapture) {
+      present.forEach((id) => consumedMeetings.current.add(id));
+      return;
+    }
+    if (captureBusy || captureTransition.current) return;
+    const next = detectedMeetings.calls.find((call) => !consumedMeetings.current.has(call.id));
+    if (!next) return;
+    // Consume before awaiting: errors and manual stops must not cause restart loops.
+    present.forEach((id) => consumedMeetings.current.add(id));
+    toggleMeeting(next);
+  }, [autoMeetingEnabled, detectedMeetings, meetingCapture, captureBusy]);
+  // The detector already confirms absence over three successful observations.
+  // Remind once per recording, after a call was seen; never stop the recorder here.
+  useEffect(() => {
+    if (!meetingCapture) { meetingEndNotice.current = null; return; }
+    const tracked = meetingEndNotice.current;
+    if (!tracked || tracked.capture !== meetingCapture) return;
+    if (!autoMeetingEnabled) { tracked.sawCall = false; return; }
+    if (detectedMeetings.error || captureBusy || captureTransition.current) return;
+    if (detectedMeetings.calls.length) { tracked.sawCall = true; return; }
+    if (!tracked.sawCall || tracked.notified) return;
+    tracked.notified = true;
+    const body = "A chamada terminou. A gravação continua ativa — termina-a quando quiseres.";
+    setNotice(body);
+    window.notetaker?.notify({ title: "A chamada terminou", body, target: { kind: "capture-reminder" } })
+      .catch((error) => setError(`Não foi possível mostrar a notificação: ${error.message}`));
+  }, [autoMeetingEnabled, detectedMeetings, meetingCapture, captureBusy]);
   useEffect(() => {
     answerRequest.current += 1; setChatAnswer(null);
     const trimmedQuery = query.trim();
@@ -1086,6 +1211,8 @@ export default function App() {
   // Resolve live content before navigation, including deleted notification targets.
   const openSource = useCallback(async (source) => {
     try {
+      // The native click has already opened the app; the stop button is global.
+      if (source.kind === "capture-reminder") return;
       if (source.kind === "summary" && source.object_id) await api(`/summaries/${source.object_id}/`);
       if (source.kind === "note" && source.meeting_id) await api(`/notes/${source.object_id}/`);
       if (source.kind === "segment" && source.segment_id) await api(`/segments/${source.segment_id}/`);
@@ -1111,7 +1238,16 @@ export default function App() {
     if (nextView === "Reuniões") { setMeetingTarget(null); setMeetingsKey((value) => value + 1); }
     setView(nextView);
   };
-  const generateDaily = async (date) => { try { const job = await api("/summaries/generate_daily/", { method: "POST", body: JSON.stringify({ date }) }); setDailyJob({ id: job.job_id, date: job.summary_date }); setNotice(`A processar as reuniões e tarefas de ${formatCalendarDate(job.summary_date)} localmente.`); } catch (nextError) { setError(nextError.message); } };
+  const generateDaily = async (date) => {
+    // Start with a clean status so an earlier failure does not accompany a new job.
+    setError("");
+    setNotice("");
+    try {
+      const job = await api("/summaries/generate_daily/", { method: "POST", body: JSON.stringify({ date }) });
+      setDailyJob({ id: job.job_id, date: job.summary_date });
+      setNotice(`A processar as reuniões e tarefas de ${formatCalendarDate(job.summary_date)} localmente.`);
+    } catch (nextError) { setError(nextError.message); }
+  };
   const generateSelectedDaily = (event) => {
     event.preventDefault();
     if (!dailyDate) return;
@@ -1134,21 +1270,22 @@ export default function App() {
       {view === "Pesquisa" && <><label>Participante<Select value={participantFilter} onChange={(event) => setParticipantFilter(event.target.value)}><option value="">Todos</option>{participants.map((item) => <option key={item.id} value={item.id}>{item.label} · {sessions.find((session) => session.id === item.session)?.title || "Reunião"}</option>)}</Select></label><label>Desde<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)}/></label><label>Até<input type="date" value={dateTo} min={dateFrom} onChange={(event) => setDateTo(event.target.value)}/></label></>}
       <button type="button" className="text-button" onClick={() => { setProjectFilter(""); setTagFilter(""); setParticipantFilter(""); setDateFrom(""); setDateTo(""); }}>Limpar filtros</button>
     </div>  </>;
-  return <main className="shell"><aside><div className="brand"><span className="brand-mark">N</span><strong>My AI Notetaker</strong></div><nav>{VIEWS.map((item) => <button className={view === item ? "active" : ""} onClick={() => selectView(item)} key={item}>{item}</button>)}</nav><div className="sidebar-controls">
+  return <main className="shell"><AISetupGuide {...ai} open={aiSetupOpen} onClose={() => setAISetupOpen(false)}/><aside><div className="brand"><img className="brand-mark" src={nexusSymbol} alt=""/><strong>Nexus</strong></div><nav>{VIEWS.map((item) => <button className={view === item ? "active" : ""} onClick={() => selectView(item)} key={item}>{item}</button>)}</nav><div className="sidebar-controls">
       <button type="button" className="sidebar-control" role="switch" aria-label="Escuta ativa" aria-checked={activeEnabled} disabled={captureBusy || Boolean(meetingCapture)} onClick={toggleActiveListening} title={meetingCapture ? "Reunião em curso" : activeListening ? "Escuta ativa" : "Captura pausada"}>
         <span aria-hidden="true" className={activeListening || meetingCapture ? "live-dot" : "idle-dot"}/><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg><span className="sidebar-control-label">{meetingCapture ? "Reunião em curso" : "Escuta ativa"}</span><span aria-hidden="true" className="sidebar-toggle"/>
       </button>
       <button type="button" className="sidebar-control" role="switch" aria-label="Sincronização GitLab" aria-checked={Boolean(gitlabStatus?.enabled)} disabled={gitlabBusy || !gitlabStatus || (!gitlabStatus.enabled && !gitlabStatus.has_token)} onClick={toggleGitLab} title={gitlabStatus?.error || (!gitlabStatus?.has_token ? "Configura o token GitLab nas Definições." : gitlabStatus.enabled ? "Sincronização GitLab ativa" : "Sincronização GitLab desativada")}>
         <span aria-hidden="true" className={gitlabStatus?.enabled && gitlabStatus.has_token && !gitlabStatus.error ? "live-dot" : "idle-dot"}/><span aria-hidden="true"><GitLabIcon/></span><span className="sidebar-control-label">GitLab</span><span aria-hidden="true" className="sidebar-toggle"/>
       </button>
-    </div></aside><section className="content"><header><div><p className="eyebrow">LOCAL · PRIVADO</p><h1>{view}</h1></div><div className="header-actions"><div className="daily-summary-button"><button onClick={() => generateDaily(localDateValue())} disabled={Boolean(dailyJob)}>{dailyJob && <Spinner/>}Resumo do dia</button><DailySummaryPicker summaries={dailySummaries.slice(0, 5)} date={dailyDate} onDateChange={setDailyDate} busy={Boolean(dailyJob)} onGenerate={generateSelectedDaily}/></div><button className={`capture ${meetingCapture ? "active" : ""}`} onClick={toggleMeeting} disabled={captureBusy}>{captureBusy && <Spinner/>}{meetingCapture ? "Terminar reunião" : "Iniciar reunião"}</button></div></header>
+    </div></aside><section className="content"><header><div className="header-title"><p className="eyebrow">LOCAL · PRIVADO</p><h1>{view}</h1></div><div className="header-question"><AIQuestionBar onOpenSource={openSource} panelContainer={aiQuestionPanel}/></div><div className="header-actions"><div className="daily-summary-button"><button onClick={() => generateDaily(localDateValue())} disabled={Boolean(dailyJob)}>{dailyJob && <Spinner/>}Resumo do dia</button><DailySummaryPicker summaries={dailySummaries.slice(0, 5)} date={dailyDate} onDateChange={setDailyDate} busy={Boolean(dailyJob)} onGenerate={generateSelectedDaily}/></div><button className={`capture ${meetingCapture ? "active" : ""}`} onClick={() => toggleMeeting()} disabled={captureBusy}>{captureBusy && <Spinner/>}{meetingCapture ? "Terminar reunião" : "Iniciar reunião"}</button></div></header>
+    <div ref={aiQuestionPanel}/>
     {error && <div className="error">{error}<button onClick={() => setError("")}>×</button></div>}{notice && <div className="notice">{notice}<button onClick={() => setNotice("")}>×</button></div>}
     {["Hoje", "Reuniões", "Pesquisa"].includes(view) && <div className="organization-toolbar"><Popup className="filter-panel"><summary>Filtros <span className="filter-indicator">{activeOrganizationFilterCount || ""}</span></summary>{organizationFilters}</Popup></div>}
-    {view === "Notas" && <Notes notes={notes} sessions={sessions} projects={projects} tags={tags} refresh={refresh} onError={setError} onOpenSource={openSource} targetId={contentDetail?.id} OrganizationMenu={OrganizationMenu}/>}
+    {view === "Notas" && <Notes notes={notes} sessions={sessions} projects={projects} refresh={refresh} onError={setError} onOpenSource={openSource} targetId={contentDetail?.id} OrganizationMenu={OrganizationMenu}/>}
     {view === "Projetos" && <Projects taskProps={taskProps} projects={projects} tags={tags} sessions={sessions} tasks={tasks} notes={notes} summaries={summaries} refresh={refresh} onError={setError} onOpen={openSource} onProjectSaved={(item) => setProjects((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))} onTagSaved={(item) => setTags((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))}/>}
     {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList {...taskProps} settingsFilters={view === "Tarefas" ? organizationFilters : null} activeFilterCount={activeOrganizationFilterCount} tasks={organizationTasks} today={view === "Hoje"} showSections={view === "Tarefas"} createOpen={view === "Tarefas" ? taskCreateOpen : undefined} onCreateOpenChange={view === "Tarefas" ? setTaskCreateOpen : undefined}/>} {view === "Reuniões" && <Meetings tasks={tasks} taskProps={taskProps} projects={projects} tags={tags} key={meetingsKey} sessions={organizationSessions} refresh={refresh} onError={setError} target={meetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{contentDetail && <article className="card"><h3>{contentDetail.title || "Nota pessoal"}</h3><p>{contentDetail.body}</p><OrganizationMenu item={contentDetail} projects={projects} tags={tags} onSave={async (changes) => {
       try { const saved = await api(`/notes/${contentDetail.id}/`, { method: "PATCH", body: JSON.stringify(changes) }); setContentDetail(saved); await refresh(); }
       catch (nextError) { setError(nextError.message); }
-    }}/><button onClick={() => setContentDetail(null)}>Fechar</button></article>}{chatAnswer && <article className="card answer"><h3>Resposta</h3><p>{chatAnswer.answer}</p>{chatAnswer.warning && <small>{chatAnswer.warning}</small>}<ReferenceInfo label="Fontes da resposta">{chatAnswer.sources?.length ? <span className="answer-sources">{chatAnswer.sources.map((source) => <button key={source.id} onClick={() => openSource(source)}><span>{source.meeting_title} · {source.speaker}</span><small>{source.text}</small></button>)}</span> : <span className="reference-text">Sem evidência suficiente.</span>}</ReferenceInfo></article>}{results && <div className="card-list search-results">{results.sources?.length ? results.sources.map((source) => <button className="card search-result" key={source.id} onClick={() => openSource(source)}><div className="search-result-meta"><span>{{segment: "Transcrição", summary: "Resumo", note: "Nota", task: "Tarefa", session: "Reunião"}[source.kind]}</span><span>{source.title || source.meeting_title}</span></div><p>{source.text}</p></button>) : <div className="empty">Não foram encontrados resultados locais.</div>}</div>}</>} {view === "Definições" && <Settings microphoneId={microphoneId} setMicrophoneId={setMicrophoneId}
-  keepDisplayAwake={keepDisplayAwake} setKeepDisplayAwake={setKeepDisplayAwake} onError={setError}/>} {view === "Definições" && <GitLabSettings onError={setError} refresh={refresh}/>} {view === "Logs" && <ListeningLogs logs={logs}/>}</section></main>;
+    }}/><button onClick={() => setContentDetail(null)}>Fechar</button></article>}{chatAnswer && <article className="card answer"><h3>Resposta</h3><p>{chatAnswer.answer}</p>{chatAnswer.warning && <small>{chatAnswer.warning}</small>}<ReferenceInfo label="Fontes da resposta">{chatAnswer.sources?.length ? <span className="answer-sources">{chatAnswer.sources.map((source) => <button key={source.id} onClick={() => openSource(source)}><span>{source.meeting_title} · {source.speaker}</span><small>{source.text}</small></button>)}</span> : <span className="reference-text">Sem evidência suficiente.</span>}</ReferenceInfo></article>}{results && <div className="card-list search-results">{results.sources?.length ? results.sources.map((source) => <button className="card search-result" key={source.id} onClick={() => openSource(source)}><div className="search-result-meta"><span>{{segment: "Transcrição", summary: "Resumo", note: "Nota", task: "Tarefa", session: "Reunião"}[source.kind]}</span><span>{source.title || source.meeting_title}</span></div><p>{source.text}</p></button>) : <div className="empty">Não foram encontrados resultados locais.</div>}</div>}</>} {view === "Definições" && <Settings ai={ai} onOpenAISetup={() => setAISetupOpen(true)} microphoneId={microphoneId} setMicrophoneId={setMicrophoneId}
+  keepDisplayAwake={keepDisplayAwake} setKeepDisplayAwake={setKeepDisplayAwake} autoMeetingEnabled={autoMeetingEnabled} setAutoMeetingEnabled={setAutoMeetingEnabled} onError={setError}/>} {view === "Definições" && <GitLabSettings onError={setError} refresh={refresh}/>} {view === "Logs" && <ListeningLogs logs={logs}/>}</section></main>;
 }

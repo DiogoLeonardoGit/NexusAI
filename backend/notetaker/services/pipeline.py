@@ -705,7 +705,14 @@ def process_summary_job(job: ProcessingJob):
             for segment in segments
         )
     if not transcript.strip():
-        raise RuntimeError("No transcript is available to generate the summary.")
+        # Distinguish an empty work day from a meeting awaiting transcription.
+        if job.session_id:
+            raise RuntimeError("Ainda não há transcrição disponível para gerar o resumo desta reunião.")
+        raise RuntimeError(
+            f"Não há conteúdo para resumir em {summary_date.strftime('%d/%m/%Y')}. "
+            "O resumo diário considera reuniões com transcrição ou resumo, tarefas criadas "
+            "ou concluídas e notas criadas nessa data. Escolhe outra data ou regista atividade nesse dia."
+        )
     _set_job_progress(job.pk, 10, "A analisar com IA")
     if job.session_id and job.progress_phase == "combined":
         result = _analyze_meeting_transcript(job, transcript, segments, prompt_label, language)

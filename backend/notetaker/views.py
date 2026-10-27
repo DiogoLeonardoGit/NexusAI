@@ -22,6 +22,7 @@ from .models import (
     Note,
     Project,
     Tag,
+    GitLabConnection,
     GitLabTask,
     ProcessingJob,
     Reminder,
@@ -73,11 +74,46 @@ def health(request):
     })
 
 
+def _gitlab_status_groups(config):
+    """Share exact category membership between counters and their local lists."""
+    from .services.gitlab_sync import pending_links
+    links = GitLabTask.objects.filter(connection=config)
+    return {
+        "pending": pending_links(config),
+        "conflicts": links.exclude(conflicts={}),
+        "hidden": links.filter(hidden=True),
+        "inactive": links.filter(active=False),
+    }
+
+
+@api_view(["GET"])
+def gitlab_status_tasks(request):
+    """List local status details without contacting GitLab or changing settings."""
+    from .services.gitlab_sync import UNSENT_TIME_STATES
+    category = request.query_params.get("category")
+    if category not in {"pending", "conflicts", "hidden", "inactive"}:
+        return Response({"detail": "Escolhe uma categoria GitLab válida."}, status=400)
+    config = GitLabConnection.objects.filter(pk=1).first()
+    if config is None:
+        return Response({"category": category, "count": 0, "results": []})
+    links = _gitlab_status_groups(config)[category].select_related("task").prefetch_related("task__time_entries")
+    results = [{
+        "task_id": link.task_id, "title": link.task.title,
+        "issue_iid": link.issue_iid, "project_id": link.project_id, "web_url": link.web_url,
+        "pending_fields": sorted(link.pending), "conflict_fields": sorted(link.conflicts),
+        "error": link.error, "hidden": link.hidden, "active": link.active,
+        "time_entries": [{"duration_seconds": entry.duration_seconds, "sync_state": entry.sync_state,
+                          "error": entry.error}
+                         for entry in link.task.time_entries.all() if entry.sync_state in UNSENT_TIME_STATES],
+    } for link in links.order_by("task__title", "task_id")]
+    return Response({"category": category, "count": len(results), "results": results})
+
+
 @api_view(["GET", "PATCH"])
 def gitlab_settings(request):
     """Expose connection state and explicit write opt-in, never credentials."""
     from .services import gitlab
-    from .services.gitlab_sync import connection, pending_links
+    from .services.gitlab_sync import connection
     config = connection()
     if request.method == "PATCH":
         if not request.data or set(request.data) - {"enabled", "write_enabled"} or any(not isinstance(value, bool) for value in request.data.values()):
@@ -87,12 +123,11 @@ def gitlab_settings(request):
             config.save(update_fields=["enabled"])
         if "write_enabled" in request.data:
             AppSetting.objects.update_or_create(key=gitlab.WRITE_SETTING, defaults={"value": request.data["write_enabled"]})
-    links = GitLabTask.objects.filter(connection=config)
+    groups = _gitlab_status_groups(config)
     return Response({"base_url": config.base_url, "project_path": config.project_path, "enabled": config.enabled,
                      "read_only": not gitlab.writes_enabled(), "has_token": gitlab.has_token(),
                      "username": config.username, "last_sync_at": config.last_sync_at, "error": config.error,
-                     "pending": pending_links(config).count(), "conflicts": links.exclude(conflicts={}).count(),
-                     "hidden": links.filter(hidden=True).count(), "inactive": links.filter(active=False).count(),
+                     **{category: links.count() for category, links in groups.items()},
                      "available_tag_ids": list(config.gitlablabel_set.filter(project_id=config.project_id, available=True).values_list("tag_id", flat=True))})
 
 
@@ -634,6 +669,18 @@ class TaskViewSet(viewsets.ModelViewSet):
         return Response(status=204)
 
     @action(detail=True, methods=["post"])
+    def unhide(self, request, pk=None):
+        """Restore local visibility without changing access, pending edits or GitLab."""
+        from .services.gitlab_sync import sync_lock
+        with sync_lock, transaction.atomic():
+            task = self.get_object()
+            if not hasattr(task, "gitlab"):
+                return Response({"detail": "Esta tarefa não veio do GitLab."}, status=400)
+            task.gitlab.hidden = False
+            task.gitlab.save(update_fields=["hidden"])
+        return Response(status=204)
+
+    @action(detail=True, methods=["post"])
     def resolve(self, request, pk=None):
         from .services.gitlab_sync import resolve_conflicts, sync_lock
         with sync_lock, transaction.atomic():
@@ -881,6 +928,20 @@ def search(request):
               for kind, plural in (("segment", "segments"), ("note", "notes"), ("task", "tasks"), ("summary", "summaries"), ("session", "sessions"))}
     result["sources"] = [_source(record) for record in records]
     return Response(result)
+
+
+@api_view(["POST"])
+def task_assistant(request):
+    """Answer general or app-context questions without changing saved data."""
+    from .services.task_assistant import TaskAnswerError, answer_question
+    try:
+        return Response(answer_question(request.data.get("question"), source_factory=_source))
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+    except TaskAnswerError as exc:
+        return Response({"detail": str(exc)}, status=502)
+    except OllamaError:
+        return Response({"detail": "A IA local não conseguiu responder. Confirma que o modelo está carregado e tenta novamente."}, status=503)
 
 
 @api_view(["POST"])

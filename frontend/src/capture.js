@@ -56,7 +56,32 @@ export function recorderFor(stream, source, sessionId, onError, pendingUploads, 
   };
 }
 
-export async function startCapture(onError, microphoneDeviceId = "") {
+// Automatic starts need a native activation immediately around getDisplayMedia,
+// after any pending active-listening uploads have finished.
+function automaticDisplayMedia() {
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    const cleanup = () => {
+      finished = true;
+      clearTimeout(timer);
+      window.removeEventListener("notetaker:request-display-media", request);
+    };
+    const fail = (error) => { if (finished) return; cleanup(); reject(error); };
+    const request = () => {
+      try {
+        navigator.mediaDevices.getDisplayMedia({ video: true, audio: true }).then((stream) => {
+          if (finished) { stream.getTracks().forEach((track) => track.stop()); return; }
+          cleanup(); resolve(stream);
+        }, fail);
+      } catch (error) { fail(error); }
+    };
+    const timer = setTimeout(() => fail(new Error("A captura automática não respondeu. Usa Iniciar reunião para tentar manualmente.")), 15_000);
+    window.addEventListener("notetaker:request-display-media", request, { once: true });
+    window.notetaker.activateMeetingCapture().catch(fail);
+  });
+}
+
+export async function startCapture(onError, microphoneDeviceId = "", automatic = false) {
   const session = await api("/sessions/", {
     method: "POST",
     body: JSON.stringify({ title: `Sessão ${new Date().toLocaleString()}`, started_at: new Date().toISOString() }),
@@ -72,7 +97,7 @@ export async function startCapture(onError, microphoneDeviceId = "") {
         autoGainControl: true,
       },
     });
-    display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    display = await (automatic ? automaticDisplayMedia() : navigator.mediaDevices.getDisplayMedia({ video: true, audio: true }));
     const systemTracks = display.getAudioTracks();
     if (!systemTracks.length) throw new Error("O Windows não disponibilizou áudio do sistema para esta captura.");
     const systemAudio = new MediaStream(systemTracks);

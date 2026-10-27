@@ -2,7 +2,7 @@ data/
 models/
 frontend/node_modules/
 frontend/dist/
-frontend/release/
+frontend/release*
 
 # Python
 *.egg-info
@@ -73,4 +73,9 @@ htmlcov/
 AGENTS.md
 .github/
 
+# Build
 backend/dist/
+backend/build/
+
+# Diagnostics
+diagnostics/
