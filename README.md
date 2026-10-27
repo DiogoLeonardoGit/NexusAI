@@ -1,7 +1,7 @@
 # Nexus AI
 
 Na interface, na janela e na bandeja, a aplicação apresenta-se como **Nexus**;
-o instalador usa **Nexus AI**. O símbolo e a paleta vêm da pasta `media/`.
+o instalador usa **Nexus AI**. O símbolo e as cores de destaque vêm da pasta `media/`; os fundos mantêm os tons escuros originais.
 Para regenerar os ícones Windows a partir do símbolo fornecido, executa
 `powershell -File scripts/generate_icon.ps1` antes de empacotar.
 

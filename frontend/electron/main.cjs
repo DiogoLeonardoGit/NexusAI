@@ -237,7 +237,7 @@ function createWindow() {
     height: 820,
     minWidth: 960,
     minHeight: 640,
-    backgroundColor: "#0c1930",
+    backgroundColor: "#0d1117",
     icon: appIcon(),
     show: true,
     webPreferences: {
