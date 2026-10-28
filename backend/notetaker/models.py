@@ -191,6 +191,8 @@ class Task(models.Model):
     description = models.TextField(blank=True)
     owner = models.CharField(max_length=16, choices=Owner.choices, default=Owner.UNKNOWN)
     owner_name = models.CharField(max_length=120, blank=True)
+    # Stable remote identity for a local task awaiting explicit publication.
+    gitlab_assignee_id = models.PositiveBigIntegerField(null=True, blank=True)
     status = models.CharField(max_length=24, choices=Status.choices, default=Status.TODO)
     # Zero means no estimate; existing time records remain intact.
     estimate_seconds = models.PositiveIntegerField(default=0)

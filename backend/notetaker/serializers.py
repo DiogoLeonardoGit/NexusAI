@@ -317,6 +317,7 @@ class TaskTimeEntrySerializer(serializers.ModelSerializer):
 
 
 class TaskSerializer(serializers.ModelSerializer):
+    gitlab_assignee_id = serializers.IntegerField(min_value=1, allow_null=True, required=False)
     milestone_id = serializers.IntegerField(min_value=1, allow_null=True, required=False, write_only=True)
     # Project is derived from the meeting; the legacy model field is not exposed.
     project = serializers.IntegerField(source="session.project_id", read_only=True, allow_null=True, default=None)
@@ -374,6 +375,7 @@ class TaskSerializer(serializers.ModelSerializer):
         if milestone_id and (not milestone or milestone.get("id") != milestone_id):
             milestone = {"id": milestone_id, "title": f"#{milestone_id}"}
         return {"web_url": link.web_url, "issue_iid": link.issue_iid, "project_id": link.project_id,
+                "assignees": link.snapshot.get("assignees", []),
                 "start_date": planning.get("start_date"), "milestone": milestone if milestone_id else None,
                 "active": link.active, "hidden": link.hidden, "pending": bool(link.pending) or any(
                     entry.sync_state != TaskTimeEntry.SyncState.SENT for entry in instance.time_entries.all()),
@@ -402,12 +404,16 @@ class TaskSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Cria a tarefa antes de definir lembretes ou registar tempo.")
         self._validate_edit_details(attrs)
         if self.instance is None or not hasattr(self.instance, "gitlab"):
+            self._validate_local_owner(attrs)
             return attrs
         link = self.instance.gitlab
         if not link.active or link.hidden:
-            raise serializers.ValidationError("Esta tarefa deixou de estar atribuída a ti ou está oculta.")
-        if attrs.get("owner", "self") != "self" or attrs.get("status", "todo") not in {"todo", "done"}:
-            raise serializers.ValidationError("As tarefas GitLab mantêm o responsável Eu e estado aberta/concluída.")
+            raise serializers.ValidationError("Esta tarefa está indisponível ou oculta.")
+        for field in ("owner", "owner_name", "gitlab_assignee_id"):
+            if field in attrs and attrs[field] != getattr(self.instance, field):
+                raise serializers.ValidationError({field: "O responsável desta tarefa é gerido no GitLab."})
+        if attrs.get("status", self.instance.status) not in {"todo", "done"}:
+            raise serializers.ValidationError("As tarefas GitLab mantêm o estado aberta/concluída.")
         if "tags" in attrs:
             permitted = set(GitLabLabel.objects.filter(connection=link.connection, project_id=link.project_id,
                                                       available=True).values_list("tag_id", flat=True))
@@ -416,6 +422,44 @@ class TaskSerializer(serializers.ModelSerializer):
             if any(tag.pk not in permitted for tag in attrs["tags"]):
                 raise serializers.ValidationError({"tags": "Escolhe etiquetas existentes neste projeto GitLab."})
         return attrs
+
+    def _validate_local_owner(self, attrs):
+        """Keep free-text names distinct from validated, stable GitLab identities."""
+        if not {"owner", "owner_name", "gitlab_assignee_id"}.intersection(attrs):
+            return
+        owner = attrs.get("owner", self.instance.owner if self.instance else Task.Owner.UNKNOWN)
+        if owner != Task.Owner.OTHER:
+            if attrs.get("gitlab_assignee_id") is not None:
+                raise serializers.ValidationError({"gitlab_assignee_id": "Escolhe Outro interveniente para indicar um utilizador GitLab."})
+            attrs.update(owner_name="", gitlab_assignee_id=None)
+            return
+        assignee_id = attrs.get("gitlab_assignee_id", self.instance.gitlab_assignee_id if self.instance else None)
+        if assignee_id is None:
+            name = attrs.get("owner_name", self.instance.owner_name if self.instance else "").strip()
+            if not name:
+                raise serializers.ValidationError({"owner_name": "Indica um nome ou escolhe um utilizador GitLab."})
+            attrs.update(owner_name=name, gitlab_assignee_id=None)
+            return
+        if self.instance and self.instance.owner == owner and self.instance.gitlab_assignee_id == assignee_id:
+            # Ordinary local edits remain available offline; publishing revalidates membership.
+            attrs["owner_name"] = self.instance.owner_name
+            return
+        from .services import gitlab
+        from .services.gitlab_sync import connection
+        try:
+            config = connection()
+            client = gitlab.GitLabClient(config)
+            project_id = config.project_id or client.project()["id"]
+            person = next((item for item in client.members(project_id) if item["id"] == assignee_id), None)
+            user_id = config.user_id or client.get("/user")["id"]
+        except gitlab.GitLabError as exc:
+            raise serializers.ValidationError({"gitlab_assignee_id": str(exc)}) from exc
+        if person is None:
+            raise serializers.ValidationError({"gitlab_assignee_id": "Escolhe um utilizador disponível neste projeto GitLab."})
+        if person["id"] == user_id:
+            attrs.update(owner=Task.Owner.SELF, owner_name="", gitlab_assignee_id=None)
+        else:
+            attrs.update(owner_name=person["name"][:120], gitlab_assignee_id=person["id"])
 
     def _validate_edit_details(self, attrs):
         """Validate the whole edit before any task, reminder or time write occurs."""

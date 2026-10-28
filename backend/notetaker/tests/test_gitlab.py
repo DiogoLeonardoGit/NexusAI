@@ -51,18 +51,18 @@ class GitLabTests(TestCase):
         self.assertEqual(self.client.post("/api/gitlab/sync/").data, {"disabled": True})
         self.fake.get.assert_not_called()
 
-    def test_personal_import_is_idempotent_and_filters_assignees(self):
+    def test_project_import_is_idempotent_and_includes_other_assignees_and_closed(self):
         other = {**self.issue, "id": 302, "iid": 6, "assignees": [{"id": 8}]}
         closed = {**self.issue, "id": 303, "iid": 7, "state": "closed"}
         self.issues += [other, closed]
-        self.assertEqual(self.enable_import()["imported"], 1)
+        self.assertEqual(self.enable_import()["imported"], 3)
         self.assertEqual(synchronize()["imported"], 0)
-        task = Task.objects.get()
+        task = Task.objects.get(gitlab__issue_iid=5)
         self.assertEqual(task.owner, "self")
         self.assertEqual(task.creation_source, "gitlab")
         self.assertEqual(set(task.tags.values_list("name", flat=True)), {"Em curso"})
-        self.fake.pages.assert_any_call("/projects/42/issues", scope="all", assignee_id=7, state="all")
-        self.assertEqual(self.client.get("/api/tasks/?owner=self").data[0]["gitlab"]["issue_iid"], 5)
+        self.fake.pages.assert_any_call("/projects/42/issues", scope="all", state="all")
+        self.assertEqual({item["gitlab"]["issue_iid"] for item in self.client.get("/api/tasks/?owner=self").data}, {5, 7})
 
     def test_wrong_account_rejected_without_import(self):
         self.fake.get.return_value = {"id": 8, "email": "other@example.com"}
@@ -220,16 +220,17 @@ class GitLabTests(TestCase):
         self.assertEqual(link.snapshot["state"], "closed")
         self.assertEqual(link.task.status, "done")
 
-    def test_manual_write_path_rechecks_assignee_before_sending(self):
+    def test_manual_write_path_preserves_other_assignee_when_sending(self):
         self.enable_import()
         task = Task.objects.get()
         self.client.post(f"/api/tasks/{task.pk}/complete/")
         self.fake.get.side_effect = lambda path: ({"id": 7, "username": "diogo", "email": gitlab.EXPECTED_EMAIL}
                                                  if path == "/user" else {**self.issue, "assignees": [{"id": 8}]})
+        self.fake.update_task.return_value = {**self.issue, "assignees": [{"id": 8}], "state": "closed", "labels": []}
         with patch.object(gitlab, "writes_enabled", return_value=True):
             synchronize(send_updates=True)
-        self.fake.update_task.assert_not_called()
-        self.assertFalse(GitLabTask.objects.get().active)
+        self.fake.update_task.assert_called_once()
+        self.assertTrue(GitLabTask.objects.get().active)
 
     def test_credentials_are_not_persisted_or_returned(self):
         with patch.object(gitlab, "_token", ""):

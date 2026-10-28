@@ -12,6 +12,8 @@ from django.utils.dateparse import parse_date, parse_datetime
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view
+from rest_framework.exceptions import ValidationError
+from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 
 from .models import (
@@ -155,6 +157,25 @@ def gitlab_milestones(request):
             project_id = config.project_id or client.project()["id"]
             return Response([{"id": item["id"], "title": item["title"], "state": item.get("state", "active")}
                              for item in client.milestones(project_id)])
+        except gitlab.GitLabError as exc:
+            return Response({"detail": str(exc)}, status=502)
+
+
+@api_view(["GET"])
+def gitlab_members(request):
+    """Expose the live member catalogue without enabling or performing remote writes."""
+    from .services import gitlab
+    from .services.gitlab_sync import connection, sync_lock
+    with sync_lock:
+        config = connection()
+        if not config.enabled:
+            return Response({"detail": "Ativa a sincronização GitLab para consultar pessoas."}, status=400)
+        try:
+            client = gitlab.GitLabClient(config)
+            project_id = config.project_id or client.project()["id"]
+            user_id = config.user_id or client.get("/user")["id"]
+            return Response([{**item, "is_self": item["id"] == user_id}
+                             for item in client.members(project_id)])
         except gitlab.GitLabError as exc:
             return Response({"detail": str(exc)}, status=502)
 
@@ -600,30 +621,48 @@ class TaskViewSet(viewsets.ModelViewSet):
         except gitlab.GitLabError as exc:
             return Response({"detail": str(exc)}, status=502)
 
-    @action(detail=True, methods=["post"])
-    def comments(self, request, pk=None):
-        """Send a user-written comment once, respecting sync and identity checks."""
+    def _comment_client(self, task):
+        """Recheck issue visibility and write settings for comments and attachments."""
+        from .services import gitlab
+        if not hasattr(task, "gitlab") or not task.gitlab.active or task.gitlab.hidden:
+            raise ValidationError({"detail": "Só podes comentar tarefas ativas ligadas ao GitLab."})
+        link = task.gitlab
+        if not link.connection.enabled or not gitlab.writes_enabled() or not gitlab.has_token():
+            raise ValidationError({"detail": "Ativa a sincronização e a escrita e configura o token GitLab."})
+        client = gitlab.GitLabClient(link.connection, allow_writes=True)
+        user = client.get("/user")
+        if user.get("email", "").lower() != gitlab.EXPECTED_EMAIL:
+            raise gitlab.GitLabError("O token tem de pertencer a diogo.leonardo@warpcom.com.")
+        # Assignment does not determine access; the token and GitLab enforce permissions.
+        client.get(f"/projects/{link.project_id}/issues/{link.issue_iid}")
+        return client
+
+    @action(detail=True, methods=["post"], parser_classes=[MultiPartParser], url_path="comment-uploads")
+    def comment_uploads(self, request, pk=None):
+        """Upload one explicitly submitted file without creating a comment or retrying."""
         from .services import gitlab
         task = self.get_object()
-        if not hasattr(task, "gitlab") or not task.gitlab.active or task.gitlab.hidden:
-            return Response({"detail": "Só podes comentar tarefas ativas ligadas ao GitLab."}, status=400)
+        if set(request.data) != {"file"} or len(request.FILES.getlist("file")) != 1:
+            return Response({"detail": "Envia apenas um ficheiro no campo file."}, status=400)
+        try:
+            client = self._comment_client(task)
+            return Response(client.upload_file(task.gitlab, request.FILES["file"]), status=201)
+        except gitlab.GitLabError as exc:
+            return Response({"detail": str(exc)}, status=502)
+
+    @action(detail=True, methods=["post"])
+    def comments(self, request, pk=None):
+        """Send user text and confirmed attachment Markdown once on explicit submission."""
+        from .services import gitlab
+        task = self.get_object()
         if not isinstance(request.data, dict) or set(request.data) != {"body"}:
             return Response({"detail": "Indica apenas o texto do comentário em body."}, status=400)
         body = request.data["body"]
         if not isinstance(body, str) or not body.strip() or len(body) > 100000:
             return Response({"detail": "Escreve um comentário com até 100000 caracteres."}, status=400)
-        link = task.gitlab
-        if not link.connection.enabled or not gitlab.writes_enabled() or not gitlab.has_token():
-            return Response({"detail": "Ativa a sincronização e a escrita e configura o token GitLab."}, status=400)
-        client = gitlab.GitLabClient(link.connection, allow_writes=True)
         try:
-            user = client.get("/user")
-            if user.get("email", "").lower() != gitlab.EXPECTED_EMAIL:
-                raise gitlab.GitLabError("O token tem de pertencer a diogo.leonardo@warpcom.com.")
-            latest = client.get(f"/projects/{link.project_id}/issues/{link.issue_iid}")
-            if not any(person["id"] == user["id"] for person in latest.get("assignees", [])):
-                return Response({"detail": "Esta tarefa já não te está atribuída no GitLab."}, status=400)
-            return Response(client.add_comment(link, body.strip()), status=201)
+            client = self._comment_client(task)
+            return Response(client.add_comment(task.gitlab, body.strip()), status=201)
         except gitlab.GitLabError as exc:
             return Response({"detail": str(exc)}, status=502)
 

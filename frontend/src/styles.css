@@ -149,6 +149,15 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 .task-comment button.primary-action { display: inline-flex; align-items: center; justify-content: center; align-self: flex-end; gap: 7px; min-width: 100px; padding: 7px 20px; font-size: 12px; }
 .task-comment button:disabled { cursor: not-allowed; }
 .task-comment small { color: #94a0b1; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+/* File drops stay inside the composer, separate from task-card dragging. */
+.comment-dropzone { display: grid; gap: 8px; min-width: 0; padding: 8px; border: 1px dashed #303949; border-radius: 10px; }
+.comment-dropzone.is-dragging { border-color: var(--nexus-cyan); background: #17c9e610; }
+.comment-attachment-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.comment-attachments { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.comment-attachments li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px; border-radius: 6px; background: #131922; }
+.comment-attachments li > span { min-width: 0; overflow-wrap: anywhere; color: #dce4ee; font-size: 12px; }
+.comment-attachments small { display: block; }
+.comment-attachments button { flex-shrink: 0; }
 .task-description-input { display: block; width: 100%; min-height: var(--field-height); margin: 2px 0 6px; line-height: var(--field-line-height); resize: none; overflow-y: hidden; }
 .task-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: #94a0b1; line-height: 1.5; }
 .task-meta .warning { margin-top: 0; }
@@ -191,7 +200,7 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 button.search-result:hover { border-color: var(--nexus-blue); }
 .search-result-meta { display: flex; gap: 10px; margin-bottom: 6px; color: #94a0b1; font-size: 12px; }
 .search-result-meta span:first-child { color: var(--nexus-cyan); font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
-.quick-task { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(200px, 1.5fr) minmax(180px, 1fr) auto auto; align-items: end; gap: 10px; margin-bottom: 18px; }
+.quick-task { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(200px, 1.5fr) minmax(160px, 1fr) minmax(180px, 1fr) auto auto; align-items: end; gap: 10px; margin-bottom: 18px; }
 .quick-task input, .quick-task textarea, .quick-task select { padding: var(--field-padding); border: 1px solid #303949; border-radius: 10px; color: #e8edf4; background: #131922; }
 .quick-task input, .quick-task textarea, .quick-task select, .quick-task button { height: var(--field-height); }
 .quick-task textarea { min-height: var(--field-height); line-height: var(--field-line-height); overflow-y: hidden; resize: none; }
@@ -325,6 +334,9 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .multi-select-options input { width: auto; accent-color: var(--nexus-cyan); }
 .label-color { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
 .new-task-meeting { display: grid; gap: 5px; color: #94a0b1; font-size: 12px; min-width: 0; }
+.task-owner-picker { display: grid; gap: 5px; color: #94a0b1; font-size: 12px; min-width: 0; }
+.task-owner-picker .custom-select { width: 100%; min-width: 0; }
+.quick-task .task-owner-picker .select-trigger { border: 1px solid #303949; color: #dce4ee; background: #131922; font-weight: 400; }
 .new-task-meeting .custom-select { width: 100%; min-width: 0; }
 .quick-task .new-task-meeting .select-trigger { border: 1px solid #303949; color: #dce4ee; background: #131922; font-weight: 400; }
 @media (max-width: 1100px) {

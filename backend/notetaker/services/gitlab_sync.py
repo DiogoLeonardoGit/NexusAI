@@ -1,4 +1,4 @@
-"""Idempotent personal-task import, local outbox and three-way reconciliation."""
+"""Idempotent project issue import, local outbox and three-way reconciliation."""
 
 import logging
 import threading
@@ -44,8 +44,10 @@ def publish_task(task):
             return task
         if AppSetting.objects.filter(key=publish_key(task.pk)).exists():
             raise ValidationError({"detail": "Existe um envio sem confirmação para esta tarefa. Verifica o GitLab; a criação não será repetida."})
-        if task.status != Task.Status.TODO or task.owner != Task.Owner.SELF:
-            raise ValidationError({"detail": "Só podes enviar tarefas abertas com responsável Eu."})
+        if task.status != Task.Status.TODO:
+            raise ValidationError({"detail": "Só podes enviar tarefas abertas."})
+        if task.owner == Task.Owner.OTHER and task.gitlab_assignee_id is None:
+            raise ValidationError({"detail": "Escolhe um utilizador GitLab para atribuir este ticket. Um nome escrito fica apenas na app."})
         config = connection()
         if not config.enabled or not gitlab.writes_enabled() or not gitlab.has_token():
             raise ValidationError({"detail": "Ativa a sincronização e a escrita e configura o token GitLab."})
@@ -56,6 +58,10 @@ def publish_task(task):
         project = client.project()
         config.user_id, config.username, config.project_id = user["id"], user["username"], project["id"]
         config.save(update_fields=["user_id", "username", "project_id"])
+        assignee_id = config.user_id if task.owner == Task.Owner.SELF else task.gitlab_assignee_id
+        if assignee_id is not None and assignee_id != config.user_id:
+            if not any(item["id"] == assignee_id for item in client.members(config.project_id)):
+                raise ValidationError({"detail": "O responsável escolhido já não está disponível neste projeto GitLab."})
         available = sync_labels(config, client)
         names = set(task.tags.values_list("name", flat=True))
         missing = sorted(names - set(available))
@@ -67,7 +73,7 @@ def publish_task(task):
             raise ValidationError({"detail": "A API GitLab não permite enviar labels com vírgulas."})
         reservation = AppSetting.objects.create(key=publish_key(task.pk), value={"state": "sending", "project_id": config.project_id})
         try:
-            issue = client.create_task(task, config.project_id, config.user_id, names)
+            issue = client.create_task(task, config.project_id, assignee_id, names)
         except gitlab.GitLabCreateUncertain:
             reservation.value = {"state": "uncertain", "project_id": config.project_id}
             reservation.save(update_fields=["value"])
@@ -91,6 +97,9 @@ def publish_task(task):
 def state_of(issue):
     values = {"title": issue["title"], "description": issue.get("description") or "",
               "state": issue["state"], "labels": sorted(issue.get("labels", []))}
+    values["assignees"] = [{"id": person["id"], "name": person.get("name") or person.get("username") or f'#{person["id"]}',
+                            "username": person.get("username", "")}
+                           for person in issue.get("assignees", [])]
     # Spent time is additive; only the estimate participates in scalar conflicts.
     total = (issue.get("time_stats") or {}).get("total_time_spent", 0)
     values["total_time_spent"] = total if type(total) is int and total >= 0 else 0
@@ -223,7 +232,14 @@ def apply_state(task, values, label_ids):
     done = values["state"] == "closed"
     was_done = task.status == Task.Status.DONE
     task.status = Task.Status.DONE if done else Task.Status.TODO
-    task.owner = Task.Owner.SELF
+    if "assignees" in values:
+        # Keep every assignee in the snapshot; the task fields summarize ownership.
+        people = values["assignees"]
+        user_id = task.gitlab.connection.user_id
+        mine = any(person["id"] == user_id for person in people)
+        task.owner = Task.Owner.SELF if mine else Task.Owner.OTHER if people else Task.Owner.UNKNOWN
+        task.owner_name = ", ".join(person["name"] for person in people)[:120] if people and not mine else ""
+        task.gitlab_assignee_id = (user_id if mine else people[0]["id"]) if people else None
     if done and not was_done:
         task.completed_at = timezone.now()
     elif not done:
@@ -288,25 +304,19 @@ def synchronize(*, send_updates=None):
             labels = sync_labels(config, client)
             if not check_enabled(config):
                 return {"disabled": True}
-            issues = list(client.pages(f"/projects/{config.project_id}/issues", scope="all",
-                                      assignee_id=config.user_id, state="all"))
+            issues = list(client.pages(f"/projects/{config.project_id}/issues", scope="all", state="all"))
             seen, imported = set(), 0
             for issue in issues:
                 if not check_enabled(config):
                     return {"disabled": True}
-                if not any(person["id"] == config.user_id for person in issue.get("assignees", [])):
-                    continue
                 link = GitLabTask.objects.filter(connection=config, project_id=config.project_id, issue_iid=issue["iid"]).first()
-                # Closed history is imported only for tasks already managed by this app.
-                if link is None and issue["state"] != "opened":
-                    continue
                 for name in issue.get("labels", []):
                     if name not in labels:
                         labels[name] = Tag.objects.get_or_create(name=name)[0].pk
                 remote = remote_state(issue, link, client)
                 with transaction.atomic():
                     if link is None:
-                        task = Task.objects.create(title=issue["title"], owner=Task.Owner.SELF, creation_source=Task.CreationSource.GITLAB)
+                        task = Task.objects.create(title=issue["title"], creation_source=Task.CreationSource.GITLAB)
                         created = parse_datetime(issue.get("created_at") or "")
                         if created:
                             task.created_at = created
@@ -358,7 +368,7 @@ def synchronize(*, send_updates=None):
                         link.error = str(exc)
                         link.save(update_fields=["error"])
                         failed += 1
-            # Missing assignments suspend edits, never delete personal records.
+            # Issues no longer visible to the token suspend edits without deleting records.
             GitLabTask.objects.filter(connection=config).exclude(pk__in=seen).update(active=False)
             config.last_sync_at = timezone.now()
             config.error = (
@@ -398,13 +408,9 @@ def resolve_conflicts(link, choice):
 
 
 def push_pending(link, config, client, labels):
-    """Recheck assignment and conflicts before emitting permitted field deltas."""
+    """Recheck remote visibility and conflicts before emitting permitted field deltas."""
     retain_local_start_date(link)
     latest = client.get(f"/projects/{link.project_id}/issues/{link.issue_iid}")
-    if not any(person["id"] == config.user_id for person in latest.get("assignees", [])):
-        link.active = False
-        link.save(update_fields=["active"])
-        return
     remote = remote_state(latest, link, client)
     merged, pending, conflicts = merge_states(link.snapshot, link.pending, remote, link.conflicts)
     for name in merged["labels"]:
@@ -450,9 +456,7 @@ def push_time_entries(link, config, client):
         raise gitlab.GitLabError("Há um envio de tempo por confirmar nesta tarefa. Verifica o GitLab; o tempo não será enviado novamente.")
     latest = client.get(f"/projects/{link.project_id}/issues/{link.issue_iid}")
     if not any(person["id"] == config.user_id for person in latest.get("assignees", [])):
-        link.active = False
-        link.save(update_fields=["active"])
-        return 0
+        raise gitlab.GitLabError("Só podes enviar tempo para tarefas atribuídas a ti no GitLab.")
     if state_of(latest)["estimate_seconds"] <= 0:
         raise gitlab.GitLabError("Define e sincroniza uma estimativa antes de enviar tempo ao GitLab.")
     sent = 0

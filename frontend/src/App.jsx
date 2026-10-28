@@ -64,6 +64,21 @@ function compareTasks(left, right, order = "default") {
 
 function Spinner() { return <span className="spinner" aria-hidden="true" />; }
 
+// Free-text owners stay local; GitLab choices carry a stable member ID.
+function TaskOwnerPicker({ value, onChange, members, disabled, label = "Responsável da tarefa" }) {
+  const selected = value.gitlab_assignee_id ? `gitlab:${value.gitlab_assignee_id}` : value.owner;
+  const people = members.filter((person) => !person.is_self);
+  return <label className="task-owner-picker">Responsável<Select aria-label={label} value={selected} disabled={disabled} onChange={(event) => {
+    const choice = event.target.value;
+    const person = choice.startsWith("gitlab:") ? people.find((item) => item.id === Number(choice.slice(7))) : null;
+    onChange(person ? { owner: "other", owner_name: person.name, gitlab_assignee_id: person.id }
+      : { owner: choice, owner_name: "", gitlab_assignee_id: null });
+  }}><option value="self">Eu</option><option value="other">Outro interveniente — escrever nome</option><option value="unknown">Sem responsável</option>
+    {value.gitlab_assignee_id && !people.some((item) => item.id === value.gitlab_assignee_id) && <option value={selected}>{value.owner_name || `#${value.gitlab_assignee_id}`} (GitLab)</option>}
+    {people.map((person) => <option key={person.id} value={`gitlab:${person.id}`}>{person.name} (@{person.username})</option>)}
+  </Select>{value.owner === "other" && !value.gitlab_assignee_id && <input aria-label="Nome do responsável" disabled={disabled} maxLength={120} value={value.owner_name} onChange={(event) => onChange({ ...value, owner_name: event.target.value })} placeholder="Nome do responsável" required/>}</label>;
+}
+
 function AutoSizeTextarea({ value, ...props }) {
   const input = useRef(null);
   // Measure rendered lines so both explicit breaks and wrapped text fit.
@@ -298,24 +313,67 @@ function TaskDescription({ text }) {
 // Comments are sent only by this form; drafts remain available after failures.
 function GitLabTaskComment({ task, gitlabStatus, onError, disabled }) {
   const [body, setBody] = useState(""), [sending, setSending] = useState(false), [result, setResult] = useState("");
+  const [attachments, setAttachments] = useState([]), [draggingFiles, setDraggingFiles] = useState(false);
+  const fileInput = useRef(null), attachmentSequence = useRef(0);
   const submitting = useRef(false);
   const reason = !task.gitlab.active || task.gitlab.hidden ? "Esta tarefa não está disponível para comentários."
     : !gitlabStatus?.enabled || gitlabStatus.read_only || !gitlabStatus.has_token ? "Ativa a sincronização e a escrita e configura o token GitLab." : "";
+  const blocked = sending || disabled || Boolean(reason);
+  const isFileDrag = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
+  // Selecting files only changes the draft; remote uploads begin on Enviar.
+  const addFiles = (files) => {
+    if (submitting.current || disabled || reason) return;
+    const additions = Array.from(files).map((file) => ({ id: ++attachmentSequence.current, file, markdown: null }));
+    setAttachments((current) => [...current, ...additions]); setResult("");
+  };
   const submit = async (event) => {
     event.preventDefault();
-    if (submitting.current || disabled || reason || !body.trim()) return;
-    submitting.current = true; setSending(true); setResult("");
+    if (submitting.current || disabled || reason || (!body.trim() && !attachments.length)) return;
+    submitting.current = true; setSending(true); setDraggingFiles(false); setResult("");
     try {
-      await api(`/tasks/${task.id}/comments/`, { method: "POST", body: JSON.stringify({ body: body.trim() }) });
-      setBody(""); setResult("Comentário enviado para o GitLab.");
+      const links = [];
+      for (const attachment of attachments) {
+        let markdown = attachment.markdown;
+        if (!markdown) {
+          setResult(`A enviar ${attachment.file.name}…`);
+          const form = new FormData(); form.append("file", attachment.file);
+          const uploaded = await api(`/tasks/${task.id}/comment-uploads/`, { method: "POST", body: form });
+          if (typeof uploaded?.markdown !== "string" || !uploaded.markdown.trim()) throw new Error("O GitLab não confirmou o link do ficheiro. Verifica o upload antes de tentar novamente.");
+          markdown = uploaded.markdown;
+          // Keep acknowledged links if a later upload or the comment fails.
+          setAttachments((current) => current.map((item) => item.id === attachment.id ? { ...item, markdown } : item));
+        }
+        links.push(markdown);
+      }
+      const comment = [body.trim(), ...links].filter(Boolean).join("\n\n");
+      if (comment.length > 100000) throw new Error("O comentário com os anexos excede 100000 caracteres. Reduz o texto ou o número de anexos.");
+      setResult("A enviar comentário…");
+      await api(`/tasks/${task.id}/comments/`, { method: "POST", body: JSON.stringify({ body: comment }) });
+      setBody(""); setAttachments([]); setResult("Comentário enviado para o GitLab.");
     } catch (error) { setResult(error.message); onError(error.message); }
     finally { submitting.current = false; setSending(false); }
   };
   return <details className="task-comment"><summary>Comentar no GitLab</summary>
     <form onSubmit={submit}>
-      <textarea aria-label={`Comentário para o GitLab: ${task.title}`} placeholder="Escreve um comentário…" rows={3} maxLength={100000} value={body} disabled={sending || disabled || Boolean(reason)} onChange={(event) => { setBody(event.target.value); setResult(""); }}/>
+      <div className={`comment-dropzone ${draggingFiles ? "is-dragging" : ""}`} onDragEnter={(event) => {
+        if (!isFileDrag(event)) return;
+        event.preventDefault(); event.stopPropagation(); if (!blocked) setDraggingFiles(true);
+      }} onDragOver={(event) => {
+        if (!isFileDrag(event)) return;
+        event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = blocked ? "none" : "copy";
+      }} onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setDraggingFiles(false);
+      }} onDrop={(event) => {
+        if (!isFileDrag(event) && !event.dataTransfer?.files?.length) return;
+        event.preventDefault(); event.stopPropagation(); setDraggingFiles(false); addFiles(event.dataTransfer.files);
+      }}>
+        <textarea aria-label={`Comentário para o GitLab: ${task.title}`} placeholder="Escreve um comentário ou arrasta ficheiros para aqui…" rows={3} maxLength={100000} value={body} disabled={blocked} onChange={(event) => { setBody(event.target.value); setResult(""); }}/>
+        <div className="comment-attachment-controls"><small>{draggingFiles ? "Larga os ficheiros para anexar" : "Arrasta ficheiros para aqui ou seleciona-os. Serão enviados ao carregar em Enviar."}</small><button type="button" className="text-button" disabled={blocked} onClick={() => fileInput.current?.click()}>Anexar ficheiros</button></div>
+        <input ref={fileInput} type="file" multiple hidden disabled={blocked} aria-label="Ficheiros para o comentário GitLab" onChange={(event) => { addFiles(event.target.files); event.target.value = ""; }}/>
+        {attachments.length > 0 && <ul className="comment-attachments" aria-label="Anexos do comentário">{attachments.map((attachment) => <li key={attachment.id}><span>{attachment.file.name}<small>{attachment.markdown ? "Upload confirmado" : "Por enviar"}</small></span><button type="button" className="text-button" aria-label={`Remover anexo ${attachment.file.name}`} disabled={blocked} onClick={() => { setAttachments((current) => current.filter((item) => item.id !== attachment.id)); setResult(""); }}>Remover</button></li>)}</ul>}
+      </div>
       {reason && <small>{reason}</small>}
-      <button type="submit" className="primary-action" disabled={sending || disabled || Boolean(reason) || !body.trim()}>{sending && <Spinner/>}{sending ? "A enviar…" : "Enviar"}</button>
+      <button type="submit" className="primary-action" disabled={blocked || (!body.trim() && !attachments.length)}>{sending && <Spinner/>}{sending ? "A enviar…" : "Enviar"}</button>
       {result && <small role="status">{result}</small>}
     </form>
   </details>;
@@ -326,6 +384,23 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const formId = showSections ? "new-task-form" : `new-task-${localFormId}`;
   const [title, setTitle] = useState(""), [description, setDescription] = useState("");
   const [newSession, setNewSession] = useState(defaultSession || "");
+  const [newOwner, setNewOwner] = useState({ owner: "self", owner_name: "", gitlab_assignee_id: null });
+  const [ownerFilter, setOwnerFilter] = useState("all");
+  const [members, setMembers] = useState([]), [membersLoading, setMembersLoading] = useState(false);
+  const [membersError, setMembersError] = useState(""), [membersRetry, setMembersRetry] = useState(0);
+  // Refresh the live catalogue when the connection changes; discard stale replies.
+  useEffect(() => {
+    let cancelled = false;
+    setMembers([]); setMembersError(""); setMembersLoading(false);
+    if (!gitlabStatus?.enabled || !gitlabStatus?.has_token) return;
+    setMembersLoading(true);
+    api("/gitlab/members/").then((items) => {
+      if (!Array.isArray(items)) throw new Error("Resposta inválida ao consultar pessoas do GitLab.");
+      if (!cancelled) setMembers(items);
+    }).catch((error) => { if (!cancelled) setMembersError(error.message); })
+      .finally(() => { if (!cancelled) setMembersLoading(false); });
+    return () => { cancelled = true; };
+  }, [gitlabStatus?.enabled, gitlabStatus?.has_token, gitlabStatus?.project_id, membersRetry]);
   const [sectionName, setSectionName] = useState(""), [columnTag, setColumnTag] = useState("");
   const [localCreateOpen, setLocalCreateOpen] = useState(false), [layout, setLayout] = useState(() => localStorage.getItem("taskLayout") || "list");
   // The Tarefas page controls creation from its global filter row; other usages stay local.
@@ -372,8 +447,8 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const createTask = async (event) => {
     event.preventDefault();
     if (!title.trim()) return;
-    const saved = await run("new", () => api("/tasks/", { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim(), owner: "self", status: "todo", session: newSession ? Number(newSession) : null }) }));
-    if (saved) { setTitle(""); setDescription(""); setShowCreate(false); }
+    const saved = await run("new", () => api("/tasks/", { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim(), ...newOwner, status: "todo", session: newSession ? Number(newSession) : null }) }));
+    if (saved) { setTitle(""); setDescription(""); setNewOwner({ owner: "self", owner_name: "", gitlab_assignee_id: null }); setShowCreate(false); }
   };
   // Persist section changes through the same API/refresh flow as task edits.
   const createSection = async (event) => {
@@ -427,6 +502,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     const initialEstimate = task.estimate_seconds ? formatTrackedTime(task.estimate_seconds) : "";
     const initialMinutes = task.reminder_minutes_before ?? 15;
     setEditingTask({ id: task.id, title: task.title, description: task.description || "", owner: task.owner, owner_name: task.owner_name || "",
+      gitlab_assignee_id: task.gitlab_assignee_id ?? null,
       gitlabLinked: Boolean(task.gitlab), milestone_id: task.gitlab?.milestone?.id ?? null,
       tags: [...(task.tags || [])], session: task.session ?? null,
       original: { milestone_id: task.gitlab?.milestone?.id ?? null, dueAt: initialDueAt, minutesBefore: initialMinutes, estimateDuration: initialEstimate, estimateSeconds: task.estimate_seconds || 0, tags: [...(task.tags || [])], session: task.session ?? null } });
@@ -439,6 +515,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     const original = editingTask.original;
     const changes = { title: editingTask.title.trim(), description: editingTask.description.trim(), owner: editingTask.owner,
       owner_name: editingTask.owner === "other" ? editingTask.owner_name.trim() : "" };
+    if (!editingTask.gitlabLinked) changes.gitlab_assignee_id = editingTask.gitlab_assignee_id;
     let estimate = original.estimateSeconds;
     if (estimateDuration.trim() !== original.estimateDuration) {
       estimate = parseGitLabDuration(estimateDuration);
@@ -474,7 +551,21 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   };
   // Search narrows the existing status/owner view before sorting.
   const searchTerm = taskSearch.trim().toLocaleLowerCase("pt-PT");
+  // Include imported assignees even when they have left the current member catalogue.
+  const ownerOptions = new Map(members.map((person) => [`gitlab:${person.id}`, `${person.name} (@${person.username})`]));
+  for (const task of tasks) {
+    for (const person of task.gitlab?.assignees || []) ownerOptions.set(`gitlab:${person.id}`, person.username ? `${person.name} (@${person.username})` : person.name);
+    if (task.gitlab_assignee_id && !ownerOptions.has(`gitlab:${task.gitlab_assignee_id}`)) ownerOptions.set(`gitlab:${task.gitlab_assignee_id}`, task.owner_name || `#${task.gitlab_assignee_id}`);
+    if (task.owner === "other" && !task.gitlab_assignee_id && !task.gitlab && task.owner_name) ownerOptions.set(`name:${task.owner_name}`, task.owner_name);
+  }
   const visible = tasks.filter((task) => {
+    if (ownerFilter === "self" && task.owner !== "self") return false;
+    if (ownerFilter === "none" && task.owner !== "unknown") return false;
+    if (ownerFilter.startsWith("gitlab:")) {
+      const id = Number(ownerFilter.slice(7));
+      if (task.gitlab_assignee_id !== id && !task.gitlab?.assignees?.some((person) => person.id === id)) return false;
+    }
+    if (ownerFilter.startsWith("name:") && (task.gitlab || task.gitlab_assignee_id || task.owner !== "other" || task.owner_name !== ownerFilter.slice(5))) return false;
     if (searchTerm && !`${task.title}\n${task.description || ""}`.toLocaleLowerCase("pt-PT").includes(searchTerm)) return false;
     if (filter === "all") return true;
     if (filter === "done") return task.status === "done";
@@ -514,7 +605,8 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const publishDisabledReason = (task) => {
     if (task.gitlab_export) return "Envio sem confirmação. Verifica o GitLab; a criação não será repetida.";
     if (editingTask?.id === task.id) return "Guarda a edição antes de enviar o ticket.";
-    if (task.status !== "todo" || task.owner !== "self") return "Só podes enviar tarefas abertas com responsável Eu.";
+    if (task.status !== "todo") return "Só podes enviar tarefas abertas.";
+    if (task.owner === "other" && !task.gitlab_assignee_id) return "Escolhe um utilizador GitLab para atribuir este ticket. Um nome escrito fica apenas na app.";
     if (!gitlabStatus?.enabled || gitlabStatus.read_only || !gitlabStatus.has_token) return "Ativa a sincronização e a escrita e configura o token GitLab.";
     const assigned = tags.filter((tag) => task.tags?.includes(tag.id));
     const invalid = (task.tags || []).filter((id) => !gitlabStatus.available_tag_ids?.includes(id));
@@ -532,11 +624,11 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     });
   };
   // Targets override filters and folded groups so notification navigation is visible.
-  useEffect(() => { if (targetId) { setFilter("all"); setTaskSearch(""); } }, [targetId, targetKey]);
+  useEffect(() => { if (targetId) { setFilter("all"); setTaskSearch(""); setOwnerFilter("all"); } }, [targetId, targetKey]);
   // A source click scrolls once after the target is visible; polling must not pull the user back.
   useEffect(() => { scrolledTarget.current = null; }, [targetId, targetKey]);
   useEffect(() => {
-    if (!targetId || filter !== "all" || taskSearch || scrolledTarget.current) return;
+    if (!targetId || filter !== "all" || taskSearch || ownerFilter !== "all" || scrolledTarget.current) return;
     const frame = requestAnimationFrame(() => {
       const card = document.querySelector(`[data-task-id="${targetId}"]`);
       if (!card) return;
@@ -544,7 +636,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
       scrolledTarget.current = { id: targetId, key: targetKey };
     });
     return () => cancelAnimationFrame(frame);
-  }, [targetId, targetKey, tasks, filter, taskSearch]);
+  }, [targetId, targetKey, tasks, filter, taskSearch, ownerFilter]);
   const renderTask = (task, column = null, boardDetail = false) => {
         const overdue = task.status !== "done" && task.due_at && new Date(task.due_at).getTime() < Date.now();
         const reminderFired = task.status !== "done" && task.reminder_status === "notified";
@@ -613,7 +705,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
             {task.time_tracking?.uncertain_seconds > 0 && <small className="task-time-uncertain" role="alert">Envio de {formatTrackedTime(task.time_tracking.uncertain_seconds)} por confirmar. Verifica o GitLab.</small>}
           </div>
           <div className={`task-meta task-details ${isEditing ? "editing" : ""}`}>
-            {isEditing && !task.gitlab ? <><Select aria-label="Responsável da tarefa" disabled={Boolean(busy)} value={editingTask.owner} onChange={(event) => setEditingTask({ ...editingTask, owner: event.target.value })}><option value="self">Eu</option><option value="other">Outro interveniente</option><option value="unknown">Por definir</option></Select>{editingTask.owner === "other" && <input value={editingTask.owner_name} onChange={(event) => setEditingTask({ ...editingTask, owner_name: event.target.value })} placeholder="Nome do responsável"/>}</> : <span className={task.gitlab ? "task-owner-fixed" : undefined} title={task.gitlab ? "Responsável gerido no GitLab" : undefined}>{task.gitlab || task.owner === "self" ? "Eu" : task.owner_name || "Outro interveniente"}</span>}
+            {isEditing && !task.gitlab ? <TaskOwnerPicker value={editingTask} onChange={(changes) => setEditingTask((current) => ({ ...current, ...changes }))} members={members} disabled={Boolean(busy)}/> : <span className={task.gitlab ? "task-owner-fixed" : undefined} title={task.gitlab ? "Responsável gerido no GitLab" : undefined}>{task.gitlab?.assignees?.length ? task.gitlab.assignees.map((person) => person.name).join(", ") : task.owner === "self" ? "Eu" : task.owner_name || "Sem responsável"}</span>}
             {!isEditing && <span>· Criada a {new Date(task.created_at).toLocaleString()} {task.creation_source === "gitlab" ? "no GitLab" : task.creation_source === "system" ? "pelo Sistema" : "por ti"}</span>}
             {task.due_at && <span>· Limite: {new Date(task.due_at).toLocaleString()}</span>}
             {task.gitlab?.start_date && <span>· Início: {formatCalendarDate(task.gitlab.start_date)}</span>}
@@ -673,6 +765,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     <div className="task-filter-row"><div className="filters">{[["todo", "A fazer"], ["mine", "Minhas tarefas"], ["others", "Pendentes de outros intervenientes"], ["done", "Concluídas"], ["all", "Todas"]].map(([value, label]) => <button type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div>{showSections && <div className="view-switch" aria-label="Apresentação das tarefas">{[["list", "Lista"], ["board", "Quadro"]].map(([value, text]) => <button type="button" key={value} aria-pressed={layout === value} className={layout === value ? "active" : ""} onClick={() => { setLayout(value); localStorage.setItem("taskLayout", value); }}>{text}</button>)}</div>}{!settingsFilters && (showSections || compactCreate) && !onCreateOpenChange && <TaskCreateButton formId={formId} open={showCreate} onClick={() => setShowCreate((value) => !value)}/>}</div>
     <div className="task-search-filters">
       <label className="task-search-field">Pesquisar tarefas<input type="search" placeholder="Pesquisar no título ou descrição…" value={taskSearch} onChange={(event) => setTaskSearch(event.target.value)}/></label>
+      <label>Responsável<Select aria-label="Filtrar tarefas por responsável" value={ownerFilter} onChange={(event) => setOwnerFilter(event.target.value)}><option value="all">Todos</option><option value="self">Eu</option><option value="none">Sem responsável</option>{[...ownerOptions].sort((a, b) => a[1].localeCompare(b[1], "pt-PT")).map(([id, name]) => <option key={id} value={id}>{name}</option>)}</Select></label>
       <label>Ordenar por<Select value={taskOrder} onChange={(event) => setTaskOrder(event.target.value)}><option value="default">Predefinido</option><option value="created-asc">Data de criação: crescente</option><option value="created-desc">Data de criação: decrescente</option><option value="due-asc">Data limite: crescente</option><option value="due-desc">Data limite: decrescente</option></Select></label>
       {taskSelectionControl}
     </div>
@@ -691,7 +784,9 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
       {labelViewControls}
     </Popup><TaskCreateButton formId={formId} open={showCreate} onClick={() => setShowCreate((value) => !value)}/></div>}
     {actionResult && <p className="task-action-result" role="status">{actionResult}</p>}
-    {((!showSections && !compactCreate) || showCreate) && <form id={formId} className="quick-task" onSubmit={createTask}><input aria-label="Título da nova tarefa" autoFocus={showSections || compactCreate} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><AutoSizeTextarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><label className="new-task-meeting">Reunião<Select aria-label="Reunião da nova tarefa" disabled={Boolean(busy) || Boolean(defaultSession)} value={newSession} onChange={(event) => setNewSession(event.target.value)}><option value="">Sem reunião</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title || "Reunião sem título"}</option>)}</Select></label><button disabled={Boolean(busy) || !title.trim()}>{busy === "new" && <Spinner/>}Adicionar</button>{(showSections || compactCreate) && <button type="button" className="secondary" onClick={() => setShowCreate(false)}>Cancelar</button>}</form>}
+    {((!showSections && !compactCreate) || showCreate) && <form id={formId} className="quick-task" onSubmit={createTask}><input aria-label="Título da nova tarefa" autoFocus={showSections || compactCreate} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><AutoSizeTextarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><label className="new-task-meeting">Reunião<Select aria-label="Reunião da nova tarefa" disabled={Boolean(busy) || Boolean(defaultSession)} value={newSession} onChange={(event) => setNewSession(event.target.value)}><option value="">Sem reunião</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title || "Reunião sem título"}</option>)}</Select></label><TaskOwnerPicker label="Responsável da nova tarefa" value={newOwner} onChange={setNewOwner} members={members} disabled={Boolean(busy)}/><button disabled={Boolean(busy) || !title.trim()}>{busy === "new" && <Spinner/>}Adicionar</button>{(showSections || compactCreate) && <button type="button" className="secondary" onClick={() => setShowCreate(false)}>Cancelar</button>}</form>}
+    {membersLoading && <small role="status">A consultar pessoas do GitLab…</small>}
+    {membersError && <div role="alert">Não foi possível consultar pessoas do GitLab: {membersError} <button type="button" disabled={Boolean(busy)} onClick={() => setMembersRetry((value) => value + 1)}>Tentar novamente</button></div>}
     {taskFilterControls}
     {!settingsFilters && labelViewControls}
     {today ? <div className="today-groups">{["Atrasadas", "Hoje", "Próximos sete dias", "Sem prazo"].map((group) => {
