@@ -296,11 +296,11 @@ function sendTrayCommand(action) {
 }
 
 function createTray() {
-  // Prefer the PNG for resizing, with the Windows icon as a checked fallback.
-  let image = nativeImage.createFromPath(appIcon("png"));
-  if (image.isEmpty()) image = nativeImage.createFromPath(appIcon());
-  if (image.isEmpty()) throw new Error("Não foi possível carregar o ícone da bandeja.");
-  const icon = image.resize({ width: 16, height: 16 });
+  // Pass the multi-resolution ICO path to Windows instead of flattening it to 16px.
+  const windowsIcon = appIcon();
+  const useWindowsIcon = process.platform === "win32" && !nativeImage.createFromPath(windowsIcon).isEmpty();
+  const icon = useWindowsIcon ? windowsIcon : nativeImage.createFromPath(appIcon("png"));
+  if (!useWindowsIcon && icon.isEmpty()) throw new Error("Não foi possível carregar o ícone da bandeja.");
   tray = new Tray(icon);
   tray.setToolTip(appDisplayName);
   const rebuild = () => tray.setContextMenu(Menu.buildFromTemplate([
