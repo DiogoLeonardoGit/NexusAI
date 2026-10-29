@@ -45,6 +45,7 @@ class MeetingDetector {
     const child = spawn(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     this.child = child;
     let lastSample = Date.now();
+    let consecutiveQueryErrors = 0;
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => {
       if (this.child !== child) return;
@@ -53,7 +54,13 @@ class MeetingDetector {
         if (!Array.isArray(sample.calls)) throw new Error("Invalid detector response");
         lastSample = Date.now();
         // Unknown observations never rearm a manually stopped meeting.
-        if (sample.error) { this.publish("Não foi possível consultar as chamadas Teams/Webex. A deteção voltará a tentar."); return; }
+        if (sample.error) {
+          // Retry transient failures silently, preserving the last confirmed calls.
+          consecutiveQueryErrors += 1;
+          if (consecutiveQueryErrors >= 3) this.publish("Não foi possível consultar as chamadas Teams/Webex. A deteção voltará a tentar.");
+          return;
+        }
+        consecutiveQueryErrors = 0;
         const calls = sample.calls.filter((call) => ["teams", "webex"].includes(call.id));
         const present = new Set(calls.map((call) => call.id));
         for (const call of calls) {

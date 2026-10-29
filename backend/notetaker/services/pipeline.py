@@ -29,7 +29,7 @@ from .ollama import (
     ACTIVE_LISTENING_SYSTEM_PROMPT, EXTRACTION_SYSTEM_PROMPT, MEETING_ANALYSIS_SYSTEM_PROMPT,
     SUMMARY_SYSTEM_PROMPT, OllamaError, generate_json,
 )
-from .transcription import detect_language, transcribe
+from .transcription import detect_language, is_header_only_webm, transcribe
 
 
 logger = logging.getLogger(__name__)
@@ -272,6 +272,14 @@ def process_transcription_job(job: ProcessingJob):
     """Transcribe without holding a SQLite write transaction during inference."""
     _ensure_job_active(job.pk)
     chunk = AudioChunk.objects.get(pk=job.chunk_id)
+    if is_header_only_webm(chunk.file_path):
+        # A recorder header contains no audio to transcribe or language to detect.
+        with transaction.atomic():
+            _ensure_job_active(job.pk)
+            AudioChunk.objects.filter(pk=chunk.pk).update(
+                status=AudioChunk.Status.COMPLETE, error="",
+            )
+        return
     chunk.status = AudioChunk.Status.PROCESSING
     chunk.save(update_fields=["status"])
 

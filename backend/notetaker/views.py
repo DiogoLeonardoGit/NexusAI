@@ -271,10 +271,36 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def retry_processing(self, request, pk=None):
+        """Retry failed audio first without replacing completed transcript segments."""
         session = self.get_object()
-        if session.audio_chunks.exclude(status=AudioChunk.Status.COMPLETE).exists():
+        with transaction.atomic():
+            failed_chunks = list(session.audio_chunks.select_for_update().filter(
+                status=AudioChunk.Status.FAILED,
+            ))
+            if failed_chunks:
+                if any(not chunk.file_path or not Path(chunk.file_path).is_file() for chunk in failed_chunks):
+                    return Response(
+                        {"detail": "Não é possível repetir a transcrição: faltam ficheiros de áudio."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                created = []
+                for chunk in failed_chunks:
+                    job, _ = ProcessingJob.objects.get_or_create(
+                        kind=ProcessingJob.Kind.TRANSCRIBE,
+                        session=session,
+                        chunk=chunk,
+                        status=ProcessingJob.Status.PENDING,
+                    )
+                    chunk.status = AudioChunk.Status.PENDING
+                    chunk.error = ""
+                    chunk.save(update_fields=["status", "error"])
+                    created.append(job.id)
+                # Post-processing can be requested once these observations finish.
+                return Response({"job_ids": created}, status=status.HTTP_202_ACCEPTED)
+        transcription_error = self._transcription_error(session)
+        if transcription_error:
             return Response(
-                {"detail": "A transcrição ainda não terminou."},
+                {"detail": transcription_error},
                 status=status.HTTP_409_CONFLICT,
             )
         phases = [
@@ -310,13 +336,25 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
                 created.append(ProcessingJob.objects.create(kind=kind, session=session).id)
         return Response({"job_ids": created}, status=status.HTTP_202_ACCEPTED)
 
+    def _transcription_error(self, session):
+        """Distinguish active transcription from terminal failures and cancellation."""
+        chunks = session.audio_chunks
+        if chunks.filter(status__in=[AudioChunk.Status.PENDING, AudioChunk.Status.PROCESSING]).exists():
+            return "A transcrição ainda não terminou."
+        if chunks.filter(status=AudioChunk.Status.FAILED).exists():
+            return "A transcrição de parte do áudio falhou. Usa Repetir para tentar recuperar."
+        if chunks.filter(status=AudioChunk.Status.CANCELLED).exists():
+            return "A transcrição foi cancelada. Volta a transcrever antes de continuar."
+        return ""
+
     @action(detail=True, methods=["post"])
     def regenerate_summary(self, request, pk=None):
         """Queue only a replacement meeting summary, preserving all other processing."""
         session = self.get_object()
-        if session.audio_chunks.exclude(status=AudioChunk.Status.COMPLETE).exists():
+        transcription_error = self._transcription_error(session)
+        if transcription_error:
             return Response(
-                {"detail": "A transcrição ainda não terminou."},
+                {"detail": transcription_error},
                 status=status.HTTP_409_CONFLICT,
             )
         if ProcessingJob.objects.filter(
@@ -337,9 +375,10 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def regenerate_tasks(self, request, pk=None):
         session = self.get_object()
-        if session.audio_chunks.exclude(status=AudioChunk.Status.COMPLETE).exists():
+        transcription_error = self._transcription_error(session)
+        if transcription_error:
             return Response(
-                {"detail": "A transcrição ainda não terminou."},
+                {"detail": transcription_error},
                 status=status.HTTP_409_CONFLICT,
             )
         if ProcessingJob.objects.filter(
