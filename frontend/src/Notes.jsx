@@ -16,7 +16,7 @@ function readNoteOrder() {
 }
 
 // One catalogue for existing meeting notes and independent personal notes.
-export default function Notes({ notes, sessions, projects, refresh, onError, onOpenSource, targetId, OrganizationMenu }) {
+export default function Notes({ notes, sessions, projects, refresh, onError, onOpenSource, targetId, OrganizationMenu, AutoSizeTextarea }) {
   const [kind, setKind] = useState("personal"), [query, setQuery] = useState("");
   const [project, setProject] = useState("");
   const [order, setOrder] = useState(readNoteOrder), [dropTarget, setDropTarget] = useState(null);
@@ -85,15 +85,16 @@ export default function Notes({ notes, sessions, projects, refresh, onError, onO
     } catch (error) { onError(error.message); }
     finally { setBusy(false); setDeletingId(null); }
   };
-  // Reuse the fields at the top for creation and inside the selected card for editing.
-  const editor = draft && <form className={draft.id ? "note-editor" : "card note-editor"} onSubmit={save}>
-      <h3>{draft.id ? "Editar nota" : "Nova nota"}</h3>
-      <label>Título <small>(opcional)</small><input maxLength={240} disabled={busy} value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })}/></label>
-      <label>Conteúdo<textarea required disabled={busy} value={draft.body} onChange={(event) => setDraft({ ...draft, body: event.target.value })} rows={6}/></label>
-      <div className="notes-filters">
+  // Creation and inline editing share the same optional associations.
+  const associationFields = draft && <div className="notes-filters">
         <label>Reunião<Select disabled={busy} value={draft.session || ""} onChange={(event) => setDraft({ ...draft, session: event.target.value })}><option value="">Sem reunião — nota pessoal</option>{sessions.map((item) => <option key={item.id} value={item.id}>{item.title || "Reunião sem título"}</option>)}</Select></label>
         <label>Projeto<Select disabled={busy} value={draft.project || ""} onChange={(event) => setDraft({ ...draft, project: event.target.value })}><option value="">{draft.session ? "Da reunião" : "Sem projeto"}</option>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</Select></label>
-      </div>
+      </div>;
+  const editor = draft && !draft.id && <form className="card note-editor" onSubmit={save}>
+      <h3>Nova nota</h3>
+      <label>Título <small>(opcional)</small><input maxLength={240} disabled={busy} value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })}/></label>
+      <label>Conteúdo<textarea required disabled={busy} value={draft.body} onChange={(event) => setDraft({ ...draft, body: event.target.value })} rows={6}/></label>
+      {associationFields}
       <div className="form-actions"><button className="primary-action" disabled={busy || !draft.body.trim()}>{busy && deletingId === null ? "A guardar…" : "Guardar nota"}</button><button type="button" className="secondary-action" disabled={busy} onClick={() => setDraft(null)}>Cancelar</button></div>
     </form>;
   return <div className="notes-workspace">
@@ -105,23 +106,28 @@ export default function Notes({ notes, sessions, projects, refresh, onError, onO
     {draft && !draft.id && editor}
     <div className="card-list">{visible.map((note) => {
       const meeting = sessions.find((item) => item.id === note.session);
+      const isEditing = draft?.id === note.id;
+      // Keep the card layout during editing, with submission handled by the existing save flow.
+      const Content = isEditing ? "form" : "div";
       return <article className={`card note-card ${dropTarget === note.id ? "note-drop-target" : ""} ${highlight === note.id ? "highlighted-segment" : ""}`} key={note.id} ref={highlight === note.id ? target : null}
         onDragOver={(event) => { if (draggedNote.current == null || busy || draft) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropTarget(note.id); }}
         onDrop={(event) => { event.preventDefault(); moveNote(draggedNote.current, note.id); draggedNote.current = null; setDropTarget(null); }}>
-        {draft?.id === note.id ? editor : <>
+        <Content className={isEditing ? "note-inline-editor" : "note-content"} onSubmit={isEditing ? save : undefined}>
         <div className="projects-heading"><button type="button" className="note-drag-handle" aria-label={`Ordenar nota ${note.title || "sem título"}`} title="Arrastar para ordenar; usar as setas para mover" disabled={busy || Boolean(draft)} draggable={!busy && !draft}
           onDragStart={(event) => { draggedNote.current = note.id; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", String(note.id)); }}
           onDragEnd={() => { draggedNote.current = null; setDropTarget(null); }}
-          onKeyDown={(event) => { const offset = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0; if (!offset) return; event.preventDefault(); const destination = visible[visible.findIndex((item) => item.id === note.id) + offset]; if (destination) moveNote(note.id, destination.id); }}>⠿</button><h3>{note.title || (note.session ? "Nota de reunião" : "Nota pessoal")}</h3><div className="form-actions"><button type="button" className="text-button" disabled={busy} onClick={() => setDraft({ ...note, title: note.title || "" })}>Editar</button><button type="button" className="text-button danger" disabled={busy} onClick={() => deleteNote(note)}>{deletingId === note.id ? "A eliminar…" : "Eliminar"}</button></div></div>
-        <p className="note-body">{note.body}</p>
-        <div className="note-meta"><small>{note.session ? meeting?.title || "Nota de reunião" : "Nota pessoal"} · {new Date(note.updated_at).toLocaleString()}</small>
+          onKeyDown={(event) => { const offset = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : 0; if (!offset) return; event.preventDefault(); const destination = visible[visible.findIndex((item) => item.id === note.id) + offset]; if (destination) moveNote(note.id, destination.id); }}>⠿</button>
+          {isEditing ? <input className="note-title-input" aria-label="Título da nota" maxLength={240} disabled={busy} value={draft.title} placeholder={note.session ? "Nota de reunião" : "Nota pessoal"} onChange={(event) => setDraft({ ...draft, title: event.target.value })}/> : <h3>{note.title || (note.session ? "Nota de reunião" : "Nota pessoal")}</h3>}
+          <div className="form-actions">{isEditing ? <><button type="submit" className="text-button" disabled={busy || !draft.body.trim()}>{busy ? "A guardar…" : "Concluir"}</button><button type="button" className="text-button secondary-text" disabled={busy} onClick={() => setDraft(null)}>Cancelar</button></> : <><button type="button" className="text-button" disabled={busy} onClick={() => setDraft({ ...note, title: note.title || "" })}>Editar</button><button type="button" className="text-button danger" disabled={busy} onClick={() => deleteNote(note)}>{deletingId === note.id ? "A eliminar…" : "Eliminar"}</button></>}</div></div>
+        {isEditing ? <AutoSizeTextarea className="note-body note-body-input" aria-label="Conteúdo da nota" required disabled={busy} value={draft.body} onChange={(event) => setDraft({ ...draft, body: event.target.value })}/> : <p className="note-body">{note.body}</p>}
+        {isEditing ? associationFields : <div className="note-meta"><small>{note.session ? meeting?.title || "Nota de reunião" : "Nota pessoal"} · {new Date(note.updated_at).toLocaleString()}</small>
           {note.session && <button type="button" className="text-button" onClick={() => onOpenSource({ kind: "note", object_id: note.id, meeting_id: note.session })}>Ver na reunião</button>}
           <OrganizationMenu item={note} sessions={sessions} projects={projects} onSave={async (changes) => {
             try { await api(`/notes/${note.id}/`, { method: "PATCH", body: JSON.stringify(changes) }); await refresh(); }
             catch (error) { onError(error.message); }
           }}/>
-        </div>
-        </>}
+        </div>}
+        </Content>
       </article>;
     })}</div>
     {!visible.length && <div className="empty">Não há notas para mostrar.</div>}

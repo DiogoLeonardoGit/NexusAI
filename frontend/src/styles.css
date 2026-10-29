@@ -134,6 +134,14 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 .task-description.is-clamped { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 10; overflow: hidden; }
 .task-description-preview > button { margin-bottom: 6px; }
 .task-comment { margin: 8px 0; }
+/* Remote comments form a chronological thread above the composer. */
+.gitlab-comment-history { margin: 12px 0; font-size: 13px; color: #cbd4df; }
+.gitlab-comment-history ol { display: grid; gap: 12px; margin: 0; padding: 0 0 0 14px; border-left: 1px solid #303949; list-style: none; }
+.gitlab-comment-history li { min-width: 0; padding: 12px 14px; border: 1px solid #303949; border-radius: 9px; background: #131922; }
+.gitlab-comment-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; overflow-wrap: anywhere; }
+.gitlab-comment-heading strong { color: #e8edf4; }
+.gitlab-comment-heading span, .gitlab-comment-heading time { color: #94a0b1; font-size: 12px; }
+.gitlab-comment-body { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
 /* Keep the comment composer consistent with the existing dark fields and actions. */
 .task-comment > summary { display: flex; align-items: center; gap: 7px; width: fit-content; padding: 5px 0; border-radius: 4px; cursor: pointer; color: #98a4b5; font-size: 12px; list-style: none; }
 .task-comment > summary::-webkit-details-marker { display: none; }
@@ -612,6 +620,12 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .note-editor { display: grid; gap: 16px; }
 .note-editor textarea { resize: vertical; }
 .note-body { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Inline note fields preserve the card's reading layout, like task editing. */
+.note-inline-editor .note-title-input, .note-inline-editor .note-body-input { border: 0; border-radius: 0; background: transparent; color: #e8edf4; font: inherit; }
+.note-inline-editor .note-title-input { flex: 1 1 200px; min-width: 0; padding: 0; font-size: 1.17em; font-weight: 700; }
+.note-inline-editor .note-body-input { display: block; width: 100%; min-height: var(--field-height); margin: 1em 0; padding: 0; line-height: inherit; resize: none; overflow-y: hidden; }
+.note-inline-editor .note-title-input:focus-visible, .note-inline-editor .note-body-input:focus-visible { outline: 1px solid var(--nexus-cyan); outline-offset: 4px; }
+.note-inline-editor > .notes-filters { margin-top: 16px; }
 .note-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 16px; color: #8794a7; }
 .gitlab-settings-error { margin: 0 0 20px; padding: 14px 16px; border: 1px solid #a7604e66; border-radius: 9px; color: #f0c0ac; background: #39201b66; font-size: 12px; }
 .gitlab-settings .gitlab-settings-error p { margin: 6px 0 0; color: #d6a895; font-size: 12px; line-height: 1.6; }

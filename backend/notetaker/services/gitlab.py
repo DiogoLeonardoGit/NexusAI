@@ -260,6 +260,16 @@ class GitLabClient:
             raise GitLabUploadUncertain("O GitLab não confirmou o link do ficheiro. Verifica o upload antes de tentar novamente.")
         return {"markdown": result["markdown"]}
 
+    def comments(self, link):
+        """Read all user comments chronologically, excluding automatic system notes."""
+        notes = self.pages(f"/projects/{link.project_id}/issues/{link.issue_iid}/notes",
+                           sort="asc", order_by="created_at")
+        return [{"id": note["id"], "body": note.get("body", ""),
+                 "created_at": note.get("created_at"),
+                 "author": {key: (note.get("author") or {}).get(key, "")
+                            for key in ("name", "username")}}
+                for note in notes if not note.get("system")]
+
     def add_comment(self, link, body):
         """Post one comment on explicit submission; never retry additive requests."""
         note = self.request(f"/projects/{link.project_id}/issues/{link.issue_iid}/notes", "POST", {"body": body})[0]

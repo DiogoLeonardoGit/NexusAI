@@ -660,15 +660,17 @@ class TaskViewSet(viewsets.ModelViewSet):
         except gitlab.GitLabError as exc:
             return Response({"detail": str(exc)}, status=502)
 
-    def _comment_client(self, task):
-        """Recheck issue visibility and write settings for comments and attachments."""
+    def _comment_client(self, task, *, allow_writes=True):
+        """Check visibility and credentials; require write opt-in only for submissions."""
         from .services import gitlab
         if not hasattr(task, "gitlab") or not task.gitlab.active or task.gitlab.hidden:
             raise ValidationError({"detail": "Só podes comentar tarefas ativas ligadas ao GitLab."})
         link = task.gitlab
-        if not link.connection.enabled or not gitlab.writes_enabled() or not gitlab.has_token():
+        if not link.connection.enabled or not gitlab.has_token():
+            raise ValidationError({"detail": "Ativa a sincronização e configura o token GitLab."})
+        if allow_writes and not gitlab.writes_enabled():
             raise ValidationError({"detail": "Ativa a sincronização e a escrita e configura o token GitLab."})
-        client = gitlab.GitLabClient(link.connection, allow_writes=True)
+        client = gitlab.GitLabClient(link.connection, allow_writes=allow_writes)
         user = client.get("/user")
         if user.get("email", "").lower() != gitlab.EXPECTED_EMAIL:
             raise gitlab.GitLabError("O token tem de pertencer a diogo.leonardo@warpcom.com.")
@@ -689,11 +691,17 @@ class TaskViewSet(viewsets.ModelViewSet):
         except gitlab.GitLabError as exc:
             return Response({"detail": str(exc)}, status=502)
 
-    @action(detail=True, methods=["post"])
+    @action(detail=True, methods=["get", "post"])
     def comments(self, request, pk=None):
-        """Send user text and confirmed attachment Markdown once on explicit submission."""
+        """Read remote comments on demand or submit text and confirmed attachment links."""
         from .services import gitlab
         task = self.get_object()
+        if request.method == "GET":
+            try:
+                client = self._comment_client(task, allow_writes=False)
+                return Response(client.comments(task.gitlab))
+            except gitlab.GitLabError as exc:
+                return Response({"detail": str(exc)}, status=502)
         if not isinstance(request.data, dict) or set(request.data) != {"body"}:
             return Response({"detail": "Indica apenas o texto do comentário em body."}, status=400)
         body = request.data["body"]

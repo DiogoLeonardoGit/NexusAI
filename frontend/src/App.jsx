@@ -314,10 +314,29 @@ function TaskDescription({ text }) {
 function GitLabTaskComment({ task, gitlabStatus, onError, disabled }) {
   const [body, setBody] = useState(""), [sending, setSending] = useState(false), [result, setResult] = useState("");
   const [attachments, setAttachments] = useState([]), [draggingFiles, setDraggingFiles] = useState(false);
+  const [open, setOpen] = useState(false), [comments, setComments] = useState([]);
+  const [loadingComments, setLoadingComments] = useState(false), [commentsError, setCommentsError] = useState("");
+  const [commentsRevision, setCommentsRevision] = useState(0);
   const fileInput = useRef(null), attachmentSequence = useRef(0);
   const submitting = useRef(false);
-  const reason = !task.gitlab.active || task.gitlab.hidden ? "Esta tarefa não está disponível para comentários."
-    : !gitlabStatus?.enabled || gitlabStatus.read_only || !gitlabStatus.has_token ? "Ativa a sincronização e a escrita e configura o token GitLab." : "";
+  const readReason = !task.gitlab.active || task.gitlab.hidden ? "Esta tarefa não está disponível para comentários."
+    : !gitlabStatus?.enabled || !gitlabStatus.has_token ? "Ativa a sincronização e configura o token GitLab." : "";
+  const reason = readReason || (gitlabStatus.read_only ? "Ativa a escrita nas definições GitLab para comentar." : "");
+  // Fetch only while expanded; discard outdated responses after closing or changing tasks.
+  useEffect(() => {
+    if (!open || readReason) return;
+    const controller = new AbortController();
+    setLoadingComments(true); setCommentsError(""); setComments([]);
+    api(`/tasks/${task.id}/comments/`, { signal: controller.signal }).then((items) => {
+      if (!Array.isArray(items)) throw new Error("Resposta de comentários inválida.");
+      if (!controller.signal.aborted) setComments(items);
+    }).catch((error) => {
+      if (!controller.signal.aborted) setCommentsError(error.message);
+    }).finally(() => {
+      if (!controller.signal.aborted) setLoadingComments(false);
+    });
+    return () => controller.abort();
+  }, [open, readReason, task.id, commentsRevision]);
   const blocked = sending || disabled || Boolean(reason);
   const isFileDrag = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
   // Selecting files only changes the draft; remote uploads begin on Enviar.
@@ -350,10 +369,23 @@ function GitLabTaskComment({ task, gitlabStatus, onError, disabled }) {
       setResult("A enviar comentário…");
       await api(`/tasks/${task.id}/comments/`, { method: "POST", body: JSON.stringify({ body: comment }) });
       setBody(""); setAttachments([]); setResult("Comentário enviado para o GitLab.");
+      setCommentsRevision((value) => value + 1);
     } catch (error) { setResult(error.message); onError(error.message); }
     finally { submitting.current = false; setSending(false); }
   };
-  return <details className="task-comment"><summary>Comentar no GitLab</summary>
+  return <details className="task-comment" onToggle={(event) => {
+    if (event.target === event.currentTarget) setOpen(event.currentTarget.open);
+  }}><summary>Comentar no GitLab</summary>
+    {open && <section className="gitlab-comment-history" aria-label="Comentários no GitLab" aria-busy={!readReason && loadingComments}>
+      {readReason ? <p className="muted">{readReason}</p> : loadingComments ? <p role="status"><Spinner/> A carregar comentários…</p>
+        : commentsError ? <div role="alert"><p>{commentsError}</p><button type="button" className="text-button" onClick={() => setCommentsRevision((value) => value + 1)}>Tentar novamente</button></div>
+          : comments.length ? <ol>{comments.map((comment) => <li key={comment.id}>
+            <div className="gitlab-comment-heading"><strong>{comment.author?.name || comment.author?.username || "Utilizador GitLab"}</strong>
+              {comment.author?.username && <span>@{comment.author.username}</span>}
+              {comment.created_at && <time dateTime={comment.created_at}>{new Date(comment.created_at).toLocaleString("pt-PT")}</time>}
+            </div><p className="gitlab-comment-body">{comment.body}</p>
+          </li>)}</ol> : <p className="muted">Ainda não existem comentários no GitLab.</p>}
+    </section>}
     <form onSubmit={submit}>
       <div className={`comment-dropzone ${draggingFiles ? "is-dragging" : ""}`} onDragEnter={(event) => {
         if (!isFileDrag(event)) return;
@@ -1383,7 +1415,7 @@ export default function App() {
     <div ref={aiQuestionPanel}/>
     {error && <div className="error">{error}<button onClick={() => setError("")}>×</button></div>}{notice && <div className="notice">{notice}<button onClick={() => setNotice("")}>×</button></div>}
     {["Hoje", "Reuniões", "Pesquisa"].includes(view) && <div className="organization-toolbar"><Popup className="filter-panel"><summary>Filtros <span className="filter-indicator">{activeOrganizationFilterCount || ""}</span></summary>{organizationFilters}</Popup></div>}
-    {view === "Notas" && <Notes notes={notes} sessions={sessions} projects={projects} refresh={refresh} onError={setError} onOpenSource={openSource} targetId={contentDetail?.id} OrganizationMenu={OrganizationMenu}/>}
+    {view === "Notas" && <Notes notes={notes} sessions={sessions} projects={projects} refresh={refresh} onError={setError} onOpenSource={openSource} targetId={contentDetail?.id} OrganizationMenu={OrganizationMenu} AutoSizeTextarea={AutoSizeTextarea}/>}
     {view === "Projetos" && <Projects taskProps={taskProps} projects={projects} tags={tags} sessions={sessions} tasks={tasks} notes={notes} summaries={summaries} refresh={refresh} onError={setError} onOpen={openSource} onProjectSaved={(item) => setProjects((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))} onTagSaved={(item) => setTags((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))}/>}
     {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList {...taskProps} initialFilter="mine" settingsFilters={view === "Tarefas" ? organizationFilters : null} activeFilterCount={activeOrganizationFilterCount} tasks={organizationTasks} today={view === "Hoje"} showSections={view === "Tarefas"} createOpen={view === "Tarefas" ? taskCreateOpen : undefined} onCreateOpenChange={view === "Tarefas" ? setTaskCreateOpen : undefined}/>} {view === "Reuniões" && <Meetings tasks={tasks} taskProps={taskProps} projects={projects} tags={tags} key={meetingsKey} sessions={organizationSessions} refresh={refresh} onError={setError} target={meetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{contentDetail && <article className="card"><h3>{contentDetail.title || "Nota pessoal"}</h3><p>{contentDetail.body}</p><OrganizationMenu item={contentDetail} projects={projects} tags={tags} onSave={async (changes) => {
       try { const saved = await api(`/notes/${contentDetail.id}/`, { method: "PATCH", body: JSON.stringify(changes) }); setContentDetail(saved); await refresh(); }
