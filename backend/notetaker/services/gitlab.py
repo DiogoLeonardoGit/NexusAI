@@ -9,7 +9,7 @@ import uuid
 from itertools import chain
 from logging.handlers import RotatingFileHandler
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from rest_framework.exceptions import ValidationError
@@ -133,9 +133,11 @@ class GitLabClient:
         self.allow_writes = allow_writes
         self.opener = build_opener(NoRedirects())
 
-    def request(self, path, method="GET", data=None, query=None, *, graphql=False, upload=None):
+    def request(self, path, method="GET", data=None, query=None, *, graphql=False, upload=None, image=False):
         if self.connection.base_url.rstrip("/") != BASE_URL or not path.startswith("/") or urlsplit(path).netloc:
             raise GitLabError("Destino GitLab inválido.")
+        if image and (method != "GET" or not re.fullmatch(r"/projects/\d+/uploads/[a-fA-F0-9]{32}/[^/]+", path)):
+            raise GitLabError("Destino de imagem inválido.")
         self.connection.refresh_from_db(fields=["enabled"])
         if not self.connection.enabled:
             raise GitLabDisabled("Sincronização desativada.")
@@ -171,10 +173,27 @@ class GitLabClient:
                                "Content-Length": str(len(prefix) + upload.size + len(suffix))}
         authentication = {"Authorization": f"Bearer {credential}"} if graphql else {"PRIVATE-TOKEN": credential}
         request = Request(url, data=body, method=method, headers={
-            **authentication, "Accept": "application/json", **content_headers,
+            **authentication, "Accept": "image/png,image/jpeg,image/gif,image/webp" if image else "application/json", **content_headers,
         })
         try:
             with self.opener.open(request, timeout=20) as response:
+                if image:
+                    # Bound memory and accept only inert raster formats, never HTML or SVG.
+                    content = response.read(15 * 1024 * 1024 + 1)
+                    if len(content) > 15 * 1024 * 1024:
+                        raise GitLabError("A imagem excede o limite de preview de 15 MB.")
+                    mime = None
+                    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+                        mime = "image/png"
+                    elif content.startswith(b"\xff\xd8\xff"):
+                        mime = "image/jpeg"
+                    elif content[:6] in (b"GIF87a", b"GIF89a"):
+                        mime = "image/gif"
+                    elif content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+                        mime = "image/webp"
+                    if not mime:
+                        raise GitLabError("Preview disponível apenas para PNG, JPEG, GIF e WebP.")
+                    return content, mime
                 result = json.load(response)
                 if graphql_read:
                     operation = re.search(r"\bquery\s+(TaskDateAccess|TaskDateSchema|TaskDates)\b", data["query"])
@@ -253,6 +272,28 @@ class GitLabClient:
                     dates.append(date)
         return timezone.localtime(max(dates)).date().isoformat() if dates else None
 
+    def comment_image(self, link, source):
+        """Resolve a Markdown upload only inside this task's GitLab project."""
+        if not isinstance(source, str) or len(source) > 2048:
+            raise GitLabError("Link de imagem inválido.")
+        try:
+            parsed = urlsplit(source)
+        except ValueError as exc:
+            raise GitLabError("Link de imagem inválido.") from exc
+        if parsed.query or parsed.fragment or (parsed.netloc and f"{parsed.scheme}://{parsed.netloc}" != BASE_URL):
+            raise GitLabError("Link de imagem inválido.")
+        path = parsed.path
+        prefix = f"/{self.connection.project_path.strip('/')}/uploads/"
+        if path.startswith(prefix):
+            path = "/uploads/" + path[len(prefix):]
+        match = re.fullmatch(r"/uploads/([a-fA-F0-9]{32})/([^/]+)", path)
+        if not match or (parsed.scheme and not parsed.netloc):
+            raise GitLabError("Só são suportadas imagens anexadas ao projeto GitLab.")
+        filename = unquote(match[2])
+        if filename in (".", "..") or any(char in filename for char in "/\\\x00\r\n"):
+            raise GitLabError("Nome de imagem inválido.")
+        return self.request(f"/projects/{link.project_id}/uploads/{match[1]}/{quote(filename, safe='')}", image=True)
+
     def upload_file(self, link, upload):
         """Upload one attachment on explicit submission and return confirmed Markdown."""
         result = self.request(f"/projects/{link.project_id}/uploads", "POST", upload=upload)[0]
@@ -303,6 +344,8 @@ class GitLabClient:
                 raise GitLabError("Não foi possível confirmar a estimativa no GitLab.")
             estimate_updated = True
         payload = {key: value for key, value in changes.items() if key in {"title", "description", "due_date"}}
+        if "assignees" in changes:
+            payload["assignee_ids"] = [person["id"] for person in changes["assignees"]]
         if "milestone_id" in changes:
             payload["milestone_id"] = changes["milestone_id"] or 0
         if "state" in changes:

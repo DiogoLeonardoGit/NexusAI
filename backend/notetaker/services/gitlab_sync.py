@@ -149,13 +149,17 @@ def local_state(task):
     """Calendar deadlines stay on Task; remote-only planning uses the existing outbox."""
     link = getattr(task, "gitlab", None)
     planning = {**link.snapshot, **link.pending} if link else {}
-    return {"title": task.title, "description": task.description,
+    values = {"title": task.title, "description": task.description,
             "state": "closed" if task.status == Task.Status.DONE else "opened",
             "labels": sorted(task.tags.values_list("name", flat=True)),
             "estimate_seconds": task.estimate_seconds,
             "due_date": timezone.localtime(task.due_at).date().isoformat() if task.due_at else None,
             "start_date": local_start_date(link.snapshot, link.pending, link.conflicts) if link else None,
             "milestone_id": planning.get("milestone_id")}
+    # Preserve multiple assignees until the user explicitly chooses a replacement.
+    if "assignees" in planning:
+        values["assignees"] = planning["assignees"]
+    return values
 
 
 def queue_task(task):
@@ -182,6 +186,11 @@ def queue_task(task):
     link.save(update_fields=["snapshot", "pending", "conflicts"])
 
 
+def assignee_ids(people):
+    """Compare ownership by stable IDs regardless of display names and ordering."""
+    return sorted(person["id"] for person in (people or []))
+
+
 def merge_states(baseline, pending, remote, existing_conflicts=None):
     """Merge independent fields and label deltas; report competing scalar edits."""
     result, remaining, conflicts = dict(remote), {}, {}
@@ -198,6 +207,13 @@ def merge_states(baseline, pending, remote, existing_conflicts=None):
         if key == "labels":
             old, local, external = set(previous or []), set(wanted), set(actual or [])
             wanted = sorted((external - (old - local)) | (local - old))
+        elif key == "assignees":
+            # Identity determines a conflict; display-name changes never do.
+            if assignee_ids(actual) == assignee_ids(wanted):
+                wanted = actual
+            elif (existing_conflicts or {}).get(key) or assignee_ids(actual) != assignee_ids(previous):
+                conflicts[key] = {"base": (existing_conflicts or {}).get(key, {}).get("base", previous),
+                                  "local": wanted, "remote": actual}
         elif actual != wanted and ((existing_conflicts or {}).get(key) or actual != previous):
             conflicts[key] = {"base": (existing_conflicts or {}).get(key, {}).get("base", previous),
                               "local": wanted, "remote": actual}
@@ -426,6 +442,8 @@ def push_pending(link, config, client, labels):
     updated = client.update_task(link, pending)
     if updated:
         confirmed = remote_state(updated, link, client)
+        if "assignees" in pending and assignee_ids(confirmed["assignees"]) != assignee_ids(pending["assignees"]):
+            raise gitlab.GitLabError("O GitLab não confirmou a alteração do responsável.")
         for key in ("due_date", "milestone_id"):
             if key in pending and confirmed.get(key) != pending[key]:
                 raise gitlab.GitLabError("O GitLab não confirmou o campo de planeamento: " + key)

@@ -40,3 +40,25 @@ export async function apiText(path) {
   if (!response.ok) throw new Error(await response.text());
   return response.text();
 }
+
+// Use authenticated fetch and a data URL compatible with the existing image CSP.
+export async function apiImage(path, { signal } = {}) {
+  const config = await getConfiguration();
+  const response = await fetch(`${config.apiBase}${path}`, {
+    signal, headers: { "X-Local-Token": config.apiToken },
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.detail || `Não foi possível carregar a imagem (${response.status}).`);
+  }
+  const blob = await response.blob();
+  if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(blob.type) || blob.size > 15 * 1024 * 1024) {
+    throw new Error("Formato ou tamanho de imagem não suportado.");
+  }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("Não foi possível ler a imagem."));
+    reader.readAsDataURL(blob);
+  });
+}

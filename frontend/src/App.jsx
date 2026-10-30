@@ -7,6 +7,7 @@ import Popup, { useOutsideDismiss } from "./Popup";
 import GitLabSettings, { GitLabIcon, LocalToGitLabIcon } from "./GitLabSettings";
 import Notes from "./Notes";
 import AIQuestionBar from "./AIQuestionBar";
+import GitLabCommentBody from "./GitLabCommentBody";
 import nexusSymbol from "./assets/nexus-symbol.png";
 import AISetupGuide, { useAIAvailability } from "./AISetupGuide";
 import { moveTaskLabels, tasksForLabelView } from "./taskLabels";
@@ -64,19 +65,24 @@ function compareTasks(left, right, order = "default") {
 
 function Spinner() { return <span className="spinner" aria-hidden="true" />; }
 
+// Assignee conflicts contain identities; show their names instead of raw objects.
+function formatTaskConflict(field, value) {
+  return field === "assignees" ? (value || []).map((person) => person.name || `#${person.id}`).join(", ") || "Sem responsável" : String(value);
+}
+
 // Free-text owners stay local; GitLab choices carry a stable member ID.
-function TaskOwnerPicker({ value, onChange, members, disabled, label = "Responsável da tarefa" }) {
-  const selected = value.gitlab_assignee_id ? `gitlab:${value.gitlab_assignee_id}` : value.owner;
+function TaskOwnerPicker({ value, onChange, members, disabled, gitlabLinked = false, label = "Responsável da tarefa" }) {
+  const selected = gitlabLinked && value.owner === "self" ? "self" : value.gitlab_assignee_id ? `gitlab:${value.gitlab_assignee_id}` : value.owner;
   const people = members.filter((person) => !person.is_self);
   return <label className="task-owner-picker">Responsável<Select aria-label={label} value={selected} disabled={disabled} onChange={(event) => {
     const choice = event.target.value;
     const person = choice.startsWith("gitlab:") ? people.find((item) => item.id === Number(choice.slice(7))) : null;
     onChange(person ? { owner: "other", owner_name: person.name, gitlab_assignee_id: person.id }
       : { owner: choice, owner_name: "", gitlab_assignee_id: null });
-  }}><option value="self">Eu</option><option value="other">Outro interveniente — escrever nome</option><option value="unknown">Sem responsável</option>
-    {value.gitlab_assignee_id && !people.some((item) => item.id === value.gitlab_assignee_id) && <option value={selected}>{value.owner_name || `#${value.gitlab_assignee_id}`} (GitLab)</option>}
+  }}><option value="self">Eu</option>{!gitlabLinked && <option value="other">Outro interveniente — escrever nome</option>}<option value="unknown" disabled={gitlabLinked}>Sem responsável</option>
+    {selected.startsWith("gitlab:") && !people.some((item) => item.id === value.gitlab_assignee_id) && <option value={selected}>{value.owner_name || `#${value.gitlab_assignee_id}`} (GitLab)</option>}
     {people.map((person) => <option key={person.id} value={`gitlab:${person.id}`}>{person.name} (@{person.username})</option>)}
-  </Select>{value.owner === "other" && !value.gitlab_assignee_id && <input aria-label="Nome do responsável" disabled={disabled} maxLength={120} value={value.owner_name} onChange={(event) => onChange({ ...value, owner_name: event.target.value })} placeholder="Nome do responsável" required/>}</label>;
+  </Select>{!gitlabLinked && value.owner === "other" && !value.gitlab_assignee_id && <input aria-label="Nome do responsável" disabled={disabled} maxLength={120} value={value.owner_name} onChange={(event) => onChange({ ...value, owner_name: event.target.value })} placeholder="Nome do responsável" required/>}</label>;
 }
 
 function AutoSizeTextarea({ value, ...props }) {
@@ -286,7 +292,7 @@ function readTaskSectionOrder() {
 }
 
 // Measure rendered lines so wrapping also counts towards the ten-line preview.
-function TaskDescription({ text }) {
+function TaskDescription({ text, taskId }) {
   const paragraph = useRef(null);
   const id = useId();
   const [expanded, setExpanded] = useState(false), [overflows, setOverflows] = useState(false);
@@ -302,10 +308,14 @@ function TaskDescription({ text }) {
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(node);
+    // Image loading can grow the content while the collapsed viewport stays fixed.
+    observer.observe(node.firstElementChild);
     return () => observer.disconnect();
   }, [text]);
   return <div className="task-description-preview">
-    <p ref={paragraph} id={id} className={`task-description ${expanded ? "" : "is-clamped"}`}>{text}</p>
+    <div ref={paragraph} id={id} className={`task-description ${expanded ? "" : "is-clamped"}`}><div className="task-description-content">
+      {taskId ? <GitLabCommentBody taskId={taskId} text={text} className="gitlab-description-body"/> : text}
+    </div></div>
     {overflows && <button type="button" className="text-button" aria-expanded={expanded} aria-controls={id} onClick={() => setExpanded((value) => !value)}>{expanded ? "Ver menos" : "Ver mais"}</button>}
   </div>;
 }
@@ -383,7 +393,7 @@ function GitLabTaskComment({ task, gitlabStatus, onError, disabled }) {
             <div className="gitlab-comment-heading"><strong>{comment.author?.name || comment.author?.username || "Utilizador GitLab"}</strong>
               {comment.author?.username && <span>@{comment.author.username}</span>}
               {comment.created_at && <time dateTime={comment.created_at}>{new Date(comment.created_at).toLocaleString("pt-PT")}</time>}
-            </div><p className="gitlab-comment-body">{comment.body}</p>
+            </div><GitLabCommentBody taskId={task.id} text={comment.body}/>
           </li>)}</ol> : <p className="muted">Ainda não existem comentários no GitLab.</p>}
     </section>}
     <form onSubmit={submit}>
@@ -537,7 +547,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
       gitlab_assignee_id: task.gitlab_assignee_id ?? null,
       gitlabLinked: Boolean(task.gitlab), milestone_id: task.gitlab?.milestone?.id ?? null,
       tags: [...(task.tags || [])], session: task.session ?? null,
-      original: { milestone_id: task.gitlab?.milestone?.id ?? null, dueAt: initialDueAt, minutesBefore: initialMinutes, estimateDuration: initialEstimate, estimateSeconds: task.estimate_seconds || 0, tags: [...(task.tags || [])], session: task.session ?? null } });
+      original: { owner: task.owner, gitlab_assignee_id: task.gitlab_assignee_id ?? null, milestone_id: task.gitlab?.milestone?.id ?? null, dueAt: initialDueAt, minutesBefore: initialMinutes, estimateDuration: initialEstimate, estimateSeconds: task.estimate_seconds || 0, tags: [...(task.tags || [])], session: task.session ?? null } });
     setDueAt(initialDueAt); setMinutesBefore(initialMinutes);
     setEstimateDuration(initialEstimate); setTimeDuration("");
   };
@@ -545,9 +555,12 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const saveTask = async () => {
     if (busy || !editingTask?.title.trim()) return;
     const original = editingTask.original;
-    const changes = { title: editingTask.title.trim(), description: editingTask.description.trim(), owner: editingTask.owner,
-      owner_name: editingTask.owner === "other" ? editingTask.owner_name.trim() : "" };
-    if (!editingTask.gitlabLinked) changes.gitlab_assignee_id = editingTask.gitlab_assignee_id;
+    const changes = { title: editingTask.title.trim(), description: editingTask.description.trim() };
+    // Only an explicit owner selection replaces a GitLab issue's full assignee list.
+    if (!editingTask.gitlabLinked || editingTask.owner !== original.owner || editingTask.gitlab_assignee_id !== original.gitlab_assignee_id) {
+      Object.assign(changes, { owner: editingTask.owner, owner_name: editingTask.owner === "other" ? editingTask.owner_name.trim() : "",
+        gitlab_assignee_id: editingTask.gitlab_assignee_id });
+    }
     let estimate = original.estimateSeconds;
     if (estimateDuration.trim() !== original.estimateDuration) {
       estimate = parseGitLabDuration(estimateDuration);
@@ -730,14 +743,14 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
               title={publishDisabledReason(task) || "Enviar ticket para o GitLab"} disabled={Boolean(busy) || Boolean(publishDisabledReason(task))}
               onClick={() => publishLocalTask(task)}>{busy === `publish-${task.id}` ? <Spinner/> : <LocalToGitLabIcon/>}</button>} {isEditing ? <><button className="text-button" onClick={saveTask} disabled={!editingTask.title.trim() || Boolean(busy)}>{busy === `edit-${task.id}` && <Spinner/>}Concluir</button><button className="text-button secondary-text" disabled={Boolean(busy)} onClick={() => setEditingTask(null)}>Cancelar</button></> : <><button className="text-button" disabled={Boolean(busy)} onClick={() => beginTaskEdit(task)}>Editar</button><button className="text-button danger" onClick={() => deleteTask(task)} disabled={busy === `delete-${task.id}`}>{busy === `delete-${task.id}` && <Spinner/>}{task.gitlab ? "Ocultar nesta app" : "Eliminar"}</button></>}</div>
           </div>
-          {isEditing ? <AutoSizeTextarea className="task-description-input" disabled={Boolean(busy)} value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <TaskDescription text={task.description}/>}
+          {isEditing ? <AutoSizeTextarea className="task-description-input" disabled={Boolean(busy)} value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <TaskDescription text={task.description} taskId={task.gitlab ? task.id : null}/>}
 
           
           <div className="task-labels">{tags.filter((tag) => task.tags?.includes(tag.id)).map((tag) => <span className="label-chip" key={tag.id}><i style={{ backgroundColor: tag.color || "#6699cc" }}/>{tag.name}</span>)}</div>
           {task.gitlab?.pending && <small className="sync-pending">Alterações locais pendentes de envio</small>}
           {task.gitlab && !isEditing && <GitLabTaskComment task={task} gitlabStatus={gitlabStatus} onError={onError} disabled={Boolean(busy)}/>}
           {task.gitlab && Object.keys(task.gitlab.conflicts).length > 0 && <div className="sync-conflict" role="alert"><strong>Conflito com o GitLab</strong><p>{Object.keys(task.gitlab.conflicts).join(", ")}</p>
-            {Object.entries(task.gitlab.conflicts).map(([field, values]) => <div className="conflict-values" key={field}><strong>{{ title: "Título", description: "Descrição", estimate_seconds: "Estimativa (segundos)", start_date: "Data de início", due_date: "Data limite", milestone_id: "Milestone", state: "Estado" }[field] || field}</strong><p>Na app: {String(values.local)}</p><p>No GitLab: {String(values.remote)}</p></div>)}
+            {Object.entries(task.gitlab.conflicts).map(([field, values]) => <div className="conflict-values" key={field}><strong>{{ title: "Título", description: "Descrição", estimate_seconds: "Estimativa (segundos)", start_date: "Data de início", due_date: "Data limite", milestone_id: "Milestone", state: "Estado", assignees: "Responsável" }[field] || field}</strong><p>Na app: {formatTaskConflict(field, values.local)}</p><p>No GitLab: {formatTaskConflict(field, values.remote)}</p></div>)}
             <button disabled={Boolean(busy)} onClick={() => run(`resolve-${task.id}`, () => api(`/tasks/${task.id}/resolve/`, { method: "POST", body: JSON.stringify({ choice: "local" }) }))}>Manter alterações locais</button>
             <button disabled={Boolean(busy)} onClick={() => run(`resolve-${task.id}`, () => api(`/tasks/${task.id}/resolve/`, { method: "POST", body: JSON.stringify({ choice: "remote" }) }))}>Usar versão GitLab</button></div>}
           <div className={`task-meta ${isEditing ? "editing" : ""}`}>
@@ -747,7 +760,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
             {task.time_tracking?.uncertain_seconds > 0 && <small className="task-time-uncertain" role="alert">Envio de {formatTrackedTime(task.time_tracking.uncertain_seconds)} por confirmar. Verifica o GitLab.</small>}
           </div>
           <div className={`task-meta task-details ${isEditing ? "editing" : ""}`}>
-            {isEditing && !task.gitlab ? <TaskOwnerPicker value={editingTask} onChange={(changes) => setEditingTask((current) => ({ ...current, ...changes }))} members={members} disabled={Boolean(busy)}/> : <span className={task.gitlab ? "task-owner-fixed" : undefined} title={task.gitlab ? "Responsável gerido no GitLab" : undefined}>{task.gitlab?.assignees?.length ? task.gitlab.assignees.map((person) => person.name).join(", ") : task.owner === "self" ? "Eu" : task.owner_name || "Sem responsável"}</span>}
+            {isEditing ? <TaskOwnerPicker value={editingTask} gitlabLinked={Boolean(task.gitlab)} onChange={(changes) => setEditingTask((current) => ({ ...current, ...changes }))} members={members} disabled={Boolean(busy) || Boolean(task.gitlab && (!task.gitlab.active || task.gitlab.hidden || !gitlabStatus?.enabled || !gitlabStatus?.has_token || membersLoading || membersError))}/> : <span>{task.gitlab?.assignees?.length ? task.gitlab.assignees.map((person) => person.name).join(", ") : task.owner === "self" ? "Eu" : task.owner_name || "Sem responsável"}</span>}
             {!isEditing && <span>· Criada a {new Date(task.created_at).toLocaleString()} {task.creation_source === "gitlab" ? "no GitLab" : task.creation_source === "system" ? "pelo Sistema" : "por ti"}</span>}
             {task.due_at && <span>· Limite: {new Date(task.due_at).toLocaleString()}</span>}
             {task.gitlab?.start_date && <span>· Início: {formatCalendarDate(task.gitlab.start_date)}</span>}

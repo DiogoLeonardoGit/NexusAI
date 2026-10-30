@@ -703,6 +703,21 @@ class TaskViewSet(viewsets.ModelViewSet):
         except gitlab.GitLabError as exc:
             return Response({"detail": str(exc)}, status=502)
 
+    @action(detail=True, methods=["get"], url_path="comment-image")
+    def comment_image(self, request, pk=None):
+        """Proxy a private raster attachment without exposing the GitLab credential."""
+        from .services import gitlab
+        task = self.get_object()
+        try:
+            client = self._comment_client(task, allow_writes=False)
+            content, mime = client.comment_image(task.gitlab, request.query_params.get("source"))
+            response = HttpResponse(content, content_type=mime)
+            response["Cache-Control"] = "no-store"
+            response["X-Content-Type-Options"] = "nosniff"
+            return response
+        except gitlab.GitLabError as exc:
+            return Response({"detail": str(exc)}, status=502)
+
     @action(detail=True, methods=["get", "post"])
     def comments(self, request, pk=None):
         """Read remote comments on demand or submit text and confirmed attachment links."""

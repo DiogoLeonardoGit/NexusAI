@@ -375,7 +375,7 @@ class TaskSerializer(serializers.ModelSerializer):
         if milestone_id and (not milestone or milestone.get("id") != milestone_id):
             milestone = {"id": milestone_id, "title": f"#{milestone_id}"}
         return {"web_url": link.web_url, "issue_iid": link.issue_iid, "project_id": link.project_id,
-                "assignees": link.snapshot.get("assignees", []),
+                "assignees": planning.get("assignees", []),
                 "start_date": planning.get("start_date"), "milestone": milestone if milestone_id else None,
                 "active": link.active, "hidden": link.hidden, "pending": bool(link.pending) or any(
                     entry.sync_state != TaskTimeEntry.SyncState.SENT for entry in instance.time_entries.all()),
@@ -409,9 +409,7 @@ class TaskSerializer(serializers.ModelSerializer):
         link = self.instance.gitlab
         if not link.active or link.hidden:
             raise serializers.ValidationError("Esta tarefa está indisponível ou oculta.")
-        for field in ("owner", "owner_name", "gitlab_assignee_id"):
-            if field in attrs and attrs[field] != getattr(self.instance, field):
-                raise serializers.ValidationError({field: "O responsável desta tarefa é gerido no GitLab."})
+        self._validate_gitlab_owner(attrs, link)
         if attrs.get("status", self.instance.status) not in {"todo", "done"}:
             raise serializers.ValidationError("As tarefas GitLab mantêm o estado aberta/concluída.")
         if "tags" in attrs:
@@ -422,6 +420,31 @@ class TaskSerializer(serializers.ModelSerializer):
             if any(tag.pk not in permitted for tag in attrs["tags"]):
                 raise serializers.ValidationError({"tags": "Escolhe etiquetas existentes neste projeto GitLab."})
         return attrs
+
+    def _validate_gitlab_owner(self, attrs, link):
+        """Queue one validated project member only when ownership actually changes."""
+        fields = ("owner", "owner_name", "gitlab_assignee_id")
+        if not any(field in attrs and attrs[field] != getattr(self.instance, field) for field in fields):
+            return
+        from .services import gitlab
+        owner = attrs.get("owner", self.instance.owner)
+        assignee_id = attrs.get("gitlab_assignee_id", self.instance.gitlab_assignee_id)
+        if owner not in (Task.Owner.SELF, Task.Owner.OTHER) or (owner == Task.Owner.OTHER and assignee_id is None):
+            raise serializers.ValidationError({"gitlab_assignee_id": "Escolhe Eu ou um utilizador disponível neste projeto GitLab."})
+        client = gitlab.GitLabClient(link.connection)
+        try:
+            user_id = link.connection.user_id or client.get("/user")["id"]
+            if owner == Task.Owner.SELF:
+                assignee_id = user_id
+            person = next((item for item in client.members(link.project_id) if item["id"] == assignee_id), None)
+        except gitlab.GitLabError as exc:
+            raise serializers.ValidationError({"gitlab_assignee_id": str(exc)}) from exc
+        if person is None:
+            raise serializers.ValidationError({"gitlab_assignee_id": "Escolhe um utilizador disponível neste projeto GitLab."})
+        mine = person["id"] == user_id
+        attrs.update(owner=Task.Owner.SELF if mine else Task.Owner.OTHER,
+                     owner_name="" if mine else person["name"][:120], gitlab_assignee_id=person["id"])
+        attrs["_gitlab_assignees"] = [{key: person.get(key, "") for key in ("id", "name", "username")}]
 
     def _validate_local_owner(self, attrs):
         """Keep free-text names distinct from validated, stable GitLab identities."""
@@ -477,6 +500,11 @@ class TaskSerializer(serializers.ModelSerializer):
             self._validate_edit_details(validated_data)
             reminder_offset = validated_data.pop("reminder_offset_minutes", None)
             time_entry = validated_data.pop("time_entry", None)
+            # Reuse the existing durable outbox; changing an assignee needs no schema change.
+            if "_gitlab_assignees" in validated_data:
+                link = instance.gitlab
+                link.pending["assignees"] = validated_data.pop("_gitlab_assignees")
+                link.save(update_fields=["pending"])
             # Remote-only metadata is durable in the same pending JSON as other edits.
             if "milestone_id" in validated_data:
                 link = instance.gitlab

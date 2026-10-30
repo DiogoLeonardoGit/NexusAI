@@ -245,6 +245,8 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       backgroundThrottling: false,
+      // Match one native Zoom Out step; menu and keyboard controls remain available.
+      zoomFactor: 1.2 ** -0.5,
     },
   });
   if (process.platform === "win32") {

@@ -61,9 +61,15 @@ header { display: flex; justify-content: space-between; align-items: center; mar
 .header-title { grid-area: title; min-width: 0; }
 .header-question { grid-area: question; justify-self: center; width: 100%; max-width: 520px; min-width: 0; }
 .ai-question-bar { display: flex; align-items: center; width: 100%; min-width: 0; max-width: 520px; height: 46px; border: 1px solid #394354; border-radius: 999px; background: #10161d; }
-/* Give the question bar its own row before the action buttons lose space. */
+/* Shrink the question field before wrapping: keep all three controls on one row. */
 @container app-content (max-width: 1300px) {
-  .content > header { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "title actions" "question question"; }
+  .content > header { grid-template-columns: max-content minmax(120px, 520px) max-content; gap: 14px; }
+}
+@container app-content (max-width: 740px) {
+  .content > header { gap: 10px; }
+  .header-actions { gap: 6px; }
+  .header-actions > button, .daily-summary-button > button { padding-inline: 10px; font-size: 13px; }
+  .header-title h1 { font-size: 28px; }
 }
 .ai-question-bar:focus-within { outline: 2px solid var(--nexus-cyan); outline-offset: 2px; }
 .ai-question-bar input { min-width: 0; width: 100%; height: 42px; min-height: 42px; padding: 8px 4px 8px 16px; border: 0; border-radius: 999px; outline: none; color: #e8edf4; background: transparent; font-size: 13px; }
@@ -131,7 +137,8 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 .task-title-input, .task-description-input, .task-meta input, .task-meta select { padding: var(--field-padding); border: 0; outline: none; border-radius: 0; color: #e8edf4; background: transparent; }
 .task-title-input { width: min(620px, 100%); min-width: 0; font-weight: 700; }
 .task-description { margin: 2px 0 6px; color: #cbd4df; white-space: pre-wrap; line-height: 1.5; overflow-wrap: anywhere; }
-.task-description.is-clamped { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 10; overflow: hidden; }
+/* A ten-line viewport also supports image galleries and keeps their full height measurable. */
+.task-description.is-clamped { max-height: 15em; overflow: hidden; }
 .task-description-preview > button { margin-bottom: 6px; }
 .task-comment { margin: 8px 0; }
 /* Remote comments form a chronological thread above the composer. */
@@ -142,6 +149,14 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 .gitlab-comment-heading strong { color: #e8edf4; }
 .gitlab-comment-heading span, .gitlab-comment-heading time { color: #94a0b1; font-size: 12px; }
 .gitlab-comment-body { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.gitlab-image-gallery { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px; margin: 10px 0; white-space: normal; }
+.gitlab-image-preview { display: block; flex: 0 1 auto; min-width: 0; max-width: 100%; white-space: normal; }
+.gitlab-image-thumbnail { display: block; max-width: 100%; padding: 4px; border: 1px solid #394354; border-radius: 8px; background: #0b0e13; }
+.gitlab-image-thumbnail img { display: block; width: auto; height: auto; max-width: min(320px, 100%); max-height: 180px; object-fit: contain; }
+.gitlab-image-dialog { max-width: 94vw; max-height: 94vh; padding: 48px 12px 12px; border: 1px solid #394354; border-radius: 12px; background: #10161d; color: #e8edf4; }
+.gitlab-image-dialog::backdrop { background: rgb(0 0 0 / 80%); }
+.gitlab-image-dialog img { display: block; max-width: 88vw; max-height: 78vh; object-fit: contain; }
+.gitlab-image-close { position: absolute; top: 8px; right: 12px; padding: 6px 12px; border: 1px solid #394354; border-radius: 6px; background: #253041; color: #e8edf4; }
 /* Keep the comment composer consistent with the existing dark fields and actions. */
 .task-comment > summary { display: flex; align-items: center; gap: 7px; width: fit-content; padding: 5px 0; border-radius: 4px; cursor: pointer; color: #98a4b5; font-size: 12px; list-style: none; }
 .task-comment > summary::-webkit-details-marker { display: none; }
