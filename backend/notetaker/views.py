@@ -611,13 +611,13 @@ class TaskViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"])
     def bulk(self, request):
-        """Validate every selected task before atomically adding labels or closing."""
+        """Validate the full batch before atomic edits, local deletion or GitLab hiding."""
         if not isinstance(request.data, dict):
             return Response({"detail": "Indica um objeto com task_ids e action."}, status=400)
         operation = request.data.get("action")
         expected = {"task_ids", "action", "tag_ids"} if operation == "add_labels" else {"task_ids", "action"}
-        if not isinstance(operation, str) or operation not in {"add_labels", "close"} or set(request.data) != expected:
-            return Response({"detail": "Indica task_ids e action: close ou add_labels (com tag_ids)."}, status=400)
+        if not isinstance(operation, str) or operation not in {"add_labels", "close", "delete"} or set(request.data) != expected:
+            return Response({"detail": "Indica task_ids e action: delete, close ou add_labels (com tag_ids)."}, status=400)
         identifiers = request.data.get("task_ids")
         if not isinstance(identifiers, list) or not identifiers or any(type(value) is not int or value <= 0 for value in identifiers):
             return Response({"detail": "Seleciona tarefas com IDs inteiros positivos."}, status=400)
@@ -630,6 +630,18 @@ class TaskViewSet(viewsets.ModelViewSet):
             tasks = list(self.get_queryset().filter(pk__in=identifiers))
             if len(tasks) != len(identifiers):
                 return Response({"detail": "Uma das tarefas selecionadas já não está disponível. Nenhuma foi alterada."}, status=400)
+            if operation == "delete":
+                deleted = hidden = 0
+                # Preserve imported issues and their sync state, matching individual hiding.
+                for task in tasks:
+                    if hasattr(task, "gitlab"):
+                        task.gitlab.hidden = True
+                        task.gitlab.save(update_fields=["hidden"])
+                        hidden += 1
+                    else:
+                        task.delete()
+                        deleted += 1
+                return Response({"deleted": deleted, "hidden": hidden})
             serializers = []
             skipped = 0
             for task in tasks:

@@ -619,17 +619,27 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const endSelection = () => {
     setSelecting(false); setSelectedIds([]); setBulkLabels([]); setActionResult("");
   };
-  // One backend transaction applies the batch; the sync worker delivers linked changes.
+  // One transaction applies the batch; deletion only hides linked GitLab tasks.
   const applyBulk = async (action) => {
     if (busy || !selectedTaskIds.length || (action === "add_labels" && !applicableLabels.length)) return;
     const openCount = selectedTasks.filter((task) => task.status !== "done").length;
     if (action === "close" && (!openCount || !window.confirm(`Fechar ${openCount} tarefa(s) selecionada(s)? Os lembretes serão cancelados e as labels de progresso serão removidas. As alterações GitLab serão sincronizadas automaticamente quando a escrita estiver ativa.`))) return;
+    if (action === "delete") {
+      const linkedCount = selectedTasks.filter((task) => task.gitlab).length;
+      const localCount = selectedTasks.length - linkedCount;
+      const effects = [];
+      if (localCount) effects.push(`${localCount} tarefa(s) local(is), os seus lembretes e registos de tempo serão eliminados definitivamente.`);
+      if (linkedCount) effects.push(`${linkedCount} tarefa(s) GitLab serão apenas ocultadas nesta app, sem alterações no GitLab.`);
+      if (!window.confirm(`Eliminar ${selectedTasks.length} tarefa(s) selecionada(s)?\n\n${effects.join("\n")}`)) return;
+    }
     setActionResult("");
     const saved = await run("bulk", async () => {
       const response = await api("/tasks/bulk/", { method: "POST", body: JSON.stringify({
         task_ids: selectedTaskIds, action, ...(action === "add_labels" ? { tag_ids: applicableLabels } : {}),
       }) });
-      setActionResult(`${response.updated} tarefa(s) atualizadas${response.skipped ? ` · ${response.skipped} já concluídas` : ""}.`);
+      setActionResult(action === "delete"
+        ? [response.deleted && `${response.deleted} tarefa(s) eliminadas`, response.hidden && `${response.hidden} tarefa(s) ocultadas nesta app`].filter(Boolean).join(" · ") + "."
+        : `${response.updated} tarefa(s) atualizadas${response.skipped ? ` · ${response.skipped} já concluídas` : ""}.`);
     });
     if (saved) { setSelectedIds([]); setBulkLabels([]); }
   };
@@ -790,6 +800,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
         <div className="bulk-label-actions"><div className="bulk-label-picker">{!selectedTasks.length && <small>Seleciona pelo menos uma tarefa</small>}<MultiSelect label="Etiquetas para adicionar às tarefas selecionadas" options={compatibleLabels} value={applicableLabels} disabled={Boolean(busy)} emptyMessage="Não existem etiquetas compatíveis com as tarefas selecionadas." onChange={setBulkLabels}/></div>
         <button type="button" className="secondary-action" disabled={Boolean(busy) || !selectedTasks.length || !applicableLabels.length} onClick={() => applyBulk("add_labels")}>Adicionar labels</button></div>
         <div className="bulk-completion-actions"><button type="button" className="primary-action" disabled={Boolean(busy) || !selectedTasks.some((task) => task.status !== "done")} onClick={() => applyBulk("close")}>{busy === "bulk" && <Spinner/>}Fechar selecionadas</button>
+        <button type="button" className="text-button danger" disabled={Boolean(busy) || !selectedTasks.length} onClick={() => applyBulk("delete")}>Eliminar selecionadas</button>
         </div>
         </div>
       </details>;

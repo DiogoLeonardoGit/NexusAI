@@ -296,6 +296,12 @@ com todas as tarefas selecionadas. **Fechar selecionadas** pede confirmação e 
 mesmas regras de fecho individual, ignorando as já concluídas. A operação é atómica:
 se uma tarefa não permitir a ação, nenhuma é alterada. Os updates GitLab ficam pendentes.
 
+**Eliminar selecionadas** pede confirmação com as quantidades de tarefas locais e GitLab.
+As tarefas locais são eliminadas definitivamente, incluindo os seus lembretes e registos
+de tempo; as tarefas GitLab são apenas ocultadas nesta app, sem alterações no GitLab.
+A operação é atómica: se uma tarefa já não estiver disponível ou ocorrer um erro,
+nenhuma é eliminada ou ocultada. Após sucesso, a lista é atualizada e a seleção é limpa.
+
 Arrasta os cabeçalhos dos separadores por etiqueta para reorganizar a ordem, guardada
 localmente e partilhada entre Lista e Quadro. Novas vistas surgem depois das existentes;
 Sem etiqueta de vista e Concluídas mantêm as suas posições. Arrastar um separador não
