@@ -24,6 +24,8 @@ export function LocalToGitLabIcon() {
 export default function GitLabSettings({ onError, refresh }) {
   const [config, setConfig] = useState(null), [busy, setBusy] = useState(false);
   const [loadError, setLoadError] = useState("");
+  const [draft, setDraft] = useState(null), [token, setToken] = useState("");
+  const [savedMessage, setSavedMessage] = useState("");
   const [category, setCategory] = useState(null), [detailsRetry, setDetailsRetry] = useState(0);
   const [details, setDetails] = useState({ category: null, loading: false, results: [], error: "" });
   const panelId = useId(), statButtons = useRef({});
@@ -50,7 +52,10 @@ export default function GitLabSettings({ onError, refresh }) {
   // Keep a failed request distinct from the initial loading state.
   const load = useCallback(async () => {
     try {
-      setConfig(await api("/gitlab/"));
+      const result = await api("/gitlab/");
+      setConfig(result);
+      setDraft((previous) => previous || { base_url: result.base_url || "", project_path: result.project_path || "",
+        primary_labels: (result.primary_labels || []).join("\n"), start_label: result.start_label || "" });
       setLoadError("");
     } catch (error) {
       setLoadError(error.message);
@@ -78,7 +83,14 @@ export default function GitLabSettings({ onError, refresh }) {
     finally { setBusy(false); }
   };
   if (!config) return <article className="card gitlab-settings">{loadError ? <><p role="alert">Não foi possível carregar a integração GitLab: {loadError}</p><button type="button" disabled={busy} onClick={retryLoad}>Tentar novamente</button></> : "A carregar integração GitLab…"}</article>;
-  const projectName = config.project_path.split("/").at(-1);
+  const projectName = config.project_path?.split("/").at(-1) || "Não configurado";
+  const connectionChanged = draft.base_url !== (config.base_url || "") || draft.project_path !== (config.project_path || "");
+  const saveToken = async (value) => {
+    if (window.notetaker?.saveGitLabToken) await window.notetaker.saveGitLabToken(value);
+    else await api("/gitlab/credentials/", { method: "POST", body: JSON.stringify({ token: value }) });
+    setToken("");
+    setSavedMessage(value ? "Token guardado." : "Token removido.");
+  };
   const listing = details.category === category ? details : { loading: true, results: [], error: "" };
   return <article className="card gitlab-settings" aria-busy={busy}>
     <div className="gitlab-settings-heading">
@@ -88,9 +100,40 @@ export default function GitLabSettings({ onError, refresh }) {
 
     <dl className="gitlab-connection-details">
       <div><dt>Projeto</dt><dd><strong>{projectName}</strong><span>{config.base_url.replace(/^https?:\/\//, "")}/{config.project_path}</span></dd></div>
-      <div><dt>Conta</dt><dd><strong>{config.username || "diogo.leonardo@warpcom.com"}</strong><span>Apenas tarefas atribuídas a ti</span></dd></div>
+      <div><dt>Conta</dt><dd><strong>{config.username || "Não autenticada"}</strong><span>Conta identificada pelo token GitLab</span></dd></div>
       <div><dt>Última sincronização</dt><dd><strong>{config.last_sync_at ? new Date(config.last_sync_at).toLocaleString() : "Ainda não realizada"}</strong><span>{config.enabled ? "Atualização a cada 60 segundos" : "Ativa a ligação para importar tarefas"}</span></dd></div>
     </dl>
+
+    <form className="gitlab-configuration" onSubmit={(event) => {
+      event.preventDefault();
+      run(async () => {
+        const saved = await api("/gitlab/", { method: "PATCH", body: JSON.stringify({ base_url: draft.base_url.trim(), project_path: draft.project_path.trim(),
+          primary_labels: draft.primary_labels.split("\n").map((label) => label.trim()).filter(Boolean), start_label: draft.start_label.trim() }) });
+        if (connectionChanged && window.notetaker?.saveGitLabToken) await window.notetaker.saveGitLabToken("");
+        setDraft({ base_url: saved.base_url || "", project_path: saved.project_path || "",
+          primary_labels: (saved.primary_labels || []).join("\n"), start_label: saved.start_label || "" });
+        setSavedMessage("Configuração guardada.");
+      });
+    }}>
+      <fieldset disabled={busy}>
+        <legend>Ligação</legend>
+        <label>Servidor GitLab<input type="url" required value={draft.base_url} placeholder="https://gitlab.example.com" onChange={(event) => { setDraft({ ...draft, base_url: event.target.value }); setSavedMessage(""); }}/></label>
+        <label>Caminho do projeto<input required maxLength={500} value={draft.project_path} placeholder="grupo/projeto" onChange={(event) => { setDraft({ ...draft, project_path: event.target.value }); setSavedMessage(""); }}/></label>
+        <details><summary>Regras de etiquetas</summary>
+          <label>Etiquetas principais obrigatórias (opcional, uma por linha)<textarea rows={3} value={draft.primary_labels} onChange={(event) => setDraft({ ...draft, primary_labels: event.target.value })}/></label>
+          <label>Etiqueta que define a data de início (opcional)<input maxLength={255} value={draft.start_label} onChange={(event) => setDraft({ ...draft, start_label: event.target.value })}/></label>
+        </details>
+        <button type="submit" className="secondary-action">Guardar configuração</button>
+      </fieldset>
+    </form>
+    <form className="gitlab-credentials" onSubmit={(event) => { event.preventDefault(); run(() => saveToken(token)); }}>
+      <span className={`gitlab-token-state ${config.has_token ? "is-configured" : ""}`}>{config.has_token ? "Token configurado" : "Token por configurar"}</span>
+      <label>Token pessoal GitLab<input type="password" autoComplete="off" maxLength={4096} value={token} disabled={busy || connectionChanged || !config.base_url || !config.project_path} onChange={(event) => { setToken(event.target.value); setSavedMessage(""); }}/></label>
+      <div className="gitlab-sync-actions"><button type="submit" className="secondary-action" disabled={busy || connectionChanged || !token.trim() || !config.base_url || !config.project_path}>{config.has_token ? "Substituir token" : "Guardar token"}</button>
+        <button type="button" className="secondary-action" disabled={busy || !config.has_token} onClick={() => run(() => saveToken(""))}>Remover token</button></div>
+      {!window.notetaker?.saveGitLabToken && <p role="status">No browser, o token fica apenas em memória até o backend reiniciar.</p>}
+    </form>
+    {savedMessage && <p role="status">{savedMessage}</p>}
 
     <div className="gitlab-sync-stats" role="group" aria-label="Resumo da sincronização">
       {STATUS_CATEGORIES.map(([key, label]) => <button type="button" key={key} ref={(element) => { statButtons.current[key] = element; }} className={config[key] > 0 ? `has-items stat-${key}` : ""} aria-expanded={category === key} aria-controls={panelId} onClick={() => setCategory(category === key ? null : key)}><strong>{config[key] ?? 0}</strong><span>{label}</span></button>)}
@@ -116,7 +159,7 @@ export default function GitLabSettings({ onError, refresh }) {
     <label className="gitlab-write-toggle"><input type="checkbox" checked={!config.read_only} disabled={busy} onChange={(event) => { run(() => api("/gitlab/", { method: "PATCH", body: JSON.stringify({ write_enabled: event.target.checked }) })); }}/><span>Permitir escrita no GitLab<small>As alterações e os tempos são enviados automaticamente. Publicar tarefas locais continua a exigir o botão da tarefa.</small></span></label>
     <div className="gitlab-settings-footer">
       <div className="gitlab-sync-explanation"><strong>{config.read_only ? "Apenas consulta e importação" : "Envio automático ativo"}</strong><p>{config.read_only ? "Escritas remotas bloqueadas. As alterações locais ficam pendentes até ativares a escrita." : "Título, descrição, estado, etiquetas, estimativas e tempos são enviados a cada sincronização. Tarefas com conflitos ficam pendentes."}</p><small>{config.enabled ? "Consulta automaticamente com a app em execução, incluindo minimizada." : "Enquanto desativada, não são feitos pedidos ao GitLab."}</small></div>
-      <div className="gitlab-sync-actions"><button type="button" className="secondary-action" disabled={busy || (!config.enabled && !config.has_token)} onClick={() => run(() => api("/gitlab/", { method: "PATCH", body: JSON.stringify({ enabled: !config.enabled }) }))}>{config.enabled ? "Desativar sincronização" : "Ativar sincronização"}</button>
+      <div className="gitlab-sync-actions"><button type="button" className="secondary-action" disabled={busy || (!config.enabled && (!config.has_token || !config.base_url || !config.project_path || connectionChanged))} onClick={() => run(() => api("/gitlab/", { method: "PATCH", body: JSON.stringify({ enabled: !config.enabled }) }))}>{config.enabled ? "Desativar sincronização" : "Ativar sincronização"}</button>
 
         <button type="button" className="secondary-action" disabled={busy || !config.enabled || !config.has_token} onClick={() => run(() => api("/gitlab/sync/", { method: "POST" }))}>Forçar sincronização</button></div>
     </div>

@@ -16,7 +16,6 @@ import { startActiveListening, startCapture } from "./capture";
 
 const VIEWS = ["Hoje", "Tarefas", "Projetos", "Reuniões", "Notas", "Pesquisa", "Definições", "Logs"];
 const REMINDER_OPTIONS = [[0, "Na hora"], [5, "5 minutos antes"], [15, "15 minutos antes"], [30, "30 minutos antes"], [60, "1 hora antes"], [1440, "1 dia antes"]];
-const GITLAB_PRIMARY_LABELS = new Set(["To Do", "On Going", "On Testing / Pending Deploy"]);
 
 // GitLab uses working days: a month is four weeks, a week five eight-hour days.
 const GITLAB_TIME_UNITS = [["mo", 576000], ["w", 144000], ["d", 28800], ["h", 3600], ["m", 60]];
@@ -265,8 +264,8 @@ function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, 
         <div className="project-meeting-content">
           {summaries.filter((summary) => summary.kind === "meeting" && summary.session === meeting.id).map((summary) => <div key={summary.id} role="link" tabIndex={0} className="project-summary-link"
             onClick={() => onOpen({ kind: "summary", object_id: summary.id, meeting_id: meeting.id })}
-            onKeyDown={(event) => { if (event.key === "Enter") onOpen({ kind: "summary", object_id: summary.id, meeting_id: meeting.id }); }}>
-            <SummaryCard summary={summary} title="Resumo"/></div>)}
+            onKeyDown={(event) => { if (event.key === "Enter" && event.target === event.currentTarget) onOpen({ kind: "summary", object_id: summary.id, meeting_id: meeting.id }); }}>
+            <SummaryCard summary={summary} title="Resumo" onOpenTask={onOpen}/></div>)}
           <h4>Notas</h4><div className="card-list">{notes.filter((note) => note.session === meeting.id).map((note) => <button type="button" className="card project-content-link" key={note.id} onClick={() => onOpen({ kind: "note", object_id: note.id, meeting_id: meeting.id })}><strong>{note.title || "Nota pessoal"}</strong><p>{note.body}</p></button>)}</div>
           <h4>Tarefas</h4><TaskList {...taskProps} tasks={projectTasks.filter((task) => task.session === meeting.id)} defaultSession={meeting.id} initialFilter="all"/>
         </div>
@@ -666,7 +665,8 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     const assigned = tags.filter((tag) => task.tags?.includes(tag.id));
     const invalid = (task.tags || []).filter((id) => !gitlabStatus.available_tag_ids?.includes(id));
     if (invalid.length) return `Estas labels não existem no GitLab: ${invalid.map((id) => tags.find((tag) => tag.id === id)?.name || `#${id}`).join(", ")}`;
-    if (!assigned.some((tag) => GITLAB_PRIMARY_LABELS.has(tag.name))) return "Escolhe pelo menos uma label principal: To Do, On Going ou On Testing / Pending Deploy.";
+    const primaryLabels = gitlabStatus.primary_labels || [];
+    if (primaryLabels.length && !assigned.some((tag) => primaryLabels.includes(tag.name))) return `Escolhe pelo menos uma etiqueta principal configurada: ${primaryLabels.join(", ")}.`;
     if (assigned.some((tag) => tag.name.includes(","))) return "A API GitLab não permite enviar labels com vírgulas.";
     return "";
   };
@@ -900,8 +900,20 @@ function DailySummaryPicker({ summaries, date, onDateChange, busy, onGenerate })
   </Popup>;
 }
 
-function SummaryCard({ summary, title = "Resumo" }) {
-  return <article className="card summary"><h3>{title}</h3><p>{summary.content}</p>{summary.decisions?.length > 0 && <><h4>Decisões</h4><ul>{summary.decisions.map((item, index) => <li key={index}>{item}</li>)}</ul></>}{summary.open_questions?.length > 0 && <><h4>Questões em aberto</h4><ul>{summary.open_questions.map((item, index) => <li key={index}>{item}</li>)}</ul></>}</article>;
+function SummaryCard({ summary, title = "Resumo", onOpenTask }) {
+  return <article className="card summary">
+    <h3>{title}</h3><p>{summary.content}</p>
+    {summary.decisions?.length > 0 && <><h4>Decisões</h4><ul>{summary.decisions.map((item, index) => <li key={index}>{item}</li>)}</ul></>}
+    {summary.pending_actions?.length > 0 && <><h4>Ações pendentes</h4><ul>{summary.pending_actions.map((action) => <li key={action.id}>
+      <strong>{action.owner_label}:</strong>{" "}
+      {onOpenTask ? <button type="button" className="text-button" onClick={(event) => {
+        event.stopPropagation(); onOpenTask({ kind: "task", object_id: action.id, meeting_id: summary.session });
+      }}>{action.title}</button> : action.title}
+      {action.due_is_ambiguous ? ` · Prazo por confirmar${action.date_phrase ? `: ${action.date_phrase}` : ""}`
+        : action.due_at ? ` · ${new Date(action.due_at).toLocaleString("pt-PT")}` : ""}
+    </li>)}</ul></>}
+    {summary.open_questions?.length > 0 && <><h4>Questões em aberto</h4><ul>{summary.open_questions.map((item, index) => <li key={index}>{item}</li>)}</ul></>}
+  </article>;
 }
 
 function ProcessingBadge({ processing, onRetry, onCancel, retrying = false, cancelling = false }) {
@@ -1046,7 +1058,7 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
     <section className="meeting-panel" hidden={meetingPanel !== "Organização"}><article className="card"><h3>Projeto</h3><OrganizationFields item={selected} projects={projects} tags={tags} onSave={(changes) => run("organization", () => api(`/sessions/${selected.id}/`, { method: "PATCH", body: JSON.stringify(changes) }))}/></article>
     </section><section className="meeting-panel" hidden={meetingPanel !== "Resumo"}>
     {selected.summaries.length === 0 && <article className="card summary pending-summary">{!["failed", "cancelled"].includes(selected.processing.state) && <Spinner/>}<p>{selected.processing.state === "failed" ? "Não foi possível gerar o resumo. Usa Repetir para tentar novamente." : selected.processing.state === "cancelled" ? "O processamento desta reunião foi cancelado." : "O resumo aparecerá quando o processamento terminar."}</p></article>}
-    {selected.summaries.map((summary) => <SummaryCard summary={summary} key={summary.id}/>)}
+    {selected.summaries.map((summary) => <SummaryCard summary={summary} key={summary.id} onOpenTask={taskProps.onOpenSource}/>)}
     </section><section className="meeting-panel" hidden={meetingPanel !== "Organização"}>
     {selected.speakers.length > 0 && <article className="card participants"><h3>Participantes</h3>{selected.speakers.map((speaker) => { const isEditing = editingSpeaker?.id === speaker.id; return <div className="participant-row" key={speaker.id}><div className="participant-field"><span>{speaker.kind === "self" ? "A minha voz" : "Participante"}</span>{isEditing ? <input value={editingSpeaker.label} onChange={(event) => setEditingSpeaker({ ...editingSpeaker, label: event.target.value })} autoFocus/> : <strong>{speaker.label}</strong>}</div><div className="participant-actions">{isEditing ? <><button className="text-button" onClick={() => saveSpeaker(speaker)} disabled={!editingSpeaker.label.trim() || busy === `speaker-${speaker.id}`}>Concluir</button><button className="text-button secondary-text" onClick={() => setEditingSpeaker(null)}>Cancelar</button></> : <button className="text-button" onClick={() => setEditingSpeaker({ id: speaker.id, label: speaker.label })}>Editar</button>}{speaker.kind !== "self" && speaker.label !== "Outros" && !isEditing && <button className="text-button" onClick={() => mergeSpeaker(speaker)} disabled={busy === `merge-${speaker.id}`}>{busy === `merge-${speaker.id}` && <Spinner/>}Fundir em Outros</button>}</div></div>; })}</article>}
     </section><section className="meeting-panel" hidden={meetingPanel !== "Notas"}>
@@ -1070,23 +1082,77 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
 
 function Settings({ ai, onOpenAISetup, microphoneId, setMicrophoneId, keepDisplayAwake, setKeepDisplayAwake, autoMeetingEnabled, setAutoMeetingEnabled, onError }) {
   const [devices, setDevices] = useState([]), [launchAtLogin, setLaunchAtLogin] = useState(false), [retentionDays, setRetentionDays] = useState(7), [maxGb, setMaxGb] = useState(5), [logHours, setLogHours] = useState(24), [defaultLanguage, setDefaultLanguage] = useState("pt"), [glossary, setGlossary] = useState(""), [busy, setBusy] = useState(false);
+  const [models, setModels] = useState([]), [selectedModel, setSelectedModel] = useState(""), [savedModel, setSavedModel] = useState("");
+  const [modelsLoading, setModelsLoading] = useState(false), [modelError, setModelError] = useState("");
+  const [checkingCompatibility, setCheckingCompatibility] = useState(false), [compatibility, setCompatibility] = useState(null);
+  const [savedMessage, setSavedMessage] = useState("");
+  const loadModels = useCallback(async () => {
+    setModelsLoading(true); setModelError("");
+    try {
+      const result = await api("/ai/models/");
+      if (!Array.isArray(result.models) || typeof result.selected_model !== "string") throw new Error("Lista de modelos inválida.");
+      setModels(result.models); setSavedModel(result.selected_model);
+      setSelectedModel((previous) => previous || result.selected_model);
+    } catch (error) { setModelError(error.message); }
+    finally { setModelsLoading(false); }
+  }, []);
+  useEffect(() => { loadModels(); }, [loadModels]);
   useEffect(() => {
     navigator.mediaDevices?.enumerateDevices().then((items) => setDevices(items.filter((item) => item.kind === "audioinput"))).catch(console.error);
     window.notetaker?.getLaunchAtLogin().then(setLaunchAtLogin).catch(console.error);
     api("/settings/").then((items) => { const values = Object.fromEntries(items.map((item) => [item.key, item.value])); if (values.audio_retention_days) setRetentionDays(values.audio_retention_days); if (values.audio_max_bytes) setMaxGb(Math.max(1, Math.round(values.audio_max_bytes / 1024 ** 3))); if (values.active_log_window_hours) setLogHours(values.active_log_window_hours); if (["pt", "en"].includes(values.default_language)) setDefaultLanguage(values.default_language); if (typeof values.transcription_glossary === "string") setGlossary(values.transcription_glossary); }).catch((error) => onError(error.message));
   }, [onError]);
   const save = async () => {
-    setBusy(true);
+    setBusy(true); setSavedMessage("");
     try { localStorage.setItem("microphoneDeviceId", microphoneId); await window.notetaker?.setLaunchAtLogin(launchAtLogin); await api("/settings/bulk_upsert/", { method: "POST", body: JSON.stringify({ settings: {
       audio_retention_days: Number(retentionDays), audio_max_bytes: Number(maxGb) * 1024 ** 3, active_log_window_hours: Number(logHours),
       default_language: defaultLanguage, transcription_glossary: glossary,
-    } }) }); } catch (error) { onError(error.message); } finally { setBusy(false); }
+      ...(selectedModel ? { lmstudio_model: selectedModel } : {}),
+    } }) });
+      if (selectedModel) setSavedModel(selectedModel);
+      setCompatibility(null); setSavedMessage("Definições guardadas.");
+      await ai.check();
+    } catch (error) { onError(error.message); } finally { setBusy(false); }
   };
-  return <article className="settings-grid card"><div><div className="ai-model-heading"><span>Modelo para resumos, tarefas e perguntas à IA</span><div className="ai-model-actions"><button type="button" aria-label="Guia de instalação e configuração da IA" title="Guia de instalação e configuração da IA" onClick={onOpenAISetup}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><circle cx="12" cy="7.5" r=".7" fill="currentColor" stroke="none"/></svg></button><button type="button" aria-label={ai.checking ? "A verificar o modelo de IA" : "Verificar novamente o modelo de IA"} title={ai.checking ? "A verificar…" : "Verificar novamente"} disabled={ai.checking} aria-busy={ai.checking} onClick={() => ai.check()}><svg className={ai.checking ? "ai-retry-spinning" : undefined} aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></svg></button></div></div><strong>{ai.health ? `${ai.health.provider === "lmstudio" ? "LM Studio" : ai.health.provider === "ollama" ? "Ollama" : ai.health.provider} · ${ai.health.model || "Não configurado"} · ${ai.health.ai_available ? "Disponível" : "Indisponível"}` : ai.error ? "Não foi possível verificar o modelo" : "A verificar o modelo…"}</strong>{ai.error && <small role="status">{ai.error}</small>}</div><div><label>Modelo de transcrição</label><strong>Faster Whisper Medium · PT/EN</strong></div><div><label>Microfone</label><Select value={microphoneId} onChange={(event) => setMicrophoneId(event.target.value)}><option value="">Predefinido do Windows</option>{devices.map((device) => <option value={device.deviceId} key={device.deviceId}>{device.label || "Microfone"}</option>)}</Select></div><div><label>Idioma para reuniões curtas</label><Select value={defaultLanguage} onChange={(event) => setDefaultLanguage(event.target.value)}><option value="pt">Português</option><option value="en">English</option></Select></div><div className="settings-limits wide"><label>Retenção máxima (dias)<input type="number" min="1" max="7" value={retentionDays} onChange={(event) => setRetentionDays(event.target.value)}/></label><label>Limite de áudio (GB)<input type="number" min="1" value={maxGb} onChange={(event) => setMaxGb(event.target.value)}/></label><label>Janela dos logs (horas)<input type="number" min="1" value={logHours} onChange={(event) => setLogHours(event.target.value)}/></label></div><div className="wide"><label>Glossário de nomes, empresas e siglas</label><textarea value={glossary} onChange={(event) => setGlossary(event.target.value)} placeholder="Warpcom, SecureNet, onboarding, Oracle…"/></div><label className="toggle"><input type="checkbox" checked={launchAtLogin} onChange={(event) => setLaunchAtLogin(event.target.checked)}/> Iniciar com o Windows</label><label className="toggle">
+  const currentModel = selectedModel || savedModel || ai.health?.model || "";
+  const modelChanged = currentModel !== (savedModel || ai.health?.model || "");
+  const verifyCompatibility = async () => {
+    setCheckingCompatibility(true); setCompatibility(null);
+    try {
+      const result = await api("/ai/models/check/", { method: "POST" });
+      if (result.structured_output !== true || result.model !== currentModel) throw new Error("Não foi possível confirmar o modelo verificado.");
+      setCompatibility({ error: false, text: "Compatibilidade JSON confirmada." });
+    } catch (error) { setCompatibility({ error: true, text: error.message }); }
+    finally { setCheckingCompatibility(false); }
+  };
+  return <article className="settings-grid card">
+    <div className="ai-model-field">
+      <div className="ai-model-heading"><span>Modelo para resumos, tarefas e perguntas à IA</span><div className="ai-model-actions">
+        <button type="button" aria-label="Guia de instalação e configuração da IA" title="Guia de instalação e configuração da IA" onClick={onOpenAISetup}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><circle cx="12" cy="7.5" r=".7" fill="currentColor" stroke="none"/></svg></button>
+        <button type="button" aria-label="Atualizar modelos e disponibilidade" title="Atualizar modelos e disponibilidade" disabled={ai.checking || modelsLoading || busy || checkingCompatibility} aria-busy={ai.checking || modelsLoading} onClick={() => { ai.check(); loadModels(); }}><svg className={ai.checking || modelsLoading ? "ai-retry-spinning" : undefined} aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></svg></button>
+      </div></div>
+      <Select aria-label="Modelo de IA" value={currentModel} disabled={modelsLoading || busy || checkingCompatibility || !models.length} onChange={(event) => { setSelectedModel(event.target.value); setCompatibility(null); setSavedMessage(""); }}>
+        {!currentModel && <option value="" disabled>Sem modelos disponíveis</option>}
+        {currentModel && !models.some((model) => model.id === currentModel) && <option value={currentModel} disabled>{currentModel} (não listado)</option>}
+        {models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}{model.loaded ? "" : " · Por carregar"}</option>)}
+      </Select>
+      <strong>{ai.health ? `LM Studio · ${ai.health.model || "Não configurado"} · ${ai.health.ai_available ? "Disponível" : "Indisponível"}` : ai.error ? "Não foi possível verificar o modelo" : "A verificar o modelo…"}</strong>
+      {ai.error && <small role="status">{ai.error}</small>}
+      {modelError && <small role="alert">{modelError}</small>}
+      {modelChanged && <small role="status">Modelo por guardar.</small>}
+      <button type="button" className="secondary-action ai-compatibility-check" disabled={!ai.health?.ai_available || modelChanged || busy || checkingCompatibility || ai.checking} onClick={verifyCompatibility}>{checkingCompatibility ? "A verificar compatibilidade…" : "Verificar compatibilidade JSON"}</button>
+      {compatibility && <small role={compatibility.error ? "alert" : "status"}>{compatibility.text}</small>}
+    </div>
+    <div><label>Modelo de transcrição</label><strong>Faster Whisper Medium · PT/EN</strong></div>
+    <div><label>Microfone</label><Select value={microphoneId} onChange={(event) => setMicrophoneId(event.target.value)}><option value="">Predefinido do Windows</option>{devices.map((device) => <option value={device.deviceId} key={device.deviceId}>{device.label || "Microfone"}</option>)}</Select></div>
+    <div><label>Idioma pré-definido</label><Select aria-label="Idioma pré-definido" value={defaultLanguage} onChange={(event) => { setDefaultLanguage(event.target.value); setSavedMessage(""); }}><option value="pt">Português</option><option value="en">English</option></Select></div>
+    <div className="settings-limits wide"><label>Retenção máxima (dias)<input type="number" min="1" max="7" value={retentionDays} onChange={(event) => setRetentionDays(event.target.value)}/></label><label>Limite de áudio (GB)<input type="number" min="1" value={maxGb} onChange={(event) => setMaxGb(event.target.value)}/></label><label>Janela dos logs (horas)<input type="number" min="1" value={logHours} onChange={(event) => setLogHours(event.target.value)}/></label></div>
+    <div className="wide"><label>Glossário de nomes, empresas e siglas</label><textarea value={glossary} onChange={(event) => setGlossary(event.target.value)} placeholder="Nomes e termos específicos das tuas reuniões"/></div>
+    <label className="toggle"><input type="checkbox" checked={launchAtLogin} onChange={(event) => setLaunchAtLogin(event.target.checked)}/> Iniciar com o Windows</label><label className="toggle">
   <input type="checkbox" checked={keepDisplayAwake}
     onChange={(event) => setKeepDisplayAwake(event.target.checked)}/>
   Manter o ecrã ativo
-</label><label className="toggle"><input type="checkbox" checked={autoMeetingEnabled} onChange={(event) => setAutoMeetingEnabled(event.target.checked)}/> Iniciar reunião ao entrar no Teams ou Webex</label><small>Deteção nas aplicações do Windows. Termina a captura pelo botão Terminar reunião.</small><button className="save" onClick={save} disabled={busy}>{busy && <Spinner/>}Guardar definições</button></article>;
+</label><label className="toggle"><input type="checkbox" checked={autoMeetingEnabled} onChange={(event) => setAutoMeetingEnabled(event.target.checked)}/> Iniciar reunião automaticamente ao entrar numa chamada Teams ou Webex</label><button className="save" onClick={save} disabled={busy || checkingCompatibility}>{busy && <Spinner/>}Guardar definições</button>{savedMessage && <p className="wide" role="status">{savedMessage}</p>}</article>;
 }
 
 export default function App() {
@@ -1104,6 +1170,13 @@ export default function App() {
   const [projects, setProjects] = useState([]), [tags, setTags] = useState([]), [notes, setNotes] = useState([]), [participants, setParticipants] = useState([]);
   const [gitlabStatus, setGitlabStatus] = useState(null), [gitlabBusy, setGitlabBusy] = useState(false);
   const [projectFilter, setProjectFilter] = useState(""), [tagFilter, setTagFilter] = useState(""), [participantFilter, setParticipantFilter] = useState(""), [dateFrom, setDateFrom] = useState(""), [dateTo, setDateTo] = useState("");
+  const [searchLoading, setSearchLoading] = useState(false), [loadingMore, setLoadingMore] = useState(false);
+  const searchRequest = useRef(0), loadingMoreRequest = useRef(null);
+  const searchParameters = useMemo(() => new URLSearchParams({
+    q: query.trim(), project: projectFilter, tag: tagFilter, participant: participantFilter,
+    date_from: dateFrom, date_to: dateTo, limit: "50",
+  }).toString(), [query, projectFilter, tagFilter, participantFilter, dateFrom, dateTo]);
+  const visibleResults = results?.searchKey === searchParameters ? results : null;
   const [taskTarget, setTaskTarget] = useState(null), [contentDetail, setContentDetail] = useState(null);
   const [taskCreateOpen, setTaskCreateOpen] = useState(false);
   const [autoMeetingEnabled, setAutoMeetingEnabled] = useState(() => localStorage.getItem("autoMeetingEnabled") !== "false");
@@ -1343,19 +1416,49 @@ export default function App() {
   }, [autoMeetingEnabled, detectedMeetings, meetingCapture, captureBusy]);
   useEffect(() => {
     answerRequest.current += 1; setChatAnswer(null);
-    const trimmedQuery = query.trim();
-    if (!trimmedQuery && !projectFilter && !tagFilter && !participantFilter && !dateFrom && !dateTo) { setResults(null); return undefined; }
-    let cancelled = false;
+    const requestId = ++searchRequest.current;
+    loadingMoreRequest.current = null;
+    setResults(null); setLoadingMore(false);
+    const parameters = new URLSearchParams(searchParameters);
+    if (!["q", "project", "tag", "participant", "date_from", "date_to"].some((key) => parameters.get(key))) {
+      setSearchLoading(false); return undefined;
+    }
+    setSearchLoading(true);
     const timer = setTimeout(async () => {
       try {
-        const nextResults = await api(`/search/?${new URLSearchParams({ q: trimmedQuery, project: projectFilter, tag: tagFilter, participant: participantFilter, date_from: dateFrom, date_to: dateTo })}`);
-        if (!cancelled) setResults(nextResults);
+        const nextResults = await api(`/search/?${searchParameters}&offset=0`);
+        if (requestId === searchRequest.current) setResults({ ...nextResults, searchKey: searchParameters });
       } catch (nextError) {
-        if (!cancelled) setError(nextError.message);
+        if (requestId === searchRequest.current) setError(nextError.message);
+      } finally {
+        if (requestId === searchRequest.current) setSearchLoading(false);
       }
     }, 250);
-    return () => { cancelled = true; clearTimeout(timer); };
-  }, [query, projectFilter, tagFilter, participantFilter, dateFrom, dateTo]);
+    return () => { searchRequest.current += 1; clearTimeout(timer); };
+  }, [searchParameters]);
+  // Append only to the same query/filter generation; stale page responses are ignored.
+  const loadMoreSearch = async () => {
+    if (!visibleResults?.has_more || searchLoading || loadingMoreRequest.current) return;
+    const requestId = searchRequest.current;
+    const token = {};
+    loadingMoreRequest.current = token; setLoadingMore(true);
+    try {
+      const nextResults = await api(`/search/?${searchParameters}&offset=${visibleResults.next_offset}`);
+      if (requestId !== searchRequest.current) return;
+      setResults((current) => {
+        if (current?.searchKey !== searchParameters) return current;
+        const seen = new Set(current.sources.map((source) => source.id));
+        return { ...nextResults, searchKey: searchParameters,
+          sources: [...current.sources, ...nextResults.sources.filter((source) => !seen.has(source.id))] };
+      });
+    } catch (nextError) {
+      if (requestId === searchRequest.current) setError(nextError.message);
+    } finally {
+      if (loadingMoreRequest.current === token) {
+        loadingMoreRequest.current = null; setLoadingMore(false);
+      }
+    }
+  };
   const ask = async () => {
     if (!query.trim()) return;
     const requestId = ++answerRequest.current;
@@ -1428,7 +1531,7 @@ export default function App() {
       {view === "Pesquisa" && <><label>Participante<Select value={participantFilter} onChange={(event) => setParticipantFilter(event.target.value)}><option value="">Todos</option>{participants.map((item) => <option key={item.id} value={item.id}>{item.label} · {sessions.find((session) => session.id === item.session)?.title || "Reunião"}</option>)}</Select></label><label>Desde<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)}/></label><label>Até<input type="date" value={dateTo} min={dateFrom} onChange={(event) => setDateTo(event.target.value)}/></label></>}
       <button type="button" className="text-button" onClick={() => { setProjectFilter(""); setTagFilter(""); setParticipantFilter(""); setDateFrom(""); setDateTo(""); }}>Limpar filtros</button>
     </div>  </>;
-  return <main className="shell"><AISetupGuide {...ai} open={aiSetupOpen} onClose={() => setAISetupOpen(false)}/><aside><div className="brand"><img className="brand-mark" src={nexusSymbol} alt=""/><strong>Nexus</strong></div><nav>{VIEWS.map((item) => <button className={view === item ? "active" : ""} onClick={() => selectView(item)} key={item}>{item}</button>)}</nav><div className="sidebar-controls">
+  return <main className="shell"><AISetupGuide {...ai} open={aiSetupOpen} onClose={() => setAISetupOpen(false)}/><aside><div className="brand"><img className="brand-mark" src={nexusSymbol} alt=""/><strong>Nexus AI</strong></div><nav>{VIEWS.map((item) => <button className={view === item ? "active" : ""} onClick={() => selectView(item)} key={item}>{item}</button>)}</nav><div className="sidebar-controls">
       <button type="button" className="sidebar-control" role="switch" aria-label="Escuta ativa" aria-checked={activeEnabled} disabled={captureBusy || Boolean(meetingCapture)} onClick={toggleActiveListening} title={meetingCapture ? "Reunião em curso" : activeListening ? "Escuta ativa" : "Captura pausada"}>
         <span aria-hidden="true" className={activeListening || meetingCapture ? "live-dot" : "idle-dot"}/><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg><span className="sidebar-control-label">{meetingCapture ? "Reunião em curso" : "Escuta ativa"}</span><span aria-hidden="true" className="sidebar-toggle"/>
       </button>
@@ -1444,6 +1547,6 @@ export default function App() {
     {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList {...taskProps} initialFilter="mine" settingsFilters={view === "Tarefas" ? organizationFilters : null} activeFilterCount={activeOrganizationFilterCount} tasks={organizationTasks} today={view === "Hoje"} showSections={view === "Tarefas"} createOpen={view === "Tarefas" ? taskCreateOpen : undefined} onCreateOpenChange={view === "Tarefas" ? setTaskCreateOpen : undefined}/>} {view === "Reuniões" && <Meetings tasks={tasks} taskProps={taskProps} projects={projects} tags={tags} key={meetingsKey} sessions={organizationSessions} refresh={refresh} onError={setError} target={meetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{contentDetail && <article className="card"><h3>{contentDetail.title || "Nota pessoal"}</h3><p>{contentDetail.body}</p><OrganizationMenu item={contentDetail} projects={projects} tags={tags} onSave={async (changes) => {
       try { const saved = await api(`/notes/${contentDetail.id}/`, { method: "PATCH", body: JSON.stringify(changes) }); setContentDetail(saved); await refresh(); }
       catch (nextError) { setError(nextError.message); }
-    }}/><button onClick={() => setContentDetail(null)}>Fechar</button></article>}{chatAnswer && <article className="card answer"><h3>Resposta</h3><p>{chatAnswer.answer}</p>{chatAnswer.warning && <small>{chatAnswer.warning}</small>}<ReferenceInfo label="Fontes da resposta">{chatAnswer.sources?.length ? <span className="answer-sources">{chatAnswer.sources.map((source) => <button key={source.id} onClick={() => openSource(source)}><span>{source.meeting_title} · {source.speaker}</span><small>{source.text}</small></button>)}</span> : <span className="reference-text">Sem evidência suficiente.</span>}</ReferenceInfo></article>}{results && <div className="card-list search-results">{results.sources?.length ? results.sources.map((source) => <button className="card search-result" key={source.id} onClick={() => openSource(source)}><div className="search-result-meta"><span>{{segment: "Transcrição", summary: "Resumo", note: "Nota", task: "Tarefa", session: "Reunião"}[source.kind]}</span><span>{source.title || source.meeting_title}</span></div><p>{source.text}</p></button>) : <div className="empty">Não foram encontrados resultados locais.</div>}</div>}</>} {view === "Definições" && <Settings ai={ai} onOpenAISetup={() => setAISetupOpen(true)} microphoneId={microphoneId} setMicrophoneId={setMicrophoneId}
+    }}/><button onClick={() => setContentDetail(null)}>Fechar</button></article>}{chatAnswer && <article className="card answer"><h3>Resposta</h3><p>{chatAnswer.answer}</p>{chatAnswer.warning && <small>{chatAnswer.warning}</small>}<ReferenceInfo label="Fontes da resposta">{chatAnswer.sources?.length ? <span className="answer-sources">{chatAnswer.sources.map((source) => <button key={source.id} onClick={() => openSource(source)}><span>{source.meeting_title} · {source.speaker}</span><small>{source.text}</small></button>)}</span> : <span className="reference-text">Sem evidência suficiente.</span>}</ReferenceInfo></article>}{searchLoading && <p role="status">A pesquisar…</p>}{visibleResults && <div className="card-list search-results">{visibleResults.sources?.length ? visibleResults.sources.map((source) => <button className="card search-result" key={source.id} onClick={() => openSource(source)}><div className="search-result-meta"><span>{{segment: "Transcrição", summary: "Resumo", note: "Nota", task: "Tarefa", session: "Reunião"}[source.kind]}</span><span>{source.title || source.meeting_title}</span></div><p>{source.text}</p></button>) : <div className="empty">Não foram encontrados resultados locais.</div>}{visibleResults.has_more && <button type="button" className="secondary-action" onClick={loadMoreSearch} disabled={loadingMore} aria-busy={loadingMore}>{loadingMore && <Spinner/>}{loadingMore ? "A carregar…" : "Ver mais"}</button>}</div>}</>} {view === "Definições" && <Settings ai={ai} onOpenAISetup={() => setAISetupOpen(true)} microphoneId={microphoneId} setMicrophoneId={setMicrophoneId}
   keepDisplayAwake={keepDisplayAwake} setKeepDisplayAwake={setKeepDisplayAwake} autoMeetingEnabled={autoMeetingEnabled} setAutoMeetingEnabled={setAutoMeetingEnabled} onError={setError}/>} {view === "Definições" && <GitLabSettings onError={setError} refresh={refresh}/>} {view === "Logs" && <ListeningLogs logs={logs}/>}</section></main>;
 }

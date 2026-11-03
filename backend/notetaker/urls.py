@@ -28,6 +28,8 @@ urlpatterns = [
     path("gitlab/sync/", views.gitlab_sync),
     path("gitlab/push/", views.gitlab_push),
     path("health/", views.health),
+    path("ai/models/", views.ai_models),
+    path("ai/models/check/", views.ai_model_check),
     path("active-listening/", views.active_listening),
     path("search/", views.search),
     path("chat/", views.chat),

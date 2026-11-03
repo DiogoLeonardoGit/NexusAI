@@ -9,7 +9,7 @@ from django.db.models import Count, Q
 from django.utils import timezone
 
 from notetaker.models import GitLabTask, Task
-from .ollama import generate_json
+from .lmstudio import generate_json
 from .search import retrieve, search_filters
 
 

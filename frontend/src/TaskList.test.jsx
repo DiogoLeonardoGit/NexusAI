@@ -61,7 +61,7 @@ describe("task interface", () => {
     expect(api).toHaveBeenCalledWith("/tasks/1/complete/", { method: "POST" });
   });
   it("marks only imported tasks with GitLab and hides them using a local action", async () => {
-    const imported = { ...task, creation_source: "gitlab", gitlab: { web_url: "https://gitlab.warpcom.com/project/-/issues/5", available_tag_ids: [1, 2, 3], pending: true, conflicts: {} } };
+    const imported = { ...task, creation_source: "gitlab", gitlab: { web_url: "https://gitlab.example.com/project/-/issues/5", available_tag_ids: [1, 2, 3], pending: true, conflicts: {} } };
     await render(); expect(element.querySelector(".gitlab-origin")).toBeNull();
     await render({ tasks: [imported] });
     expect(element.querySelector(".gitlab-origin")).toBeTruthy();
@@ -82,7 +82,7 @@ describe("task interface", () => {
 
 describe("GitLab settings", () => {
   it("shows a disabled, read-only connection and never starts synchronization on mount", async () => {
-    api.mockResolvedValue({ base_url: "https://gitlab.warpcom.com", project_path: "serviceunit/django-apps/twinportal", enabled: false,
+    api.mockResolvedValue({ base_url: "https://gitlab.example.com", project_path: "team/project", enabled: false,
       read_only: true, has_token: false, pending: 0, conflicts: 0, hidden: 0, inactive: 0 });
     await act(async () => root.render(<GitLabSettings onError={vi.fn()} refresh={vi.fn()}/>));
     expect(element.textContent).toContain("Sincronização desativada");
@@ -93,11 +93,31 @@ describe("GitLab settings", () => {
 
   it("mounts the full app and exposes the new controls through the existing tabs", async () => {
     localStorage.setItem("activeListeningEnabled", "false");
-    const config = { base_url: "https://gitlab.warpcom.com", project_path: "serviceunit/django-apps/twinportal", enabled: false,
+    let selectedModel = "Local";
+    const config = { base_url: "https://gitlab.example.com", project_path: "team/project", enabled: false,
       read_only: true, has_token: false, pending: 0, conflicts: 0, hidden: 0, inactive: 0 };
-    api.mockImplementation(async (path) => {
+    api.mockImplementation(async (path, options) => {
       if (path === "/gitlab/") return config;
-      if (path === "/health/") return { model: "Local", ollama: false };
+      if (path === "/health/") return { model: selectedModel, provider: "lmstudio", ai_available: true };
+      if (path === "/ai/models/") return { selected_model: selectedModel, models: [
+        { id: "Local", name: "Local Chat", loaded: true },
+        { id: "Alternative", name: "Alternative Chat", loaded: true },
+      ] };
+      if (path === "/settings/bulk_upsert/") {
+        selectedModel = JSON.parse(options.body).settings.lmstudio_model;
+        return [];
+      }
+      if (path === "/ai/models/check/") return { model: selectedModel, structured_output: true };
+      if (path.startsWith("/search/?")) {
+        const parameters = new URLSearchParams(path.split("?")[1]);
+        const offset = Number(parameters.get("offset"));
+        const query = parameters.get("q");
+        const count = query === "segunda" || offset ? 1 : 50;
+        return { sources: Array.from({ length: count }, (_, index) => ({
+          id: `segment-${query}-${offset + index}`, kind: "segment", title: "Reunião",
+          text: `${query}: trecho ${offset + index}`,
+        })), has_more: query !== "segunda" && offset === 0, next_offset: offset === 0 ? 50 : null };
+      }
       if (path === "/tasks/") return [task];
       if (path === "/tags/") return tags;
       return [];
@@ -110,7 +130,40 @@ describe("GitLab settings", () => {
     expect(element.querySelector(".gitlab-status")).toBeNull();
     await click("Definições");
     expect(element.querySelector(".gitlab-settings")).toBeTruthy();
-    expect(element.textContent).toContain("serviceunit/django-apps/twinportal");
+    expect(element.textContent).toContain("team/project");
+    expect(element.querySelector(".brand").textContent).toBe("Nexus AI");
+    expect(element.querySelector('[aria-label="Idioma pré-definido"]').textContent).toContain("Português");
+    expect(api.mock.calls.some(([path]) => path === "/ai/models/check/")).toBe(false);
+    const modelSelector = element.querySelector('[aria-label="Modelo de IA"]');
+    await act(async () => modelSelector.click());
+    await act(async () => modelSelector.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
+    await act(async () => modelSelector.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+    expect(modelSelector.textContent).toContain("Alternative Chat");
+    expect(element.querySelector(".ai-compatibility-check").disabled).toBe(true);
+    await click("Guardar definições");
+    expect(selectedModel).toBe("Alternative");
+    expect(element.querySelector(".ai-compatibility-check").disabled).toBe(false);
+    await click("Verificar compatibilidade JSON");
+    expect(element.textContent).toContain("Compatibilidade JSON confirmada.");
     expect(api.mock.calls.some(([path]) => path === "/gitlab/sync/")).toBe(false);
+    await click("Pesquisa");
+    const searchInput = element.querySelector(".search input");
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+    await act(async () => {
+      setValue.call(searchInput, "primeira");
+      searchInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 350)); });
+    expect(element.querySelectorAll(".search-result")).toHaveLength(50);
+    await click("Ver mais");
+    expect(element.querySelectorAll(".search-result")).toHaveLength(51);
+    expect([...element.querySelectorAll("button")].some((item) => item.textContent === "Ver mais")).toBe(false);
+    await act(async () => {
+      setValue.call(searchInput, "segunda");
+      searchInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 350)); });
+    expect(element.querySelectorAll(".search-result")).toHaveLength(1);
+    expect(element.querySelector(".search-result").textContent).toContain("segunda");
   });
 });

@@ -45,6 +45,26 @@ class TimelineTranscriptSegmentSerializer(TranscriptSegmentSerializer):
 
 
 class SummarySerializer(serializers.ModelSerializer):
+    pending_actions = serializers.SerializerMethodField()
+
+    def get_pending_actions(self, instance):
+        """Expose live meeting actions without storing a duplicate task list in summaries."""
+        if instance.kind != Summary.Kind.MEETING or not instance.session_id:
+            return []
+        tasks = instance.session.tasks.exclude(
+            status__in=[Task.Status.DONE, Task.Status.CANCELLED],
+        ).order_by("created_at", "pk")
+        return [{
+            "id": task.pk,
+            "title": task.title,
+            "owner_label": task.owner_name or (
+                "Eu" if task.owner == Task.Owner.SELF else "Responsável por definir"
+            ),
+            "due_at": serializers.DateTimeField().to_representation(task.due_at) if task.due_at else None,
+            "date_phrase": task.date_phrase,
+            "due_is_ambiguous": task.due_is_ambiguous,
+        } for task in tasks]
+
     class Meta:
         model = Summary
         fields = "__all__"
@@ -87,6 +107,13 @@ class ProcessingStatusSerializer(serializers.Serializer):
 
 class CaptureSessionSerializer(serializers.ModelSerializer):
     processing = serializers.SerializerMethodField()
+
+    def create(self, validated_data):
+        """Lock new meetings to the user's preferred language, defaulting to Portuguese."""
+        if not validated_data.get("language"):
+            preferred = AppSetting.objects.filter(key="default_language").values_list("value", flat=True).first()
+            validated_data["language"] = preferred if preferred in CaptureSession.Language.values else CaptureSession.Language.PORTUGUESE
+        return super().create(validated_data)
 
     def get_processing(self, instance):
         jobs = instance.processingjob_set.all()
@@ -486,17 +513,14 @@ class TaskSerializer(serializers.ModelSerializer):
 
     def _validate_edit_details(self, attrs):
         """Validate the whole edit before any task, reminder or time write occurs."""
-        if "reminder_offset_minutes" in attrs:
-            due_at = attrs.get("due_at", self.instance.due_at)
-            if due_at and due_at - timedelta(minutes=attrs["reminder_offset_minutes"]) <= timezone.now():
-                raise serializers.ValidationError({"reminder_offset_minutes": "A hora do lembrete já passou. Escolhe uma data posterior ou menos antecedência."})
         if "time_entry" in attrs and not attrs.get("estimate_seconds", self.instance.estimate_seconds):
             raise serializers.ValidationError({"time_entry": "Define uma estimativa antes de registar tempo."})
 
     def update(self, instance, validated_data):
-        from .services.gitlab_sync import COMPLETION_LABELS, queue_task, sync_lock
+        from .services.gitlab import workflow
+        from .services.gitlab_sync import queue_task, sync_lock
         with sync_lock, transaction.atomic():
-            # Recheck time-sensitive validation under the synchronization lock.
+            # Recheck edit dependencies under the synchronization lock.
             self._validate_edit_details(validated_data)
             reminder_offset = validated_data.pop("reminder_offset_minutes", None)
             time_entry = validated_data.pop("time_entry", None)
@@ -516,7 +540,7 @@ class TaskSerializer(serializers.ModelSerializer):
                 instance.save(update_fields=["completed_at"])
                 if instance.status == "done":
                     # Remove only task memberships; keep the reusable label catalogue.
-                    instance.tags.remove(*instance.tags.filter(name__in=COMPLETION_LABELS))
+                    instance.tags.remove(*instance.tags.filter(name__in=workflow().get("primary_labels", [])))
                     instance.reminders.update(status=Reminder.Status.CANCELLED)
             if reminder_offset is not None:
                 instance.due_is_ambiguous = False

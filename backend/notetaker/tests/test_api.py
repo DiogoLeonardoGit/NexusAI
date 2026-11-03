@@ -7,6 +7,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from notetaker.models import AudioChunk, CaptureSession, ProcessingJob, Reminder, Task, TranscriptSegment
+from notetaker.services.lmstudio import LMStudioError
 
 
 @override_settings(LOCAL_API_TOKEN="test-token")
@@ -137,8 +138,10 @@ class ApiTests(TestCase):
         )
         self.assertEqual(response.data["reminder_minutes_before"], 60)
         self.assertEqual(response.data["reminder_status"], Reminder.Status.SCHEDULED)
+        with patch("notetaker.views.timezone.now", return_value=reminder.remind_at + timezone.timedelta(seconds=1)):
+            self.assertIn(reminder.id, [item["id"] for item in self.client.get("/api/reminders/due/").data])
 
-    def test_schedule_rejects_reminder_time_in_the_past(self):
+    def test_schedule_keeps_expired_reminder_without_alerting(self):
         task = Task.objects.create(title="Preparar reunião")
         due = timezone.now() + timezone.timedelta(minutes=5)
         response = self.client.post(
@@ -146,18 +149,33 @@ class ApiTests(TestCase):
             {"due_at": due.isoformat(), "minutes_before": 15},
             format="json",
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertFalse(Reminder.objects.filter(task=task).exists())
+        self.assertEqual(response.status_code, 200)
+        reminder = Reminder.objects.get(task=task)
+        self.assertLess(reminder.remind_at, reminder.created_at)
+        self.assertEqual(response.data["reminder_minutes_before"], 15)
+        self.assertEqual(self.client.get("/api/reminders/due/").data, [])
+        # Inline editing is a second write path, with the same expired-alert rule.
+        edited = self.client.patch(
+            f"/api/tasks/{task.id}/",
+            {"due_at": (timezone.now() - timezone.timedelta(days=1)).isoformat(), "reminder_offset_minutes": 30},
+            format="json",
+        )
+        self.assertEqual(edited.status_code, 200)
+        self.assertEqual(edited.data["reminder_minutes_before"], 30)
+        self.assertEqual(self.client.get("/api/reminders/due/").data, [])
+        self.assertEqual(Reminder.objects.filter(task=task, status=Reminder.Status.SCHEDULED).count(), 1)
 
+    @patch("notetaker.services.search.generate_json", side_effect=LMStudioError("Unavailable"))
     @patch("notetaker.views.generate_json")
-    def test_chat_rejects_unverified_citation_ids(self, generate_json):
+    def test_chat_rejects_unverified_citation_ids(self, generate_json, _search_generation):
         generate_json.return_value = {"answer": "Sem evidência.", "segment_ids": [999]}
         response = self.client.post("/api/chat/", {"question": "O que ficou decidido?"}, format="json")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["segment_ids"], [])
 
+    @patch("notetaker.services.search.generate_json", side_effect=LMStudioError("Unavailable"))
     @patch("notetaker.views.generate_json")
-    def test_chat_turns_inline_citation_into_structured_source(self, generate_json):
+    def test_chat_turns_inline_citation_into_structured_source(self, generate_json, _search_generation):
         session = CaptureSession.objects.create(title="Onboarding", started_at=timezone.now())
         chunk = AudioChunk.objects.create(
             session=session,

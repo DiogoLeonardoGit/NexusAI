@@ -1,4 +1,5 @@
 from datetime import timedelta
+import json
 import logging
 from pathlib import Path
 import threading
@@ -25,16 +26,18 @@ from notetaker.models import (
 
 from .dates import parse_spoken_date
 from .diarization import diarize_session
-from .ollama import (
-    ACTIVE_LISTENING_SYSTEM_PROMPT, EXTRACTION_SYSTEM_PROMPT, MEETING_ANALYSIS_SYSTEM_PROMPT,
-    SUMMARY_SYSTEM_PROMPT, OllamaError, generate_json,
+from .lmstudio import (
+    ACTIVE_LISTENING_SYSTEM_PROMPT, MEETING_ANALYSIS_SYSTEM_PROMPT,
+    MEETING_CONSOLIDATION_SYSTEM_PROMPT,
+    MEETING_SUMMARY_FINAL_PROMPT, MEETING_SUMMARY_NOTES_PROMPT, MEETING_SUMMARY_REDUCTION_PROMPT,
+    SUMMARY_SYSTEM_PROMPT, LMStudioError, generate_json,
 )
 from .transcription import detect_language, is_header_only_webm, transcribe
 
 
 logger = logging.getLogger(__name__)
 
-OLLAMA_INPUT_CHARS = 16000
+AI_INPUT_CHARS = 16000
 ACTIVE_LISTENING_EXTRACTION_DELAY = timedelta(minutes=2)
 
 
@@ -72,7 +75,7 @@ def _set_job_progress(job_id, percent, phase):
         raise JobCancelled
 
 
-def _analysis_chunks(material: str, limit: int = OLLAMA_INPUT_CHARS) -> list[str]:
+def _analysis_chunks(material: str, limit: int = AI_INPUT_CHARS) -> list[str]:
     """Split complete meeting material into bounded, contiguous model inputs."""
     chunks = []
     current = []
@@ -141,22 +144,26 @@ MEETING_ANALYSIS_SCHEMA = {
         "summary": {"type": "string"},
         "decisions": {
             "type": "array",
-            "maxItems": 6,
             "items": {"type": "string"},
         },
         "open_questions": {
             "type": "array",
-            "maxItems": 6,
             "items": {"type": "string"},
         },
         "tasks": {
             "type": "array",
-            "maxItems": 4,
             "items": TASK_SCHEMA["properties"]["tasks"]["items"],
         },
     },
     "required": ["summary", "decisions", "open_questions", "tasks"],
     "additionalProperties": False,
+}
+
+# The final pass returns the same facts plus a meeting title; no persistence fields change.
+MEETING_CONSOLIDATION_SCHEMA = {
+    **MEETING_ANALYSIS_SCHEMA,
+    "properties": {**MEETING_ANALYSIS_SCHEMA["properties"], "title": {"type": "string"}},
+    "required": [*MEETING_ANALYSIS_SCHEMA["required"], "title"],
 }
 
 def recover_stale_jobs(max_age_minutes=15):
@@ -390,7 +397,7 @@ def _persist_meeting_tasks(job, segments, transcript, items):
                 Reminder.objects.get_or_create(task=task, remind_at=task.due_at)
 
 def process_extraction_job(job: ProcessingJob):
-    """Run legacy meeting task extraction while saving each completed part immediately."""
+    """Use whole-meeting reconciliation for explicit task regeneration as well."""
     segments = list(
         TranscriptSegment.objects.filter(session=job.session)
         .select_related("speaker", "chunk", "session")
@@ -400,23 +407,7 @@ def process_extraction_job(job: ProcessingJob):
     if not transcript:
         return
     language = job.session.language or CaptureSession.Language.PORTUGUESE
-    requested_language = "Portuguese" if language == "pt" else "English"
-    pieces = _analysis_chunks(transcript, limit=8000)
-    for index, piece in enumerate(pieces):
-        _ensure_job_active(job.pk)
-        result = generate_json(
-            f"Extract actionable tasks from part {index + 1} of {len(pieces)}. "
-            f"Write in {requested_language}.\n{piece}",
-            TASK_SCHEMA,
-            system_prompt=EXTRACTION_SYSTEM_PROMPT,
-            max_output_tokens=512,
-        )
-        _persist_meeting_tasks(job, segments, transcript, result.get("tasks", []))
-        _set_job_progress(
-            job.pk,
-            10 + round(75 * (index + 1) / len(pieces)),
-            f"A extrair tarefas ({index + 1}/{len(pieces)})",
-        )
+    _analyze_meeting_transcript(job, transcript, segments, "meeting", language)
 
 
 def process_active_listening_job(job: ProcessingJob):
@@ -512,6 +503,58 @@ SUMMARY_SCHEMA = {
     "required": ["title", "summary", "decisions", "open_questions"],
 }
 
+# These schemas are only model responses. The persisted Summary fields stay unchanged.
+MEETING_SUMMARY_NOTES_SCHEMA = {
+    "type": "object",
+    "properties": {"facts": {"type": "array", "items": {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": [
+                "context", "current_process", "proposal", "decision", "deferred",
+            ]},
+            "text": {"type": "string"},
+            "source_ids": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["kind", "text", "source_ids"],
+        "additionalProperties": False,
+    }}},
+    "required": ["facts"],
+    "additionalProperties": False,
+}
+
+MEETING_SUMMARY_FINAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "decisions": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "source_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["text", "source_ids"],
+            "additionalProperties": False,
+        }},
+    },
+    "required": ["title", "summary", "decisions"],
+    "additionalProperties": False,
+}
+
+MEETING_SUMMARY_REDUCTION_SCHEMA = {
+    **MEETING_SUMMARY_NOTES_SCHEMA,
+    "properties": {"facts": {"type": "array", "items": {
+        "type": "object",
+        "properties": {
+            "kind": MEETING_SUMMARY_NOTES_SCHEMA["properties"]["facts"]["items"]["properties"]["kind"],
+            "text": {"type": "string"},
+            "source_ids": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["kind", "text", "source_ids"],
+        "additionalProperties": False,
+    }}},
+}
+
 
 def _clean_list(values):
     return [str(value).strip() for value in values or [] if str(value).strip()]
@@ -532,7 +575,7 @@ def _keyword_title(transcript):
 
 def _summarize_material(material: str, label: str, language: str, heartbeat=None, compact=False):
     requested_language = "Portuguese" if language == "pt" else "English"
-    chunk_size = OLLAMA_INPUT_CHARS
+    chunk_size = AI_INPUT_CHARS
     pieces = [material[index : index + chunk_size] for index in range(0, len(material), chunk_size)]
     partials = []
     instruction = (
@@ -574,9 +617,82 @@ def _summarize_material(material: str, label: str, language: str, heartbeat=None
     result["open_questions"] = _clean_list(result.get("open_questions"))
     return result
 
-def _analyze_meeting_transcript(job, transcript, segments, prompt_label, language):
+def _consolidate_meeting_notes(job, partials, requested_language, *, summary_facts=None):
+    """Reduce chronological notes in bounded batches, retaining tasks and source quotes.
+
+    Summary-only reductions use their own schemas and prompts without task requirements.
+    Intermediate reductions keep resolutions so the final pass can reconcile distant parts.
+    Nothing is persisted during reduction.
+    Fail instead of truncating notes if the model cannot compress oversized material.
+    """
+    limit = 10000
+    if not partials:
+        raise LMStudioError("Não há notas disponíveis para consolidar a reunião.")
+    while True:
+        batches, batch, size = [], [], 0
+        for partial in partials:
+            encoded = json.dumps(partial, ensure_ascii=False)
+            if len(encoded) > limit:
+                raise LMStudioError("As notas da reunião excedem o contexto de consolidação.")
+            if batch and size + len(encoded) + 1 > limit:
+                batches.append(batch)
+                batch, size = [], 0
+            batch.append(partial)
+            size += len(encoded) + 1
+        if batch:
+            batches.append(batch)
+        final = len(batches) == 1
+        reduced = []
+        for batch in batches:
+            _ensure_job_active(job.pk, touch=True)
+            if summary_facts is not None:
+                instruction = (
+                    "Write an informative summary and cover every distinct final agreement with source_ids."
+                    if final else "Consolidate repeated facts, preserving substantive topics, classifications and source_ids."
+                )
+                schema = MEETING_SUMMARY_FINAL_SCHEMA if final else MEETING_SUMMARY_REDUCTION_SCHEMA
+                system_prompt = MEETING_SUMMARY_FINAL_PROMPT if final else MEETING_SUMMARY_REDUCTION_PROMPT
+                output_tokens = 2048
+            else:
+                instruction = (
+                    "Produce the final whole-meeting summary and consolidated tasks."
+                    if final else
+                    "Produce compact intermediate notes, preserving resolutions, topic requirements, "
+                    "task candidates and verbatim source quotes. Reduce repetition and size."
+                )
+                schema = MEETING_CONSOLIDATION_SCHEMA
+                system_prompt = MEETING_CONSOLIDATION_SYSTEM_PROMPT
+                output_tokens = 3072 if final else 2048
+            result = generate_json(
+                f"{instruction} Notes are in chronological order. Write in {requested_language}.\n"
+                + "\n".join(json.dumps(item, ensure_ascii=False) for item in batch),
+                schema,
+                system_prompt=system_prompt,
+                max_output_tokens=output_tokens,
+            )
+            if summary_facts is not None and not final:
+                result = {"facts": _referenced_summary_facts(result, summary_facts)}
+            reduced.append(result)
+            _ensure_job_active(job.pk, touch=True)
+        if final:
+            return reduced[0]
+        previous_size = sum(len(json.dumps(item, ensure_ascii=False)) for item in partials)
+        reduced_size = sum(len(json.dumps(item, ensure_ascii=False)) for item in reduced)
+        if reduced_size >= previous_size:
+            raise LMStudioError("Não foi possível consolidar a reunião sem perder contexto.")
+        partials = reduced
+
+
+def _analyze_meeting_transcript(job, transcript, segments, prompt_label, language, *, create_tasks=True):
+    """Reconcile the full meeting before saving any tasks; summary-only runs never create tasks."""
     requested_language = "Portuguese" if language == "pt" else "English"
     pieces = _analysis_chunks(transcript, limit=8000)
+    if len(pieces) == 1 and len(json.dumps({"transcript": transcript}, ensure_ascii=False)) <= 10000:
+        # A short meeting fits directly, avoiding loss from an unnecessary notes pass.
+        result = _consolidate_meeting_notes(job, [{"transcript": transcript}], requested_language)
+        if create_tasks:
+            _persist_meeting_tasks(job, segments, transcript, result.get("tasks", []))
+        return result
     partials = []
     for index, piece in enumerate(pieces):
         _set_job_progress(
@@ -589,13 +705,15 @@ def _analyze_meeting_transcript(job, transcript, segments, prompt_label, languag
             f"Write in {requested_language}.\n{piece}",
             MEETING_ANALYSIS_SCHEMA,
             system_prompt=MEETING_ANALYSIS_SYSTEM_PROMPT,
-            max_output_tokens=768,
+            max_output_tokens=2048,
         )
-        _persist_meeting_tasks(job, segments, transcript, result.get("tasks", []))
         partials.append({
+            "part": index + 1,
             "summary": str(result.get("summary", "")).strip(),
             "decisions": _clean_list(result.get("decisions")),
             "open_questions": _clean_list(result.get("open_questions")),
+            "tasks": [item for item in result.get("tasks", [])
+                      if item.get("evidence") and item["evidence"] in piece],
         })
         _set_job_progress(
             job.pk,
@@ -603,24 +721,130 @@ def _analyze_meeting_transcript(job, transcript, segments, prompt_label, languag
             f"A analisar parte {index + 1}/{len(pieces)}",
         )
 
-    consolidated = "\n\n".join(
-        "\n".join([
-            f"Part {index + 1}: {partial.get('summary', '')}",
-            f"Decisions: {'; '.join(partial.get('decisions', []))}",
-            f"Open questions: {'; '.join(partial.get('open_questions', []))}",
-        ])
-        for index, partial in enumerate(partials)
+    _set_job_progress(job.pk, 80, "A consolidar temas, decisões e ações")
+    result = _consolidate_meeting_notes(job, partials, requested_language)
+    if create_tasks:
+        _persist_meeting_tasks(job, segments, transcript, result.get("tasks", []))
+    return result
+
+def _supported_summary_facts(result, source):
+    """Resolve classified facts to supplied transcript excerpts without matching quote wording."""
+    facts = []
+    seen = set()
+    for item in result.get("facts", []):
+        text = str(item.get("text", "")).strip()
+        source_ids = list(dict.fromkeys(item.get("source_ids", [])))
+        kind = item.get("kind")
+        key = (kind, text.casefold(), tuple(source_ids))
+        if (not text or key in seen
+                or kind not in {"context", "current_process", "proposal", "decision", "deferred"}):
+            continue
+        if not source_ids or any(source_id not in source for source_id in source_ids):
+            raise LMStudioError("O modelo devolveu referências inválidas aos excertos da transcrição.")
+        seen.add(key)
+        facts.append({
+            "kind": kind, "text": text, "excerpt_ids": source_ids,
+            "evidence": "\n".join(source[source_id] for source_id in source_ids),
+        })
+    positions = {source_id: index for index, source_id in enumerate(source)}
+    facts.sort(key=lambda item: min(positions[source_id] for source_id in item["excerpt_ids"]))
+    return facts
+
+
+def _referenced_summary_facts(result, source_facts):
+    """Resolve reduction references to original verified excerpts, retaining their IDs.
+
+    Paraphrasing no longer depends on copying the same quote again. Every reference must
+    exist, and a reduced decision may only reference facts originally classified as decisions.
+    """
+    facts = []
+    for item in result.get("facts", []):
+        text = str(item.get("text", "")).strip()
+        source_ids = list(dict.fromkeys(item.get("source_ids", [])))
+        if not text:
+            continue
+        if not source_ids or any(source_id not in source_facts for source_id in source_ids):
+            raise LMStudioError("O modelo devolveu referências inválidas ao consolidar os factos da reunião.")
+        originals = [source_facts[source_id] for source_id in source_ids]
+        if item["kind"] == "decision" and any(fact["kind"] != "decision" for fact in originals):
+            raise LMStudioError("O modelo classificou uma proposta ou contexto como decisão na consolidação.")
+        facts.append({
+            "kind": item["kind"], "text": text, "source_ids": source_ids,
+        })
+    return facts
+
+
+def _summarize_meeting_transcript(job, transcript, language):
+    """Summarize independently of tasks, accepting only source-backed decision candidates.
+
+    Current practice and proposals remain distinguishable throughout reduction. Stable
+    references link paraphrased decisions to the verified original excerpts. Open questions are
+    absent from the model schemas and always empty in the returned record.
+    """
+    requested_language = "European Portuguese" if language == "pt" else "English"
+    # Leave room for excerpt identifiers in each bounded model input.
+    pieces = _analysis_chunks(transcript, limit=6000)
+    partials = []
+    source_facts = {}
+    start, end = (80, 88) if job.progress_phase == "combined" else (10, 75)
+    for index, piece in enumerate(pieces):
+        _set_job_progress(
+            job.pk, start + round((end - start) * index / len(pieces)),
+            f"A recolher factos para o resumo ({index + 1}/{len(pieces)})",
+        )
+        excerpts = {f"p{index + 1}-e{excerpt_index}": excerpt
+                    for excerpt_index, excerpt in enumerate(_analysis_chunks(piece, limit=700), start=1)}
+        result = generate_json(
+            f"Extract factual summary notes from part {index + 1}/{len(pieces)}. "
+            f"Write in {requested_language}. Transcript excerpts with source IDs:\n"
+            + json.dumps(excerpts, ensure_ascii=False),
+            MEETING_SUMMARY_NOTES_SCHEMA,
+            system_prompt=MEETING_SUMMARY_NOTES_PROMPT,
+            max_output_tokens=2048,
+        )
+        facts = _supported_summary_facts(result, excerpts)
+        for fact_index, fact in enumerate(facts, start=1):
+            source_id = f"p{index + 1}-f{fact_index}"
+            fact["source_ids"] = [source_id]
+            source_facts[source_id] = fact
+        # Keep full excerpts in source_facts, without repeating them in every reduction.
+        partials.append({"part": index + 1, "facts": [
+            {key: fact[key] for key in ("kind", "text", "source_ids")} for fact in facts
+        ]})
+    if not any(partial["facts"] for partial in partials):
+        raise LMStudioError("Não foi possível obter factos com evidência para resumir a reunião.")
+    _set_job_progress(job.pk, end, "A redigir o resumo e reconciliar decisões")
+    result = _consolidate_meeting_notes(
+        job, partials, requested_language, summary_facts=source_facts,
     )
-    _set_job_progress(job.pk, 80, "A consolidar o resumo")
-    return _summarize_material(
-        consolidated,
-        f"complete {prompt_label} from chronological factual notes",
-        language,
-        heartbeat=lambda: _ensure_job_active(job.pk, touch=True),
-    )
+    summary = str(result.get("summary", "")).strip()
+    if not summary:
+        raise LMStudioError("O modelo não devolveu conteúdo para o resumo da reunião.")
+    decisions = []
+    seen = set()
+    for item in result.get("decisions", []):
+        text = str(item.get("text", "")).strip()
+        source_ids = item.get("source_ids", [])
+        if not text:
+            continue
+        if (not source_ids or any(source_id not in source_facts
+                or source_facts[source_id]["kind"] != "decision" for source_id in source_ids)):
+            raise LMStudioError("O modelo devolveu uma decisão sem referências válidas aos excertos da reunião.")
+        if text.casefold() not in seen:
+            decisions.append(text)
+            seen.add(text.casefold())
+    return {
+        "title": _short_title(result.get("title")),
+        "summary": summary,
+        "decisions": decisions,
+        "open_questions": [],
+    }
+
 
 def _summarize_complete_transcript(job, transcript, prompt_label, language):
     """Map every transcript part and reduce partial results into one summary."""
+    if job.session_id:
+        return _summarize_meeting_transcript(job, transcript, language)
     pieces = _analysis_chunks(transcript)
     if len(pieces) == 1:
         return _summarize_material(
@@ -723,9 +947,8 @@ def process_summary_job(job: ProcessingJob):
         )
     _set_job_progress(job.pk, 10, "A analisar com IA")
     if job.session_id and job.progress_phase == "combined":
-        result = _analyze_meeting_transcript(job, transcript, segments, prompt_label, language)
-    else:
-        result = _summarize_complete_transcript(job, transcript, prompt_label, language)
+        _analyze_meeting_transcript(job, transcript, segments, prompt_label, language)
+    result = _summarize_complete_transcript(job, transcript, prompt_label, language)
     _set_job_progress(job.pk, 90, "A guardar o resumo")
     with transaction.atomic():
         _ensure_job_active(job.pk)
@@ -736,7 +959,8 @@ def process_summary_job(job: ProcessingJob):
             defaults={
                 "content": str(result.get("summary", "")).strip(),
                 "decisions": result.get("decisions", []),
-                "open_questions": result.get("open_questions", []),
+                # Enforce this independently of model output, including combined jobs.
+                "open_questions": [] if job.session_id else result.get("open_questions", []),
             },
         )
         if job.session_id and (not job.session.title or job.session.title.startswith("Sessão ")):
@@ -819,7 +1043,7 @@ def process_job(job: ProcessingJob):
         job.status = ProcessingJob.Status.CANCELLED
         job.error = "Cancelado pelo utilizador."
     except Exception as exc:
-        job.status = ProcessingJob.Status.FAILED if isinstance(exc, OllamaError) or (
+        job.status = ProcessingJob.Status.FAILED if isinstance(exc, LMStudioError) or (
             job.kind == ProcessingJob.Kind.ACTIVE_LISTEN
         ) else (
             ProcessingJob.Status.FAILED if job.attempts >= 3 else ProcessingJob.Status.PENDING

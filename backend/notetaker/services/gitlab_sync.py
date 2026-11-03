@@ -14,7 +14,6 @@ from . import gitlab
 
 logger = logging.getLogger(__name__)
 sync_lock = threading.RLock()
-COMPLETION_LABELS = frozenset({"To Do", "On Going", "On Testing / Pending Deploy"})
 UNSENT_TIME_STATES = (TaskTimeEntry.SyncState.PENDING, TaskTimeEntry.SyncState.SENDING, TaskTimeEntry.SyncState.UNCERTAIN)
 
 
@@ -53,8 +52,7 @@ def publish_task(task):
             raise ValidationError({"detail": "Ativa a sincronização e a escrita e configura o token GitLab."})
         client = gitlab.GitLabClient(config, allow_writes=True)
         user = client.get("/user")
-        if user.get("email", "").lower() != gitlab.EXPECTED_EMAIL:
-            raise gitlab.GitLabError("O token tem de pertencer a diogo.leonardo@warpcom.com.")
+        gitlab.validate_identity(config, user)
         project = client.project()
         config.user_id, config.username, config.project_id = user["id"], user["username"], project["id"]
         config.save(update_fields=["user_id", "username", "project_id"])
@@ -67,8 +65,9 @@ def publish_task(task):
         missing = sorted(names - set(available))
         if missing:
             raise ValidationError({"detail": "Estas labels não existem no GitLab: " + ", ".join(missing)})
-        if not names & COMPLETION_LABELS:
-            raise ValidationError({"detail": "Escolhe pelo menos uma label principal: To Do, On Going ou On Testing / Pending Deploy."})
+        primary_labels = set(gitlab.workflow().get("primary_labels", []))
+        if primary_labels and not names & primary_labels:
+            raise ValidationError({"detail": "Escolhe pelo menos uma etiqueta principal configurada: " + ", ".join(sorted(primary_labels))})
         if any("," in name for name in names):
             raise ValidationError({"detail": "A API GitLab não permite enviar labels com vírgulas."})
         reservation = AppSetting.objects.create(key=publish_key(task.pk), value={"state": "sending", "project_id": config.project_id})
@@ -173,7 +172,8 @@ def queue_task(task):
     retain_local_start_date(link)
     current = local_state(task)
     # Stamp the local label change now, so offline delivery retains its actual date.
-    if "On Going" in current["labels"] and "On Going" not in link.snapshot.get("labels", []) and not current["start_date"]:
+    start_label = gitlab.workflow().get("start_label", "")
+    if start_label and start_label in current["labels"] and start_label not in link.snapshot.get("labels", []) and not current["start_date"]:
         current["start_date"] = timezone.localdate().isoformat()
     link.snapshot["start_date"] = current["start_date"]
     link.pending = {key: value for key, value in current.items() if value != link.snapshot.get(key, 0 if key == "estimate_seconds" else None)}
@@ -223,7 +223,7 @@ def merge_states(baseline, pending, remote, existing_conflicts=None):
     # Closing locally also removes progress labels added remotely before delivery.
     # Restrict this rule to a pending close; imported closed history stays unchanged.
     if pending.get("state") == "closed":
-        result["labels"] = sorted(set(result["labels"]) - COMPLETION_LABELS)
+        result["labels"] = sorted(set(result["labels"]) - set(gitlab.workflow().get("primary_labels", [])))
         if result["labels"] != remote.get("labels", []):
             remaining["labels"] = result["labels"]
         else:
@@ -308,8 +308,7 @@ def synchronize(*, send_updates=None):
         sent, failed = 0, 0
         try:
             user = client.get("/user")
-            if user.get("email", "").lower() != gitlab.EXPECTED_EMAIL:
-                raise gitlab.GitLabError("O token tem de pertencer a diogo.leonardo@warpcom.com.")
+            gitlab.validate_identity(config, user)
             if not check_enabled(config):
                 return {"disabled": True}
             project = client.project()
@@ -361,7 +360,8 @@ def synchronize(*, send_updates=None):
                             link.task.completed_at = closed
                             link.task.save(update_fields=["completed_at"])
                         # Recover history only for pre-existing labels with no start date.
-                        if "On Going" in merged["labels"] and not merged.get("start_date") and "start_date" not in link.pending:
+                        start_label = gitlab.workflow().get("start_label", "")
+                        if start_label and start_label in merged["labels"] and not merged.get("start_date") and "start_date" not in link.pending:
                             date = client.ongoing_date(link)
                             if date:
                                 remote["start_date"] = date

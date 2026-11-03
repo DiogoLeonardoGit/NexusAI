@@ -10,7 +10,7 @@ from django.utils import timezone
 from django.utils.dateparse import parse_date
 
 from notetaker.models import CaptureSession, Note, Summary, Task, TranscriptSegment
-from .ollama import OllamaError, SEARCH_EXPANSION_PROMPT, SEARCH_RANKING_PROMPT, generate_json
+from .lmstudio import LMStudioError, SEARCH_EXPANSION_PROMPT, SEARCH_RANKING_PROMPT, generate_json
 
 logger = logging.getLogger(__name__)
 CHAT_STOP_WORDS = set("a ao aos as com da das de do dos e em esta este falamos foi na nas no nos o onde os para por que sobre uma quando what when the with about meeting reuniao reunião sessao sessão".split())
@@ -76,11 +76,12 @@ def _filtered(queryset, kind, filters):
     return queryset.distinct()
 
 
-def retrieve(question, filters=None, *, expand=False):
+def retrieve(question, filters=None, *, expand=False, limit=50, offset=0, per_kind_limit=30):
     """Rank the complete filtered corpus before limiting returned evidence.
 
     Local model expansion supplies alternate vocabulary, never source facts.
-    No cloud requests, embeddings model or external index is needed.
+    No cloud requests, embeddings model or external index is needed. Textual pagination
+    grows the ranked candidate window before slicing; AI callers retain bounded evidence.
     """
     filters = filters or {}
     original = [term for term in re.findall(r"\w+", normalize(question)) if len(term) > 2 and term not in CHAT_STOP_WORDS][:24]
@@ -99,7 +100,7 @@ def retrieve(question, filters=None, *, expand=False):
                 normalized = normalize(term.strip())[:100]
                 if normalized and normalized not in terms:
                     terms.append(normalized)
-        except OllamaError as exc:
+        except LMStudioError as exc:
             logger.warning("Local search expansion unavailable: %s", exc)
             warning = "A expansão por IA não está disponível; foi usada pesquisa textual."
     specifications = [
@@ -136,7 +137,7 @@ def retrieve(question, filters=None, *, expand=False):
                     score += 30
                 record = {"kind": kind, "item": item, "title": title, "text": text, "score": score}
                 yield score, item.pk, record
-        records.extend(row[2] for row in heapq.nlargest(30, candidates(), key=lambda row: row[:2]))
+        records.extend(row[2] for row in heapq.nlargest(per_kind_limit, candidates(), key=lambda row: row[:2]))
     records.sort(key=lambda row: (row["score"], row["item"].pk), reverse=True)
     # Ask the same local model to assess meaning within the retrieved candidates.
     if expand and records and not warning:
@@ -154,10 +155,10 @@ def retrieve(question, filters=None, *, expand=False):
             selected = [ranked[key] for key in order if key in ranked]
             if selected:
                 records = selected
-        except OllamaError as exc:
+        except LMStudioError as exc:
             logger.warning("Local relevance ranking unavailable: %s", exc)
             warning = "A avaliação por IA não está disponível; foi usada relevância textual."
-    return records[:50], warning
+    return records[offset:offset + limit], warning
 
 
 def search_chat_context(question):

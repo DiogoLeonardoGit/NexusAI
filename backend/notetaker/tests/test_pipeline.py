@@ -13,7 +13,7 @@ from notetaker.models import (
     TranscriptSegment,
 )
 from notetaker.services.pipeline import next_pending_job, process_job, recover_stale_jobs
-from notetaker.services.ollama import OllamaError
+from notetaker.services.lmstudio import LMStudioError
 from notetaker.services.diarization import identify_speaker_names
 
 
@@ -100,8 +100,8 @@ class PipelineTests(TestCase):
             process_job(job)
         self.assertEqual(summarize.call_count, 1)
 
-    @patch("notetaker.services.pipeline.process_summary_job", side_effect=OllamaError("invalid JSON"))
-    def test_invalid_ollama_output_fails_without_automatic_retry(self, summarize):
+    @patch("notetaker.services.pipeline.process_summary_job", side_effect=LMStudioError("invalid JSON"))
+    def test_invalid_lmstudio_output_fails_without_automatic_retry(self, summarize):
         job = ProcessingJob.objects.create(kind=ProcessingJob.Kind.SUMMARIZE, session=self.session)
         process_job(job)
         job.refresh_from_db()

@@ -12,14 +12,51 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import URLValidator
 from rest_framework.exceptions import ValidationError
 
-EXPECTED_EMAIL = "diogo.leonardo@warpcom.com"
-BASE_URL = "https://gitlab.warpcom.com"
-PROJECT_PATH = "serviceunit/django-apps/twinportal"
 WRITE_SETTING = "gitlab_write_enabled"
+WORKFLOW_SETTING = "gitlab_workflow"
 _token = os.getenv("NOTETAKER_GITLAB_TOKEN", "")
+_token_origin = os.getenv("NOTETAKER_GITLAB_TOKEN_ORIGIN", "")
 _credential_lock = threading.Lock()
+
+
+def normalize_base_url(value):
+    """Accept only an explicit HTTPS origin, without credentials or URL suffixes."""
+    if not isinstance(value, str) or len(value) > 200 or any(char.isspace() for char in value):
+        raise ValidationError({"base_url": "Indica um servidor HTTPS válido."})
+    try:
+        URLValidator(schemes=["https"])(value)
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (ValueError, DjangoValidationError) as exc:
+        raise ValidationError({"base_url": "Indica um servidor HTTPS válido."}) from exc
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment
+            or "\\" in value or (port is not None and not 1 <= port <= 65535)):
+        raise ValidationError({"base_url": "Indica apenas o servidor HTTPS, sem caminhos ou credenciais."})
+    hostname = parsed.hostname.lower()
+    hostname = f"[{hostname}]" if ":" in hostname else hostname.encode("idna").decode("ascii")
+    return f"https://{hostname}" + (f":{port}" if port and port != 443 else "")
+
+
+def workflow():
+    """Return optional project-specific label rules; a fresh installation has none."""
+    from notetaker.models import AppSetting
+    value = AppSetting.objects.filter(key=WORKFLOW_SETTING).values_list("value", flat=True).first()
+    return value if isinstance(value, dict) else {"primary_labels": [], "start_label": ""}
+
+
+def validate_identity(connection, user):
+    """Bind existing remote data to its authenticated account rather than an email."""
+    from notetaker.models import AppSetting
+    if not isinstance(user.get("id"), int) or not user.get("username"):
+        raise GitLabError("O GitLab não confirmou a conta autenticada.")
+    if (connection.user_id and connection.user_id != user["id"]
+            and (connection.gitlabtask_set.exists() or AppSetting.objects.filter(key__startswith="gitlab_publish_task_").exists())):
+        raise GitLabError("Esta ligação tem tarefas de outra conta. Usa o token da conta associada.")
 
 
 def _diagnose_graphql(operation, result, status):
@@ -111,13 +148,15 @@ class NoRedirects(HTTPRedirectHandler):
         return None
 
 
-def set_token(value):
+def set_token(value, origin=""):
     """Replace only the in-memory credential; persistence belongs to Electron."""
-    global _token
+    global _token, _token_origin
     if not isinstance(value, str) or len(value) > 4096 or any(c in value for c in "\r\n"):
         raise ValidationError({"detail": "Token inválido."})
+    normalized_origin = normalize_base_url(origin) if value.strip() else ""
     with _credential_lock:
         _token = value.strip()
+        _token_origin = normalized_origin
 
 
 def has_token():
@@ -134,7 +173,12 @@ class GitLabClient:
         self.opener = build_opener(NoRedirects())
 
     def request(self, path, method="GET", data=None, query=None, *, graphql=False, upload=None, image=False):
-        if self.connection.base_url.rstrip("/") != BASE_URL or not path.startswith("/") or urlsplit(path).netloc:
+        try:
+            base_url = normalize_base_url(self.connection.base_url)
+        except ValidationError as exc:
+            raise GitLabError("Configura o servidor HTTPS do GitLab nas definições.") from exc
+        if (not path.startswith("/") or urlsplit(path).netloc or "\\" in path
+                or any(segment in (".", "..") for segment in unquote(path).split("/"))):
             raise GitLabError("Destino GitLab inválido.")
         if image and (method != "GET" or not re.fullmatch(r"/projects/\d+/uploads/[a-fA-F0-9]{32}/[^/]+", path)):
             raise GitLabError("Destino de imagem inválido.")
@@ -149,11 +193,14 @@ class GitLabClient:
             raise GitLabError("Escrita desativada ou pedido de escrita não autorizado.")
         with _credential_lock:
             credential = _token
+            credential_origin = _token_origin
         if not credential:
             raise GitLabError("Configura o token pessoal nas definições GitLab.")
+        if credential_origin != base_url:
+            raise GitLabError("Configura um token para este servidor GitLab.")
         if graphql and path != "/graphql":
             raise GitLabError("Destino GraphQL inválido.")
-        url = BASE_URL + ("/api" if graphql else "/api/v4") + path
+        url = base_url + ("/api" if graphql else "/api/v4") + path
         if query:
             url += "?" + urlencode(query, doseq=True)
         body = json.dumps(data).encode() if data is not None else None
@@ -245,7 +292,9 @@ class GitLabClient:
             page = int(next_page)
 
     def project(self):
-        return self.get("/projects/" + quote(PROJECT_PATH, safe=""))
+        if not self.connection.project_path:
+            raise GitLabError("Configura o caminho do projeto GitLab nas definições.")
+        return self.get("/projects/" + quote(self.connection.project_path, safe=""))
 
     def milestones(self, project_id):
         """Read assignable project and ancestor-group milestones with pagination."""
@@ -261,12 +310,15 @@ class GitLabClient:
         return sorted(members.values(), key=lambda item: (item["name"].casefold(), item["id"]))
 
     def ongoing_date(self, link):
-        """Recover the latest On Going addition from the issue's label history."""
+        """Recover the latest addition of the optional start-date label."""
         from django.utils import timezone
         from django.utils.dateparse import parse_datetime
+        start_label = workflow().get("start_label", "")
+        if not start_label:
+            return None
         dates = []
         for event in self.pages(f"/projects/{link.project_id}/issues/{link.issue_iid}/resource_label_events"):
-            if event.get("action") == "add" and (event.get("label") or {}).get("name") == "On Going":
+            if event.get("action") == "add" and (event.get("label") or {}).get("name") == start_label:
                 date = parse_datetime(event.get("created_at") or "")
                 if date:
                     dates.append(date)
@@ -280,7 +332,7 @@ class GitLabClient:
             parsed = urlsplit(source)
         except ValueError as exc:
             raise GitLabError("Link de imagem inválido.") from exc
-        if parsed.query or parsed.fragment or (parsed.netloc and f"{parsed.scheme}://{parsed.netloc}" != BASE_URL):
+        if parsed.query or parsed.fragment or (parsed.netloc and f"{parsed.scheme}://{parsed.netloc}" != self.connection.base_url):
             raise GitLabError("Link de imagem inválido.")
         path = parsed.path
         prefix = f"/{self.connection.project_path.strip('/')}/uploads/"

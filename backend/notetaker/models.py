@@ -315,8 +315,8 @@ class AppSetting(models.Model):
 class GitLabConnection(models.Model):
     """Single personal integration; credentials are held outside the database."""
 
-    base_url = models.URLField(default="https://gitlab.warpcom.com")
-    project_path = models.CharField(max_length=500, default="serviceunit/django-apps/twinportal")
+    base_url = models.URLField(default="", blank=True)
+    project_path = models.CharField(max_length=500, default="", blank=True)
     project_id = models.PositiveBigIntegerField(null=True, blank=True)
     user_id = models.PositiveBigIntegerField(null=True, blank=True)
     username = models.CharField(max_length=255, blank=True)

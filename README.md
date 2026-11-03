@@ -1,7 +1,7 @@
 # Nexus AI
 
-Na interface, na janela e na bandeja, a aplicação apresenta-se como **Nexus**;
-o instalador usa **Nexus AI**. O símbolo e as cores de destaque vêm da pasta `media/`; os fundos mantêm os tons escuros originais.
+Na interface, na janela, na bandeja e no instalador, a aplicação apresenta-se como
+**Nexus AI**. O símbolo e as cores de destaque vêm da pasta `media/`; os fundos mantêm os tons escuros originais.
 Para regenerar os ícones Windows a partir do símbolo fornecido, executa
 `powershell -File scripts/generate_icon.ps1` antes de empacotar.
 
@@ -10,7 +10,7 @@ A barra de perguntas à IA mantém a resposta visível até clicares em
 citada desloca a página uma única vez; as atualizações automáticas permitem
 continuar a fazer scroll livremente. Uma nova pergunta substitui a resposta anterior.
 
-Assistente pessoal desktop para Windows. Captura microfone e áudio do sistema, transcreve português e inglês com Faster Whisper e usa um modelo local através do LM Studio (por defeito, `qwen2.5-14b-instruct`) ou do Ollama para criar resumos, tarefas e lembretes.
+Assistente pessoal desktop para Windows. Captura microfone e áudio do sistema, transcreve português e inglês com Faster Whisper e usa um modelo local através do LM Studio (por defeito, `qwen2.5-14b-instruct`) para criar resumos, tarefas e lembretes.
 
 Áudio, transcrições e notas permanecem no computador. O frontend comunica apenas com o backend local, que escuta em `127.0.0.1`. A integração GitLab opcional consulta tarefas na instância empresarial através do backend e permite enviar alterações manualmente, após ativar o modo de escrita.
 
@@ -19,7 +19,7 @@ Assistente pessoal desktop para Windows. Captura microfone e áudio do sistema, 
 - Windows 11
 - Python 3.12
 - Node.js 24 e npm
-- LM Studio com `Qwen2.5-14B-Instruct-GGUF` em Q4_K_M, ou Ollama com `gemma4:12b`
+- LM Studio com um modelo de conversação compatível com JSON Schema; recomendado: `Qwen2.5-14B-Instruct-GGUF` em Q4_K_M
 
 ## Preparação
 
@@ -45,27 +45,28 @@ As seguintes variáveis de ambiente são opcionais (também podem ser definidas 
 `.env` da raiz em desenvolvimento):
 
 ```dotenv
-AI_PROVIDER=lmstudio
 LMSTUDIO_URL=http://127.0.0.1:1234
 LMSTUDIO_MODEL=qwen2.5-14b-instruct
 ```
 
-O valor de `LMSTUDIO_MODEL` tem de corresponder exatamente ao identificador
-apresentado no servidor; confirma-o em `http://127.0.0.1:1234/v1/models`.
-Nas definições da aplicação são apresentados o fornecedor, modelo e disponibilidade.
+`LMSTUDIO_MODEL` define o modelo inicial, antes de existir uma escolha guardada.
+O valor tem de corresponder exatamente ao identificador apresentado no servidor;
+confirma-o em `http://127.0.0.1:1234/v1/models`.
+Nas **Definições**, a lista obtida de `/api/v1/models` inclui apenas modelos de
+conversação, não modelos de embeddings. Podes atualizar a lista, selecionar outro
+modelo e guardar a preferência, que tem prioridade sobre a variável de ambiente.
+São preservados os identificadores das instâncias já carregadas. A seleção não
+faz downloads nem carrega ou descarrega modelos no LM Studio.
+Também são apresentados o fornecedor, modelo guardado e disponibilidade.
 A disponibilidade confirma que o modelo consta da lista do servidor; a primeira
 geração pode ainda precisar de o carregar. Não é efetuada inferência na verificação.
+O botão **Verificar compatibilidade JSON** é uma ação distinta e explícita: envia
+um pequeno pedido sintético ao modelo guardado, sem dados das reuniões, e valida
+a resposta estruturada. Não garante a qualidade dos resumos ou a compatibilidade
+com todos os pedidos futuros.
 Reinicia a aplicação depois de alterar estas variáveis. Na aplicação instalada,
 define-as no ambiente do processo/Windows antes de iniciar a aplicação.
 
-Para voltar ao Ollama, define `AI_PROVIDER=ollama` e inicia-o numa consola:
-
-```powershell
-ollama serve
-```
-
-Nesta opção continuam disponíveis `OLLAMA_URL` (por defeito
-`http://127.0.0.1:11434`) e `OLLAMA_MODEL` (por defeito `gemma4:12b`).
 Esta configuração usa apenas inferência local, sem API cloud, chave ou mensalidade.
 O Whisper e os dados existentes não são alterados pela escolha do servidor de IA.
 
@@ -78,9 +79,19 @@ npm run dev
 
 A janela pode ser minimizada para a área de notificação. A escuta ativa usa apenas o microfone e retoma automaticamente após uma reunião. O botão `Iniciar reunião` ativa simultaneamente o microfone selecionado e o loopback do áudio do Windows.
 
+O **Idioma pré-definido** começa em **Português** e pode ser alterado para inglês
+nas Definições. Aplica-se desde a criação de cada nova reunião, incluindo reuniões
+iniciadas automaticamente, independentemente da duração. Uma escolha explícita
+do idioma da reunião tem prioridade. As reuniões existentes não são alteradas.
+
 ## Dados locais
 
-Em desenvolvimento, a base SQLite e o áudio ficam em `data/`. Na aplicação instalada ficam na pasta de dados da aplicação do Windows. Na primeira execução, o Electron copia uma base inicial vazia e já preparada; nunca copia dados pessoais do workspace.
+Em desenvolvimento, a base SQLite e o áudio ficam em `data/`. Na aplicação instalada
+ficam em `%APPDATA%\Nexus AI` (normalmente `C:\Users\<utilizador>\AppData\Roaming\Nexus AI`).
+Não existe cópia, migração ou remoção automática de pastas de versões anteriores.
+Na primeira execução, o Electron copia uma base inicial vazia e já preparada;
+nunca copia dados pessoais do workspace. Os identificadores internos `notetaker`
+mantêm-se para preservar o schema, o backend e a comunicação Electron.
 
 - O áudio já processado é removido ao fim de no máximo sete dias.
 - O limite inicial de armazenamento é 5 GB e pode ser reduzido nas definições.
@@ -109,7 +120,7 @@ O backend é empacotado como pasta para evitar o atraso de extração de execut�
 ## Limitações conhecidas
 
 - A identificação robusta é `Eu` para o microfone e `Outros` para o áudio do sistema. Separar automaticamente cada participante remoto não é fiável em todas as chamadas.
-- O primeiro pedido de IA pode demorar enquanto o LM Studio ou Ollama carrega o modelo.
+- O primeiro pedido de IA pode demorar enquanto o LM Studio carrega o modelo.
 - A aplicação só consegue captar áudio que o Windows e a aplicação de origem permitam disponibilizar por loopback.
 
 ## Projetos, etiquetas e trabalho diário
@@ -143,7 +154,8 @@ restaura e foca a janela, abrindo a tarefa ou reunião; destinos indisponíveis 
 
 A pesquisa tem filtros por projeto, etiqueta, data da reunião e participante, ignora acentos
 e inclui reuniões, transcrições, resumos, notas e tarefas, com fontes clicáveis.
-A pesquisa de IA expande vocabulário e avalia a relevância através do Ollama existente.
+A pesquisa textual carrega até 50 resultados de cada vez; o botão **Ver mais** obtém a página seguinte,
+mantendo a pesquisa e os filtros. A pesquisa de IA expande vocabulário e avalia a relevância através do LM Studio.
 Este processamento acrescenta tempo de resposta e não utiliza um índice de embeddings.
 Os limites de candidatos são aplicados após a ordenação textual. Se a expansão ou avaliação
 falhar, a pesquisa textual continua disponível. As respostas recebem contexto limitado e
@@ -156,13 +168,21 @@ atualizado; não distribuir uma base com dados pessoais.
 
 ## Integração GitLab — consulta e envio manual
 
-A ligação está limitada a `https://gitlab.warpcom.com` e ao projeto
-`serviceunit/django-apps/twinportal`. É necessário acesso VPN e um token pessoal com
-scope `api` da conta `diogo.leonardo@warpcom.com`, com acesso ao projeto.
-Introduz o token em Definições > GitLab na aplicação desktop. O Electron guarda-o
+Uma instalação nova não tem servidor, projeto ou conta GitLab predefinidos.
+Em Definições > GitLab, guarda o servidor HTTPS (por exemplo,
+`https://gitlab.example.com`) e o caminho do projeto (`grupo/projeto`). Depois introduz
+e guarda um token pessoal com scope `api` e acesso ao projeto, e ativa a sincronização.
+A conta é identificada pelo próprio GitLab; não existe uma restrição por nome ou email.
+O Electron guarda o token associado ao servidor configurado,
 encriptado pelo Windows (`safeStorage`) na pasta de dados da aplicação. O backend
 recebe-o apenas em memória; não é devolvido pela API nem guardado na SQLite.
-O modo de desenvolvimento só em browser não persiste credenciais.
+O modo de desenvolvimento só em browser permite introduzir o token, mas não o persiste.
+Credenciais cifradas antigas sem associação ao servidor precisam de ser reintroduzidas.
+Para arrancar o backend com um token por variável de ambiente, define também
+`NOTETAKER_GITLAB_TOKEN_ORIGIN` com o servidor HTTPS correspondente.
+Mudar servidor ou projeto limpa a credencial em memória e desativa sincronização e
+escrita. A mudança é bloqueada quando já existem dados GitLab associados; mudar de
+conta com tarefas importadas também é bloqueado, sem apagar dados ou pendências.
 
 A sincronização e o modo de escrita estão **desativados por defeito**. Ativar a sincronização permite consultas
 e importação. Desativar impede novos pedidos, incluindo novas páginas de uma
@@ -170,7 +190,7 @@ consulta em curso; um pedido HTTP já enviado pode terminar. O controlo está em
 e na aba Tarefas. Há sincronização ao iniciar o backend, a cada 60 segundos e no botão
 Sincronizar agora, enquanto a aplicação estiver em execução, mesmo minimizada.
 
-A identidade é confirmada pelo email de `/user` e a seleção usa o ID do responsável.
+A identidade é confirmada pelo ID devolvido por `/user` e a seleção usa o ID do responsável.
 Só são importadas tarefas abertas atribuídas a essa conta; mencionar o nome ou ser autor
 não basta. Tarefas já importadas são reconciliadas também quando fechadas ou reabertas.
 Tarefas que deixem de estar atribuídas a ti são retiradas das vistas ativas e suspendem
@@ -203,8 +223,9 @@ ligadas ao GitLab; reuniões, os respetivos projetos e lembretes continuam locai
 Nas tarefas locais, o botão **local → GitLab**, no lugar do ícone de origem, cria um
 ticket no projeto GitLab configurado. Requer tarefa aberta com responsável **Eu**,
 sincronização e escrita ativas e token configurado. Todas as labels têm de existir no
-catálogo GitLab e é obrigatória pelo menos uma de **To Do**, **On Going** ou
-**On Testing / Pending Deploy**. Labels inexistentes ou com vírgulas bloqueiam o envio;
+catálogo GitLab. As regras opcionais em Definições > GitLab permitem exigir pelo menos
+uma das etiquetas principais configuradas; por defeito não existe essa exigência.
+Labels inexistentes ou com vírgulas bloqueiam o envio;
 o backend consulta novamente o catálogo antes da criação e não cria labels locais no GitLab.
 Depois do sucesso, a mesma tarefa recebe a ligação e o ícone GitLab normal, mantendo
 a origem local e a reunião. O Quadro continua a apresentar apenas o título.
@@ -213,7 +234,8 @@ uma resposta incerta ou uma falha ao guardar a ligação. Nesses casos, é neces
 verificar o ticket no GitLab antes de resolver o envio; não há repetição automática.
 
 Ao concluir uma tarefa na app, são removidas apenas as suas associações às etiquetas
-`To Do`, `On Going` e `On Testing / Pending Deploy`, quando existirem. As outras etiquetas
+principais configuradas, quando existirem. Sem regras configuradas, nenhuma etiqueta
+é removida automaticamente. As outras etiquetas
 e o catálogo são preservados. Nas tarefas GitLab, a remoção fica pendente juntamente
 com o fecho e é enviada pelo botão manual; a reconciliação também retira essas etiquetas
 se forem adicionadas remotamente antes do envio do fecho pendente. Reabrir não as repõe.
@@ -250,7 +272,8 @@ Datas e horas de lembretes permanecem locais; a data limite remota é usada inic
 quando não existe data local. Não são sincronizados comentários, participantes ou reuniões.
 
 A **data de início (`start_date`) é exclusivamente local**: não é consultada nem enviada
-ao GitLab. Ao passar uma tarefa para `On Going`, a app continua a guardar a data local.
+ao GitLab. Quando estiver configurada uma etiqueta para definir a data de início,
+adicioná-la guarda a data local; por defeito não existe uma etiqueta com esse efeito.
 Datas de início anteriormente pendentes são preservadas na app e deixam de contar como
 alterações por enviar durante a sincronização normal. A data local não acompanha futuras
 alterações desse campo no GitLab. Títulos, descrições, etiquetas, estado, prazo, milestones,
@@ -316,7 +339,7 @@ reuniões e notas são preservadas. Etiquetas importadas permanecem geridas no G
 
 A deteção automática está ativa por defeito e pode ser desligada em **Definições →
 Iniciar reunião ao entrar no Teams ou Webex**. A preferência é aplicada imediatamente
-e fica guardada nesta instalação. Requer o Nexus em execução, podendo estar
+e fica guardada nesta instalação. Requer o Nexus AI em execução, podendo estar
 minimizado ou na bandeja. Não deteta reuniões no navegador.
 
 Um processo PowerShell oculto usa o UI Automation do Windows para procurar os controlos
@@ -340,7 +363,7 @@ o fim da chamada gera um aviso na aplicação e uma notificação do Windows:
 O aviso só aparece após três verificações consecutivas sem chamadas detetadas e
 uma única vez por gravação, mesmo que a chamada reapareça. Se Teams e Webex estiverem
 em chamada simultaneamente, aguarda que ambas terminem. Clicar na notificação abre
-o Nexus; a gravação continua até carregares em **Terminar reunião**.
+o Nexus AI; a gravação continua até carregares em **Terminar reunião**.
 Falhas do detetor, desativar a deteção ou parar manualmente a gravação não geram
 este aviso. Ao reativar a deteção, é necessário observar uma chamada novamente.
 
