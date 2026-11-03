@@ -5,19 +5,58 @@ import logging
 import os
 import re
 import threading
+import uuid
+from itertools import chain
 from logging.handlers import RotatingFileHandler
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import URLValidator
 from rest_framework.exceptions import ValidationError
 
-EXPECTED_EMAIL = "diogo.leonardo@warpcom.com"
-BASE_URL = "https://gitlab.warpcom.com"
-PROJECT_PATH = "serviceunit/django-apps/twinportal"
 WRITE_SETTING = "gitlab_write_enabled"
+WORKFLOW_SETTING = "gitlab_workflow"
 _token = os.getenv("NOTETAKER_GITLAB_TOKEN", "")
+_token_origin = os.getenv("NOTETAKER_GITLAB_TOKEN_ORIGIN", "")
 _credential_lock = threading.Lock()
+
+
+def normalize_base_url(value):
+    """Accept only an explicit HTTPS origin, without credentials or URL suffixes."""
+    if not isinstance(value, str) or len(value) > 200 or any(char.isspace() for char in value):
+        raise ValidationError({"base_url": "Indica um servidor HTTPS válido."})
+    try:
+        URLValidator(schemes=["https"])(value)
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (ValueError, DjangoValidationError) as exc:
+        raise ValidationError({"base_url": "Indica um servidor HTTPS válido."}) from exc
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or parsed.password is not None
+            or parsed.path not in ("", "/") or parsed.query or parsed.fragment
+            or "\\" in value or (port is not None and not 1 <= port <= 65535)):
+        raise ValidationError({"base_url": "Indica apenas o servidor HTTPS, sem caminhos ou credenciais."})
+    hostname = parsed.hostname.lower()
+    hostname = f"[{hostname}]" if ":" in hostname else hostname.encode("idna").decode("ascii")
+    return f"https://{hostname}" + (f":{port}" if port and port != 443 else "")
+
+
+def workflow():
+    """Return optional project-specific label rules; a fresh installation has none."""
+    from notetaker.models import AppSetting
+    value = AppSetting.objects.filter(key=WORKFLOW_SETTING).values_list("value", flat=True).first()
+    return value if isinstance(value, dict) else {"primary_labels": [], "start_label": ""}
+
+
+def validate_identity(connection, user):
+    """Bind existing remote data to its authenticated account rather than an email."""
+    from notetaker.models import AppSetting
+    if not isinstance(user.get("id"), int) or not user.get("username"):
+        raise GitLabError("O GitLab não confirmou a conta autenticada.")
+    if (connection.user_id and connection.user_id != user["id"]
+            and (connection.gitlabtask_set.exists() or AppSetting.objects.filter(key__startswith="gitlab_publish_task_").exists())):
+        raise GitLabError("Esta ligação tem tarefas de outra conta. Usa o token da conta associada.")
 
 
 def _diagnose_graphql(operation, result, status):
@@ -98,6 +137,10 @@ class GitLabCommentUncertain(GitLabError):
     """A comment may already exist remotely; never retry it automatically."""
 
 
+class GitLabUploadUncertain(GitLabError):
+    """An upload may exist remotely even when its Markdown was not acknowledged."""
+
+
 class NoRedirects(HTTPRedirectHandler):
     """Never forward a personal access token to a redirect destination."""
 
@@ -105,13 +148,15 @@ class NoRedirects(HTTPRedirectHandler):
         return None
 
 
-def set_token(value):
+def set_token(value, origin=""):
     """Replace only the in-memory credential; persistence belongs to Electron."""
-    global _token
+    global _token, _token_origin
     if not isinstance(value, str) or len(value) > 4096 or any(c in value for c in "\r\n"):
         raise ValidationError({"detail": "Token inválido."})
+    normalized_origin = normalize_base_url(origin) if value.strip() else ""
     with _credential_lock:
         _token = value.strip()
+        _token_origin = normalized_origin
 
 
 def has_token():
@@ -122,17 +167,36 @@ def has_token():
 class GitLabClient:
     """Restrict authenticated requests to the configured HTTPS instance."""
 
-    def __init__(self, connection, *, allow_writes=False):
+    def __init__(self, connection, *, allow_writes=False, inspection=False, token=None):
+        """Allow explicit setup checks with an optional, non-persisted credential."""
+        if token is not None and (not inspection or not isinstance(token, str)
+                                  or len(token) > 4096 or any(char in token for char in "\r\n")):
+            raise ValidationError({"detail": "Token inválido."})
         self.connection = connection
         self.allow_writes = allow_writes
+        self.inspection = inspection
+        self.token = token.strip() if token is not None else None
         self.opener = build_opener(NoRedirects())
 
-    def request(self, path, method="GET", data=None, query=None, *, graphql=False):
-        if self.connection.base_url.rstrip("/") != BASE_URL or not path.startswith("/") or urlsplit(path).netloc:
+    def request(self, path, method="GET", data=None, query=None, *, graphql=False, upload=None, image=False):
+        try:
+            base_url = normalize_base_url(self.connection.base_url)
+        except ValidationError as exc:
+            raise GitLabError("Configura o servidor HTTPS do GitLab nas definições.") from exc
+        if (not path.startswith("/") or urlsplit(path).netloc or "\\" in path
+                or any(segment in (".", "..") for segment in unquote(path).split("/"))):
             raise GitLabError("Destino GitLab inválido.")
-        self.connection.refresh_from_db(fields=["enabled"])
-        if not self.connection.enabled:
-            raise GitLabDisabled("Sincronização desativada.")
+        if image and (method != "GET" or not re.fullmatch(r"/projects/\d+/uploads/[a-fA-F0-9]{32}/[^/]+", path)):
+            raise GitLabError("Destino de imagem inválido.")
+        if self.inspection:
+            project_path = "/projects/" + quote(self.connection.project_path, safe="")
+            if (method != "GET" or graphql or upload is not None or image
+                    or (path not in ("/user", project_path) and not re.fullmatch(r"/projects/\d+/labels", path))):
+                raise GitLabError("Consulta de configuração GitLab inválida.")
+        else:
+            self.connection.refresh_from_db(fields=["enabled"])
+            if not self.connection.enabled:
+                raise GitLabDisabled("Sincronização desativada.")
         # GraphQL reads use POST too; only explicit query documents are read-only.
         graphql_read = (graphql and method == "POST" and isinstance(data, dict)
                         and data.get("query", "").lstrip().startswith("query ")
@@ -141,26 +205,65 @@ class GitLabClient:
             raise GitLabError("Escrita desativada ou pedido de escrita não autorizado.")
         with _credential_lock:
             credential = _token
+            credential_origin = _token_origin
+        if self.inspection and self.token is not None:
+            credential = self.token
+            credential_origin = base_url
         if not credential:
             raise GitLabError("Configura o token pessoal nas definições GitLab.")
+        if credential_origin != base_url:
+            raise GitLabError("Configura um token para este servidor GitLab.")
         if graphql and path != "/graphql":
             raise GitLabError("Destino GraphQL inválido.")
-        url = BASE_URL + ("/api" if graphql else "/api/v4") + path
+        url = base_url + ("/api" if graphql else "/api/v4") + path
         if query:
             url += "?" + urlencode(query, doseq=True)
         body = json.dumps(data).encode() if data is not None else None
+        content_headers = {"Content-Type": "application/json"}
+        if upload is not None:
+            if method != "POST" or not re.fullmatch(r"/projects/\d+/uploads", path) or graphql or data is not None:
+                raise GitLabError("Destino de upload inválido.")
+            # Stream multipart bytes with an explicit length instead of buffering the file.
+            boundary = uuid.uuid4().hex
+            filename = re.sub(r"[\x00-\x1f\x7f]", "_", upload.name.replace("\\", "/").rsplit("/", 1)[-1])
+            filename = filename.replace("\\", "\\\\").replace('"', '\\"')
+            prefix = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                      'Content-Type: application/octet-stream\r\n\r\n').encode("utf-8")
+            suffix = f"\r\n--{boundary}--\r\n".encode("ascii")
+            body = chain((prefix,), upload.chunks(), (suffix,))
+            content_headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
+                               "Content-Length": str(len(prefix) + upload.size + len(suffix))}
         authentication = {"Authorization": f"Bearer {credential}"} if graphql else {"PRIVATE-TOKEN": credential}
         request = Request(url, data=body, method=method, headers={
-            **authentication, "Accept": "application/json", "Content-Type": "application/json",
+            **authentication, "Accept": "image/png,image/jpeg,image/gif,image/webp" if image else "application/json", **content_headers,
         })
         try:
             with self.opener.open(request, timeout=20) as response:
+                if image:
+                    # Bound memory and accept only inert raster formats, never HTML or SVG.
+                    content = response.read(15 * 1024 * 1024 + 1)
+                    if len(content) > 15 * 1024 * 1024:
+                        raise GitLabError("A imagem excede o limite de preview de 15 MB.")
+                    mime = None
+                    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+                        mime = "image/png"
+                    elif content.startswith(b"\xff\xd8\xff"):
+                        mime = "image/jpeg"
+                    elif content[:6] in (b"GIF87a", b"GIF89a"):
+                        mime = "image/gif"
+                    elif content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+                        mime = "image/webp"
+                    if not mime:
+                        raise GitLabError("Preview disponível apenas para PNG, JPEG, GIF e WebP.")
+                    return content, mime
                 result = json.load(response)
                 if graphql_read:
                     operation = re.search(r"\bquery\s+(TaskDateAccess|TaskDateSchema|TaskDates)\b", data["query"])
                     _diagnose_graphql(operation[1] if operation else "other_query", result, response.status)
                 return result, response.headers.get("X-Next-Page", "")
         except HTTPError as exc:
+            if upload is not None and exc.code >= 500:
+                raise GitLabUploadUncertain("Upload sem confirmação. Verifica o GitLab antes de tentar enviar este ficheiro novamente.") from exc
             if method == "POST" and path.endswith("/notes") and exc.code >= 500:
                 raise GitLabCommentUncertain("Envio do comentário sem confirmação. Verifica o GitLab antes de tentar novamente.") from exc
             if method == "POST" and path.endswith("/add_spent_time") and exc.code >= 500:
@@ -168,11 +271,16 @@ class GitLabClient:
             if method == "POST" and path.endswith("/issues") and exc.code >= 500:
                 raise GitLabCreateUncertain("A resposta à criação ficou incerta. Verifica o GitLab antes de tentar novamente.") from exc
             messages = {401: "Token inválido ou expirado.", 403: "Sem permissão no GitLab.",
-                        404: "Tarefa ou projeto indisponível.", 429: "Limite de pedidos atingido; será feita nova tentativa."}
+                        404: "Tarefa ou projeto indisponível.", 413: "O ficheiro excede o tamanho permitido pelo GitLab.",
+                        429: "Limite de pedidos atingido; será feita nova tentativa."}
+            if upload is not None:
+                messages[429] = "Limite de pedidos atingido. Tenta novamente mais tarde."
             if method == "POST" and (path.endswith("/issues") or path.endswith("/add_spent_time") or path.endswith("/notes")):
                 messages[429] = "Limite de pedidos atingido. Tenta novamente mais tarde."
             raise GitLabError(messages.get(exc.code, f"GitLab respondeu com HTTP {exc.code}.")) from exc
         except (URLError, TimeoutError, OSError, ValueError) as exc:
+            if upload is not None:
+                raise GitLabUploadUncertain("Upload sem confirmação. Verifica o GitLab antes de tentar enviar este ficheiro novamente.") from exc
             if method == "POST" and path.endswith("/notes"):
                 raise GitLabCommentUncertain("Envio do comentário sem confirmação. Verifica o GitLab antes de tentar novamente.") from exc
             if method == "POST" and path.endswith("/add_spent_time"):
@@ -199,24 +307,76 @@ class GitLabClient:
             page = int(next_page)
 
     def project(self):
-        return self.get("/projects/" + quote(PROJECT_PATH, safe=""))
+        if not self.connection.project_path:
+            raise GitLabError("Configura o caminho do projeto GitLab nas definições.")
+        return self.get("/projects/" + quote(self.connection.project_path, safe=""))
 
     def milestones(self, project_id):
         """Read assignable project and ancestor-group milestones with pagination."""
         # Use only the current parameter; its deprecated alias must not be sent alongside it.
         return list(self.pages(f"/projects/{project_id}/milestones", include_ancestors="true"))
 
+    def members(self, project_id):
+        """List active direct and inherited project members using numeric pagination."""
+        members = {item["id"]: {"id": item["id"], "name": item.get("name") or item["username"],
+                                  "username": item["username"]}
+                   for item in self.pages(f"/projects/{project_id}/members/all")
+                   if item.get("state", "active") == "active"}
+        return sorted(members.values(), key=lambda item: (item["name"].casefold(), item["id"]))
+
     def ongoing_date(self, link):
-        """Recover the latest On Going addition from the issue's label history."""
+        """Recover the latest addition of the optional start-date label."""
         from django.utils import timezone
         from django.utils.dateparse import parse_datetime
+        start_label = workflow().get("start_label", "")
+        if not start_label:
+            return None
         dates = []
         for event in self.pages(f"/projects/{link.project_id}/issues/{link.issue_iid}/resource_label_events"):
-            if event.get("action") == "add" and (event.get("label") or {}).get("name") == "On Going":
+            if event.get("action") == "add" and (event.get("label") or {}).get("name") == start_label:
                 date = parse_datetime(event.get("created_at") or "")
                 if date:
                     dates.append(date)
         return timezone.localtime(max(dates)).date().isoformat() if dates else None
+
+    def comment_image(self, link, source):
+        """Resolve a Markdown upload only inside this task's GitLab project."""
+        if not isinstance(source, str) or len(source) > 2048:
+            raise GitLabError("Link de imagem inválido.")
+        try:
+            parsed = urlsplit(source)
+        except ValueError as exc:
+            raise GitLabError("Link de imagem inválido.") from exc
+        if parsed.query or parsed.fragment or (parsed.netloc and f"{parsed.scheme}://{parsed.netloc}" != self.connection.base_url):
+            raise GitLabError("Link de imagem inválido.")
+        path = parsed.path
+        prefix = f"/{self.connection.project_path.strip('/')}/uploads/"
+        if path.startswith(prefix):
+            path = "/uploads/" + path[len(prefix):]
+        match = re.fullmatch(r"/uploads/([a-fA-F0-9]{32})/([^/]+)", path)
+        if not match or (parsed.scheme and not parsed.netloc):
+            raise GitLabError("Só são suportadas imagens anexadas ao projeto GitLab.")
+        filename = unquote(match[2])
+        if filename in (".", "..") or any(char in filename for char in "/\\\x00\r\n"):
+            raise GitLabError("Nome de imagem inválido.")
+        return self.request(f"/projects/{link.project_id}/uploads/{match[1]}/{quote(filename, safe='')}", image=True)
+
+    def upload_file(self, link, upload):
+        """Upload one attachment on explicit submission and return confirmed Markdown."""
+        result = self.request(f"/projects/{link.project_id}/uploads", "POST", upload=upload)[0]
+        if not isinstance(result, dict) or not isinstance(result.get("markdown"), str) or not result["markdown"].strip():
+            raise GitLabUploadUncertain("O GitLab não confirmou o link do ficheiro. Verifica o upload antes de tentar novamente.")
+        return {"markdown": result["markdown"]}
+
+    def comments(self, link):
+        """Read all user comments chronologically, excluding automatic system notes."""
+        notes = self.pages(f"/projects/{link.project_id}/issues/{link.issue_iid}/notes",
+                           sort="asc", order_by="created_at")
+        return [{"id": note["id"], "body": note.get("body", ""),
+                 "created_at": note.get("created_at"),
+                 "author": {key: (note.get("author") or {}).get(key, "")
+                            for key in ("name", "username")}}
+                for note in notes if not note.get("system")]
 
     def add_comment(self, link, body):
         """Post one comment on explicit submission; never retry additive requests."""
@@ -229,7 +389,7 @@ class GitLabClient:
         """Create one explicitly approved issue; labels must be prevalidated by the caller."""
         return self.request(f"/projects/{project_id}/issues", "POST", {
             "title": task.title, "description": task.description,
-            "assignee_ids": [user_id], "labels": ",".join(sorted(labels)),
+            "assignee_ids": [user_id] if user_id is not None else [], "labels": ",".join(sorted(labels)),
         })[0]
 
     def add_spent_time(self, link, duration_seconds):
@@ -251,6 +411,8 @@ class GitLabClient:
                 raise GitLabError("Não foi possível confirmar a estimativa no GitLab.")
             estimate_updated = True
         payload = {key: value for key, value in changes.items() if key in {"title", "description", "due_date"}}
+        if "assignees" in changes:
+            payload["assignee_ids"] = [person["id"] for person in changes["assignees"]]
         if "milestone_id" in changes:
             payload["milestone_id"] = changes["milestone_id"] or 0
         if "state" in changes:

@@ -7,6 +7,23 @@ import re
 from django.conf import settings
 
 
+def is_header_only_webm(path: str) -> bool:
+    """Recognize Chromium's empty WebM header followed only by zero padding.
+
+    Match this specific recorder output rather than suppressing decoder errors
+    from truncated or otherwise damaged audio files.
+    """
+    source = Path(path)
+    if not source.is_file() or source.stat().st_size > 4096:
+        return False
+    header = bytes.fromhex(
+        "1a45dfa39f4286810142f7810142f2810442f381084282847765626d4287810442858102"
+    )
+    with source.open("rb") as audio:
+        data = audio.read(4097)
+    return len(data) <= 4096 and data.startswith(header) and not any(data[len(header):])
+
+
 @lru_cache(maxsize=1)
 def get_model():
     from faster_whisper import WhisperModel

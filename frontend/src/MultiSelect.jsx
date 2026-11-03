@@ -37,11 +37,16 @@ export default function MultiSelect({ options, value = [], onChange, disabled, l
   useEffect(() => { if (!open) setQuery(""); }, [open]);
   // Focus after layout, without scrolling the page to the portalled search field.
   useEffect(() => { if (open) search.current?.focus({ preventScroll: true }); }, [open]);
-  // Serialize writes while preserving the open menu and search between selections.
+  // Clear the search on selection so the next label can be searched immediately.
   const toggle = async (option) => {
     if (disabled || pending.current) return;
     pending.current = true;
-    try { await onChange(value.includes(option.id) ? value.filter((id) => id !== option.id) : [...value, option.id]); }
+    const removing = value.includes(option.id);
+    if (!removing) {
+      setQuery("");
+      search.current?.focus({ preventScroll: true });
+    }
+    try { await onChange(removing ? value.filter((id) => id !== option.id) : [...value, option.id]); }
     finally { pending.current = false; }
   };
   const close = () => { setOpen(false); trigger.current?.focus({ preventScroll: true }); };

@@ -58,7 +58,7 @@ const result = JSON.parse(value);
 if (result.size < 100 || result.header.join(",") !== "26,69,223,163") {
   throw new Error(`MediaRecorder did not produce a self-contained WebM: ${value}`);
 }
-const audioPath = join(tmpdir(), `mynotetaker-webm-smoke-${process.pid}.webm`);
+const audioPath = join(tmpdir(), `nexus-ai-webm-smoke-${process.pid}.webm`);
 writeFileSync(audioPath, Buffer.from(result.base64, "base64"));
 const python = join(process.cwd(), ".venv", "Scripts", "python.exe");
 const decoded = spawnSync(python, [join("scripts", "smoke_transcription.py"), audioPath], {

@@ -2,7 +2,7 @@
   "name": "nexus-ai",
   "version": "0.1.0",
   "description": "Assistente pessoal offline para reuniões, notas, tarefas e lembretes.",
-  "author": "Diogo Leonardo",
+  "author": "Nexus AI",
   "private": true,
   "main": "electron/main.cjs",
   "scripts": {

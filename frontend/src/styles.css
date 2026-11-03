@@ -32,7 +32,7 @@ aside { position: sticky; top: 0; height: 100dvh; overflow: hidden; display: fle
 .brand { display: flex; align-items: center; gap: 11px; padding: 0 10px 30px; }
 /* Give the Nexus name more presence beside its existing symbol. */
 .brand strong { font-size: 22px; line-height: 1.2; }
-.brand-mark { display: block; flex: 0 0 42px; width: 42px; height: 42px; object-fit: contain; }
+.brand-mark { display: block; flex: 0 0 56px; width: 56px; height: 56px; object-fit: contain; }
 nav { display: grid; flex: 1; min-height: 0; align-content: start; overflow-y: auto; gap: 6px; }
 nav button { padding: 11px 13px; border: 0; border-radius: 9px; text-align: left; color: #9ca8b8; background: transparent; }
 nav button:hover, nav button.active { color: var(--nexus-white); background: var(--nexus-deep); }
@@ -61,9 +61,15 @@ header { display: flex; justify-content: space-between; align-items: center; mar
 .header-title { grid-area: title; min-width: 0; }
 .header-question { grid-area: question; justify-self: center; width: 100%; max-width: 520px; min-width: 0; }
 .ai-question-bar { display: flex; align-items: center; width: 100%; min-width: 0; max-width: 520px; height: 46px; border: 1px solid #394354; border-radius: 999px; background: #10161d; }
-/* Give the question bar its own row before the action buttons lose space. */
+/* Shrink the question field before wrapping: keep all three controls on one row. */
 @container app-content (max-width: 1300px) {
-  .content > header { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "title actions" "question question"; }
+  .content > header { grid-template-columns: max-content minmax(120px, 520px) max-content; gap: 14px; }
+}
+@container app-content (max-width: 740px) {
+  .content > header { gap: 10px; }
+  .header-actions { gap: 6px; }
+  .header-actions > button, .daily-summary-button > button { padding-inline: 10px; font-size: 13px; }
+  .header-title h1 { font-size: 28px; }
 }
 .ai-question-bar:focus-within { outline: 2px solid var(--nexus-cyan); outline-offset: 2px; }
 .ai-question-bar input { min-width: 0; width: 100%; height: 42px; min-height: 42px; padding: 8px 4px 8px 16px; border: 0; border-radius: 999px; outline: none; color: #e8edf4; background: transparent; font-size: 13px; }
@@ -131,9 +137,26 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 .task-title-input, .task-description-input, .task-meta input, .task-meta select { padding: var(--field-padding); border: 0; outline: none; border-radius: 0; color: #e8edf4; background: transparent; }
 .task-title-input { width: min(620px, 100%); min-width: 0; font-weight: 700; }
 .task-description { margin: 2px 0 6px; color: #cbd4df; white-space: pre-wrap; line-height: 1.5; overflow-wrap: anywhere; }
-.task-description.is-clamped { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 10; overflow: hidden; }
+/* A ten-line viewport also supports image galleries and keeps their full height measurable. */
+.task-description.is-clamped { max-height: 15em; overflow: hidden; }
 .task-description-preview > button { margin-bottom: 6px; }
 .task-comment { margin: 8px 0; }
+/* Remote comments form a chronological thread above the composer. */
+.gitlab-comment-history { margin: 12px 0; font-size: 13px; color: #cbd4df; }
+.gitlab-comment-history ol { display: grid; gap: 12px; margin: 0; padding: 0 0 0 14px; border-left: 1px solid #303949; list-style: none; }
+.gitlab-comment-history li { min-width: 0; padding: 12px 14px; border: 1px solid #303949; border-radius: 9px; background: #131922; }
+.gitlab-comment-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; overflow-wrap: anywhere; }
+.gitlab-comment-heading strong { color: #e8edf4; }
+.gitlab-comment-heading span, .gitlab-comment-heading time { color: #94a0b1; font-size: 12px; }
+.gitlab-comment-body { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.gitlab-image-gallery { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px; margin: 10px 0; white-space: normal; }
+.gitlab-image-preview { display: block; flex: 0 1 auto; min-width: 0; max-width: 100%; white-space: normal; }
+.gitlab-image-thumbnail { display: block; max-width: 100%; padding: 4px; border: 1px solid #394354; border-radius: 8px; background: #0b0e13; }
+.gitlab-image-thumbnail img { display: block; width: auto; height: auto; max-width: min(320px, 100%); max-height: 180px; object-fit: contain; }
+.gitlab-image-dialog { max-width: 94vw; max-height: 94vh; padding: 48px 12px 12px; border: 1px solid #394354; border-radius: 12px; background: #10161d; color: #e8edf4; }
+.gitlab-image-dialog::backdrop { background: rgb(0 0 0 / 80%); }
+.gitlab-image-dialog img { display: block; max-width: 88vw; max-height: 78vh; object-fit: contain; }
+.gitlab-image-close { position: absolute; top: 8px; right: 12px; padding: 6px 12px; border: 1px solid #394354; border-radius: 6px; background: #253041; color: #e8edf4; }
 /* Keep the comment composer consistent with the existing dark fields and actions. */
 .task-comment > summary { display: flex; align-items: center; gap: 7px; width: fit-content; padding: 5px 0; border-radius: 4px; cursor: pointer; color: #98a4b5; font-size: 12px; list-style: none; }
 .task-comment > summary::-webkit-details-marker { display: none; }
@@ -149,6 +172,15 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 .task-comment button.primary-action { display: inline-flex; align-items: center; justify-content: center; align-self: flex-end; gap: 7px; min-width: 100px; padding: 7px 20px; font-size: 12px; }
 .task-comment button:disabled { cursor: not-allowed; }
 .task-comment small { color: #94a0b1; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+/* File drops stay inside the composer, separate from task-card dragging. */
+.comment-dropzone { display: grid; gap: 8px; min-width: 0; padding: 8px; border: 1px dashed #303949; border-radius: 10px; }
+.comment-dropzone.is-dragging { border-color: var(--nexus-cyan); background: #17c9e610; }
+.comment-attachment-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.comment-attachments { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.comment-attachments li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px; border-radius: 6px; background: #131922; }
+.comment-attachments li > span { min-width: 0; overflow-wrap: anywhere; color: #dce4ee; font-size: 12px; }
+.comment-attachments small { display: block; }
+.comment-attachments button { flex-shrink: 0; }
 .task-description-input { display: block; width: 100%; min-height: var(--field-height); margin: 2px 0 6px; line-height: var(--field-line-height); resize: none; overflow-y: hidden; }
 .task-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: #94a0b1; line-height: 1.5; }
 .task-meta .warning { margin-top: 0; }
@@ -191,7 +223,7 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 button.search-result:hover { border-color: var(--nexus-blue); }
 .search-result-meta { display: flex; gap: 10px; margin-bottom: 6px; color: #94a0b1; font-size: 12px; }
 .search-result-meta span:first-child { color: var(--nexus-cyan); font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
-.quick-task { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(200px, 1.5fr) minmax(180px, 1fr) auto auto; align-items: end; gap: 10px; margin-bottom: 18px; }
+.quick-task { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(200px, 1.5fr) minmax(160px, 1fr) minmax(180px, 1fr) auto auto; align-items: end; gap: 10px; margin-bottom: 18px; }
 .quick-task input, .quick-task textarea, .quick-task select { padding: var(--field-padding); border: 1px solid #303949; border-radius: 10px; color: #e8edf4; background: #131922; }
 .quick-task input, .quick-task textarea, .quick-task select, .quick-task button { height: var(--field-height); }
 .quick-task textarea { min-height: var(--field-height); line-height: var(--field-line-height); overflow-y: hidden; resize: none; }
@@ -210,7 +242,7 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .task-section-body .empty { padding: 24px; }
 .task-drag-handle { flex: 0 0 20px; padding: 0; border: 0; color: #94a0b1; background: transparent; font-size: 24px; line-height: 24px; cursor: grab; }
 .task-drag-handle:active { cursor: grabbing; }
-.settings-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 28px; }
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; }
 .settings-grid div { display: grid; gap: 5px; }
 .settings-grid label { color: #7f8b9d; font-size: 13px; }
 .settings-grid input, .settings-grid select, .settings-grid textarea, .notes textarea { padding: var(--field-padding); border: 1px solid #303949; border-radius: 8px; color: #e8edf4; background: #0f141c; }
@@ -325,6 +357,9 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .multi-select-options input { width: auto; accent-color: var(--nexus-cyan); }
 .label-color { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
 .new-task-meeting { display: grid; gap: 5px; color: #94a0b1; font-size: 12px; min-width: 0; }
+.task-owner-picker { display: grid; gap: 5px; color: #94a0b1; font-size: 12px; min-width: 0; }
+.task-owner-picker .custom-select { width: 100%; min-width: 0; }
+.quick-task .task-owner-picker .select-trigger { border: 1px solid #303949; color: #dce4ee; background: #131922; font-weight: 400; }
 .new-task-meeting .custom-select { width: 100%; min-width: 0; }
 .quick-task .new-task-meeting .select-trigger { border: 1px solid #303949; color: #dce4ee; background: #131922; font-weight: 400; }
 @media (max-width: 1100px) {
@@ -564,7 +599,24 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .gitlab-status-task-heading strong { flex: 1 1 240px; overflow-wrap: anywhere; font-size: 13px; }
 .gitlab-status-list p { margin: 7px 0; color: #aab6c6; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .gitlab-status-list .gitlab-status-task-error { color: #f0c0ac; }
-.gitlab-credentials { padding: 20px; border: 1px solid #303949; border-radius: 11px; background: #0f141c; }
+.gitlab-credentials { display: grid; gap: 12px; padding: 20px 0; border-top: 1px solid #303949; }
+.gitlab-configuration { margin-bottom: 20px; }
+.gitlab-configuration-panel { margin-bottom: 20px; }
+.gitlab-configuration-panel > summary { cursor: pointer; color: #e0e7ef; font-size: 14px; }
+.gitlab-configuration-panel[open] > summary { margin-bottom: 16px; }
+.gitlab-configuration-actions { padding-top: 14px; border-top: 1px solid #303949; }
+.gitlab-configuration .custom-select { width: 100%; min-width: 0; }
+.gitlab-configuration .selected-labels { flex-wrap: wrap; }
+.gitlab-configuration .label-chip { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
+.gitlab-configuration fieldset { display: grid; gap: 14px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.gitlab-configuration legend { padding: 0 0 14px; color: #e0e7ef; font-size: 14px; }
+.gitlab-configuration details { display: grid; gap: 12px; }
+.gitlab-configuration details label { margin-top: 12px; }
+.gitlab-configuration summary { cursor: pointer; color: #aab6c6; font-size: 13px; }
+.gitlab-configuration label, .gitlab-credentials > label { display: grid; gap: 8px; min-width: 0; color: #c3cddb; font-size: 12px; }
+.gitlab-configuration :is(input:not([type="checkbox"]), textarea), .gitlab-credentials input { box-sizing: border-box; width: 100%; min-width: 0; padding: var(--field-padding); border: 1px solid #3b485a; border-radius: 8px; color: #e8edf4; background: #151d28; font: inherit; }
+.gitlab-configuration textarea { resize: vertical; }
+.gitlab-configuration button { justify-self: start; }
 .gitlab-credentials-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
 .gitlab-credentials h3 { margin: 0; font-size: 14px; }
 .gitlab-token-state { color: #8f9bac; font-size: 11px; }
@@ -600,6 +652,12 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .note-editor { display: grid; gap: 16px; }
 .note-editor textarea { resize: vertical; }
 .note-body { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Inline note fields preserve the card's reading layout, like task editing. */
+.note-inline-editor .note-title-input, .note-inline-editor .note-body-input { border: 0; border-radius: 0; background: transparent; color: #e8edf4; font: inherit; }
+.note-inline-editor .note-title-input { flex: 1 1 200px; min-width: 0; padding: 0; font-size: 1.17em; font-weight: 700; }
+.note-inline-editor .note-body-input { display: block; width: 100%; min-height: var(--field-height); margin: 1em 0; padding: 0; line-height: inherit; resize: none; overflow-y: hidden; }
+.note-inline-editor .note-title-input:focus-visible, .note-inline-editor .note-body-input:focus-visible { outline: 1px solid var(--nexus-cyan); outline-offset: 4px; }
+.note-inline-editor > .notes-filters { margin-top: 16px; }
 .note-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 16px; color: #8794a7; }
 .gitlab-settings-error { margin: 0 0 20px; padding: 14px 16px; border: 1px solid #a7604e66; border-radius: 9px; color: #f0c0ac; background: #39201b66; font-size: 12px; }
 .gitlab-settings .gitlab-settings-error p { margin: 6px 0 0; color: #d6a895; font-size: 12px; line-height: 1.6; }
@@ -612,7 +670,7 @@ button.search-result:hover { border-color: var(--nexus-blue); }
   .gitlab-settings { padding: 18px; }
   .gitlab-connection-details { grid-template-columns: minmax(0, 1fr); gap: 18px; }
   .gitlab-sync-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .gitlab-credentials { padding: 16px; }
+  .gitlab-credentials { padding: 16px 0; }
   .gitlab-token-form label { flex-basis: 100%; }
   .gitlab-sync-actions { width: 100%; }
   .gitlab-sync-actions button { flex: 1 1 160px; }
@@ -641,6 +699,12 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .ai-setup-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
 .settings-grid .ai-model-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; color: #8794a7; font-size: 13px; }
 .settings-grid .ai-model-actions { display: flex; flex-shrink: 0; gap: 4px; }
+.settings-grid .ai-model-field { min-width: 0; align-content: start; gap: 10px; }
+.ai-model-field > strong, .ai-model-field > small { overflow-wrap: anywhere; }
+.ai-compatibility-check { justify-self: start; max-width: 100%; }
+@media (max-width: 700px) {
+  .settings-grid, .settings-grid .settings-limits { grid-template-columns: minmax(0, 1fr); }
+}
 .ai-model-actions button { display: grid; place-items: center; width: 28px; height: 28px; padding: 4px; border: 0; border-radius: 6px; background: transparent; color: #aab6c6; }
 .ai-model-actions button:hover:not(:disabled) { color: var(--nexus-cyan); background: #253041; }
 .ai-model-actions button:focus-visible { outline: 2px solid var(--nexus-cyan); outline-offset: 2px; }

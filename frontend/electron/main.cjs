@@ -15,10 +15,8 @@ let captureState = "paused";
 let trayControls = { ready: false, recording: false, listeningEnabled: false, busy: false };
 let trayCapturePermitUntil = 0;
 const backendProcesses = [];
-const hasSingleInstanceLock = app.requestSingleInstanceLock();
-const appDisplayName = "Nexus";
-// Retain the original data location so existing notes, settings and encrypted credentials stay available.
-const existingUserDataPath = path.join(app.getPath("appData"), "My Notetaker");
+const appDisplayName = "Nexus AI";
+const userDataPath = path.join(app.getPath("appData"), appDisplayName);
 let powerSaveBlockerId = null;
 const activeNotifications = new Set();
 const meetingDetector = new MeetingDetector((state) => {
@@ -35,9 +33,10 @@ function updatePowerSaveBlocker(enabled) {
   }
 }
 
-app.setPath("userData", existingUserDataPath);
+app.setPath("userData", userDataPath);
 app.setName(appDisplayName);
 
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
 
 app.on("second-instance", () => {
@@ -188,12 +187,14 @@ function startBackend() {
       fs.copyFileSync(path.join(process.resourcesPath, "backend-template", "notetaker.sqlite3"), database);
     }
   }
+  const gitlabCredential = readGitLabToken();
   const env = {
     ...process.env,
     NOTETAKER_API_TOKEN: apiToken,
     NOTETAKER_DATA_DIR: dataDir,
     NOTETAKER_DIAGNOSTICS: "1",
-    NOTETAKER_GITLAB_TOKEN: readGitLabToken(),
+    NOTETAKER_GITLAB_TOKEN: gitlabCredential.token,
+    NOTETAKER_GITLAB_TOKEN_ORIGIN: gitlabCredential.base_url,
     WHISPER_MODEL: isDev
       ? path.join(projectRoot, "models", "faster-whisper-medium")
       : path.join(process.resourcesPath, "models", "faster-whisper-medium"),
@@ -245,6 +246,8 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       backgroundThrottling: false,
+      // Match one native Zoom Out step; menu and keyboard controls remain available.
+      zoomFactor: 1.2 ** -0.5,
     },
   });
   if (process.platform === "win32") {
@@ -296,15 +299,15 @@ function sendTrayCommand(action) {
 }
 
 function createTray() {
-  // Prefer the PNG for resizing, with the Windows icon as a checked fallback.
-  let image = nativeImage.createFromPath(appIcon("png"));
-  if (image.isEmpty()) image = nativeImage.createFromPath(appIcon());
-  if (image.isEmpty()) throw new Error("Não foi possível carregar o ícone da bandeja.");
-  const icon = image.resize({ width: 16, height: 16 });
+  // Pass the multi-resolution ICO path to Windows instead of flattening it to 16px.
+  const windowsIcon = appIcon();
+  const useWindowsIcon = process.platform === "win32" && !nativeImage.createFromPath(windowsIcon).isEmpty();
+  const icon = useWindowsIcon ? windowsIcon : nativeImage.createFromPath(appIcon("png"));
+  if (!useWindowsIcon && icon.isEmpty()) throw new Error("Não foi possível carregar o ícone da bandeja.");
   tray = new Tray(icon);
   tray.setToolTip(appDisplayName);
   const rebuild = () => tray.setContextMenu(Menu.buildFromTemplate([
-    { label: "Abrir Nexus", click: showMainWindow },
+    { label: "Abrir Nexus AI", click: showMainWindow },
     { label: "Iniciar reunião", enabled: trayControls.ready && !trayControls.busy && !trayControls.recording, click: () => sendTrayCommand("start-meeting") },
     ...(trayControls.recording ? [{ label: "Terminar gravação", enabled: !trayControls.busy, click: () => sendTrayCommand("stop-meeting") }] : []),
     { label: trayControls.listeningEnabled ? "Desativar escuta ativa" : "Ativar escuta ativa", enabled: trayControls.ready && !trayControls.busy && !trayControls.recording, click: () => sendTrayCommand("toggle-listening") },
@@ -356,13 +359,16 @@ ipcMain.handle("meeting:capture:activate", async (event) => {
 function readGitLabToken() {
   const fs = require("fs");
   const tokenPath = path.join(app.getPath("userData"), "gitlab-token.enc");
-  if (!fs.existsSync(tokenPath)) return "";
+  if (!fs.existsSync(tokenPath)) return { token: "", base_url: "" };
   try {
     if (!safeStorage.isEncryptionAvailable()) throw new Error("Encryption unavailable");
-    return safeStorage.decryptString(fs.readFileSync(tokenPath));
+    const credential = JSON.parse(safeStorage.decryptString(fs.readFileSync(tokenPath)));
+    const origin = new URL(credential.base_url);
+    if (typeof credential.token !== "string" || origin.protocol !== "https:" || origin.origin !== credential.base_url) throw new Error("Invalid credential binding");
+    return credential;
   } catch {
     console.error("Não foi possível desbloquear o token GitLab. Introduz novamente o token nas definições.");
-    return "";
+    return { token: "", base_url: "" };
   }
 }
 
@@ -370,17 +376,20 @@ ipcMain.handle("gitlab:token", async (event, value) => {
   if (event.sender !== mainWindow?.webContents || typeof value !== "string" || value.length > 4096 || /[\r\n]/.test(value)) {
     throw new Error("Pedido de credencial inválido.");
   }
-  if (!safeStorage.isEncryptionAvailable()) throw new Error("Proteção de credenciais Windows indisponível.");
+  if (value.trim() && !safeStorage.isEncryptionAvailable()) throw new Error("Proteção de credenciais Windows indisponível.");
   const fs = require("fs");
   const tokenPath = path.join(app.getPath("userData"), "gitlab-token.enc");
   const token = value.trim();
+  const settingsResponse = await fetch(apiBase + "/gitlab/", { headers: { "X-Local-Token": apiToken } });
+  if (!settingsResponse.ok) throw new Error("Não foi possível consultar a configuração GitLab.");
+  const config = await settingsResponse.json();
   const response = await fetch(apiBase + "/gitlab/credentials/", {
     method: "POST", headers: { "X-Local-Token": apiToken, "Content-Type": "application/json" },
     body: JSON.stringify({ token }),
   });
   if (!response.ok) throw new Error("Não foi possível guardar a credencial no backend local.");
   fs.mkdirSync(app.getPath("userData"), { recursive: true });
-  if (token) fs.writeFileSync(tokenPath, safeStorage.encryptString(token));
+  if (token) fs.writeFileSync(tokenPath, safeStorage.encryptString(JSON.stringify({ token, base_url: config.base_url })));
   else if (fs.existsSync(tokenPath)) fs.unlinkSync(tokenPath);
   return { has_token: Boolean(token) };
 });
@@ -388,7 +397,10 @@ ipcMain.handle("gitlab:token", async (event, value) => {
 ipcMain.handle("gitlab:open", async (event, value) => {
   if (event.sender !== mainWindow?.webContents) throw new Error("Pedido inválido.");
   const url = new URL(value);
-  if (url.origin !== "https://gitlab.warpcom.com" || url.username || url.password) throw new Error("Ligação GitLab inválida.");
+  const response = await fetch(apiBase + "/gitlab/", { headers: { "X-Local-Token": apiToken } });
+  if (!response.ok) throw new Error("Não foi possível consultar a configuração GitLab.");
+  const config = await response.json();
+  if (url.protocol !== "https:" || url.origin !== config.base_url || url.username || url.password) throw new Error("Ligação GitLab inválida.");
   await shell.openExternal(url.href);
 });
 ipcMain.handle("notification:show", (_event, payload) => {

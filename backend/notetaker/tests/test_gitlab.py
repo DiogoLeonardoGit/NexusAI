@@ -18,17 +18,17 @@ class GitLabTests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.client.credentials(HTTP_X_LOCAL_TOKEN="test-token")
-        self.config = GitLabConnection.objects.create(pk=1)
+        self.config = GitLabConnection.objects.create(pk=1, base_url="https://gitlab.example.com", project_path="team/project")
         self.issue = {"id": 301, "iid": 5, "project_id": 42, "title": "Preparar entrega", "description": "Detalhes",
                       "state": "opened", "labels": ["Em curso"], "assignees": [{"id": 7}],
                       "updated_at": "2026-10-13T10:00:00Z", "due_date": None,
-                      "web_url": "https://gitlab.warpcom.com/serviceunit/django-apps/twinportal/-/issues/5"}
+                      "web_url": "https://gitlab.example.com/team/project/-/issues/5"}
         self.issues = [self.issue]
         self.labels = [{"id": 10, "name": "Em curso", "color": "#6699cc"},
                        {"id": 11, "name": "P1", "color": "#ff0000"},
                        {"id": 12, "name": "Revisão", "color": "#6699cc"}]
         self.fake = MagicMock()
-        self.fake.get.return_value = {"id": 7, "username": "diogo.leonardo", "email": gitlab.EXPECTED_EMAIL}
+        self.fake.get.return_value = {"id": 7, "username": "user", "email": "user@example.com"}
         self.fake.project.return_value = {"id": 42}
         self.fake.pages.side_effect = lambda path, **query: deepcopy(self.labels if path.endswith("/labels") else self.issues)
         self.client_patch = patch("notetaker.services.gitlab.GitLabClient", return_value=self.fake)
@@ -51,26 +51,28 @@ class GitLabTests(TestCase):
         self.assertEqual(self.client.post("/api/gitlab/sync/").data, {"disabled": True})
         self.fake.get.assert_not_called()
 
-    def test_personal_import_is_idempotent_and_filters_assignees(self):
+    def test_project_import_is_idempotent_and_includes_other_assignees_and_closed(self):
         other = {**self.issue, "id": 302, "iid": 6, "assignees": [{"id": 8}]}
         closed = {**self.issue, "id": 303, "iid": 7, "state": "closed"}
         self.issues += [other, closed]
-        self.assertEqual(self.enable_import()["imported"], 1)
+        self.assertEqual(self.enable_import()["imported"], 3)
         self.assertEqual(synchronize()["imported"], 0)
-        task = Task.objects.get()
+        task = Task.objects.get(gitlab__issue_iid=5)
         self.assertEqual(task.owner, "self")
         self.assertEqual(task.creation_source, "gitlab")
         self.assertEqual(set(task.tags.values_list("name", flat=True)), {"Em curso"})
-        self.fake.pages.assert_any_call("/projects/42/issues", scope="all", assignee_id=7, state="all")
-        self.assertEqual(self.client.get("/api/tasks/?owner=self").data[0]["gitlab"]["issue_iid"], 5)
+        self.fake.pages.assert_any_call("/projects/42/issues", scope="all", state="all")
+        self.assertEqual({item["gitlab"]["issue_iid"] for item in self.client.get("/api/tasks/?owner=self").data}, {5, 7})
 
-    def test_wrong_account_rejected_without_import(self):
-        self.fake.get.return_value = {"id": 8, "email": "other@example.com"}
+    def test_account_change_rejected_without_replacing_imported_data(self):
+        self.enable_import()
+        self.fake.get.return_value = {"id": 8, "username": "other", "email": "other@example.com"}
         with self.assertRaises(gitlab.GitLabError):
-            self.enable_import()
-        self.assertEqual(Task.objects.count(), 0)
+            synchronize()
+        self.assertEqual(Task.objects.count(), 1)
         self.config.refresh_from_db()
-        self.assertIn(gitlab.EXPECTED_EMAIL, self.config.error)
+        self.assertEqual(self.config.user_id, 7)
+        self.assertIn("outra conta", self.config.error)
 
     def test_completion_and_labels_queue_without_remote_writes(self):
         self.enable_import()
@@ -206,7 +208,7 @@ class GitLabTests(TestCase):
         self.enable_import()
         task = Task.objects.get()
         self.client.post(f"/api/tasks/{task.pk}/complete/")
-        self.fake.get.side_effect = lambda path: ({"id": 7, "username": "diogo", "email": gitlab.EXPECTED_EMAIL}
+        self.fake.get.side_effect = lambda path: ({"id": 7, "username": "user", "email": "user@example.com"}
                                                  if path == "/user" else deepcopy(self.issue))
         self.fake.update_task.return_value = {**self.issue, "state": "closed"}
         settings = self.client.patch("/api/gitlab/", {"write_enabled": True}, format="json")
@@ -220,19 +222,20 @@ class GitLabTests(TestCase):
         self.assertEqual(link.snapshot["state"], "closed")
         self.assertEqual(link.task.status, "done")
 
-    def test_manual_write_path_rechecks_assignee_before_sending(self):
+    def test_manual_write_path_preserves_other_assignee_when_sending(self):
         self.enable_import()
         task = Task.objects.get()
         self.client.post(f"/api/tasks/{task.pk}/complete/")
-        self.fake.get.side_effect = lambda path: ({"id": 7, "username": "diogo", "email": gitlab.EXPECTED_EMAIL}
+        self.fake.get.side_effect = lambda path: ({"id": 7, "username": "user", "email": "user@example.com"}
                                                  if path == "/user" else {**self.issue, "assignees": [{"id": 8}]})
+        self.fake.update_task.return_value = {**self.issue, "assignees": [{"id": 8}], "state": "closed", "labels": []}
         with patch.object(gitlab, "writes_enabled", return_value=True):
             synchronize(send_updates=True)
-        self.fake.update_task.assert_not_called()
-        self.assertFalse(GitLabTask.objects.get().active)
+        self.fake.update_task.assert_called_once()
+        self.assertTrue(GitLabTask.objects.get().active)
 
     def test_credentials_are_not_persisted_or_returned(self):
-        with patch.object(gitlab, "_token", ""):
+        with patch.object(gitlab, "_token", ""), patch.object(gitlab, "_token_origin", ""):
             response = self.client.post("/api/gitlab/credentials/", {"token": "fake-local-test-token"}, format="json")
             self.assertEqual(response.data, {"has_token": True})
             status = self.client.get("/api/gitlab/")
@@ -242,7 +245,7 @@ class GitLabTests(TestCase):
 
 class ClientSafetyTests(TestCase):
     def test_all_remote_write_methods_are_blocked_before_transport(self):
-        config = GitLabConnection.objects.create(enabled=True)
+        config = GitLabConnection.objects.create(enabled=True, base_url="https://gitlab.example.com")
         client = gitlab.GitLabClient(config)
         with patch.object(client.opener, "open") as transport:
             for method in ["POST", "PUT", "PATCH", "DELETE"]:
@@ -251,21 +254,21 @@ class ClientSafetyTests(TestCase):
             transport.assert_not_called()
 
     def test_foreign_host_and_redirect_are_rejected(self):
-        config = GitLabConnection.objects.create(base_url="https://other.example.com")
+        config = GitLabConnection.objects.create(base_url="https://gitlab.example.com", enabled=True)
         with self.assertRaises(gitlab.GitLabError):
-            gitlab.GitLabClient(config).get("/user")
+            gitlab.GitLabClient(config).get("//other.example.com/user")
         self.assertIsNone(gitlab.NoRedirects().redirect_request(None, None, 302, None, {}, "https://other.example.com"))
 
     def test_disabled_connection_blocks_even_manually_authorized_writes(self):
-        config = GitLabConnection.objects.create(enabled=False)
+        config = GitLabConnection.objects.create(enabled=False, base_url="https://gitlab.example.com")
         with patch.object(gitlab, "writes_enabled", return_value=True), self.assertRaises(gitlab.GitLabError):
             gitlab.GitLabClient(config, allow_writes=True).request("/projects/42/issues/5", "PUT", {})
 
     def test_future_outbound_payload_uses_only_deltas_in_simulated_transport(self):
-        config = GitLabConnection.objects.create(enabled=True)
+        config = GitLabConnection.objects.create(enabled=True, base_url="https://gitlab.example.com")
         task = Task.objects.create(title="Local")
         link = GitLabTask.objects.create(task=task, connection=config, project_id=42, issue_iid=5, remote_id=301,
-                                        snapshot={"labels": ["Em curso", "Cliente"]}, web_url="https://gitlab.warpcom.com")
+                                        snapshot={"labels": ["Em curso", "Cliente"]}, web_url="https://gitlab.example.com")
         client = gitlab.GitLabClient(config)
         with patch.object(client, "request", return_value=({}, "")) as request:
             client.update_task(link, {"state": "closed", "labels": ["Cliente", "P1"]})
@@ -280,7 +283,7 @@ class ClientSafetyTests(TestCase):
         self.assertEqual(pending, {"title": "Local", "labels": ["B", "C", "D"]})
 
     def test_get_pagination_uses_numeric_pages_and_can_be_stopped(self):
-        config = GitLabConnection.objects.create(enabled=True)
+        config = GitLabConnection.objects.create(enabled=True, base_url="https://gitlab.example.com")
         client = gitlab.GitLabClient(config)
         with patch.object(client, "request", side_effect=[([{"id": 1}], "2"), ([{"id": 2}], "")]) as request:
             self.assertEqual(list(client.pages("/issues", scope="all")), [{"id": 1}, {"id": 2}])
@@ -292,9 +295,9 @@ class ClientSafetyTests(TestCase):
         transport.assert_not_called()
 
     def test_failed_get_does_not_expose_response_or_credentials(self):
-        config = GitLabConnection.objects.create(enabled=True)
+        config = GitLabConnection.objects.create(enabled=True, base_url="https://gitlab.example.com")
         client = gitlab.GitLabClient(config)
-        with patch.object(gitlab, "_token", "fake-local-test-token"):
+        with patch.object(gitlab, "_token", "fake-local-test-token"), patch.object(gitlab, "_token_origin", config.base_url):
             with patch.object(client.opener, "open", side_effect=HTTPError("unused", 401, "secret-response", {}, None)):
                 with self.assertRaises(gitlab.GitLabError) as error:
                     client.get("/user")

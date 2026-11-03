@@ -7,7 +7,7 @@ from django.db import transaction
 
 from notetaker.models import AudioChunk, Speaker, TranscriptSegment
 
-from .ollama import OllamaError, generate_json
+from .lmstudio import LMStudioError, generate_json
 
 
 MAX_REMOTE_SPEAKERS = 8
@@ -121,7 +121,7 @@ def identify_speaker_names(session_id: int, check_active=None, set_progress=None
         )
         try:
             result = generate_json(prompt, SPEAKER_NAMES_SCHEMA, max_output_tokens=512)
-        except OllamaError:
+        except LMStudioError:
             # Naming is optional: diarization itself remains useful if a part cannot be interpreted.
             continue
         candidates.extend(result.get("speakers", []))

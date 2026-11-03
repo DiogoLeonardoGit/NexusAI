@@ -5,16 +5,58 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $buildDirectory = Join-Path $projectRoot "frontend\build"
 New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
 
-# Keep the original transparent Nexus artwork for Electron and the system tray.
+# Normalize the original artwork once so every surface uses the same visible scale.
 $sourcePath = Join-Path $projectRoot "media\NexusAI_simbolo_quadrado_512.png"
 $pngPath = Join-Path $buildDirectory "icon.png"
-Copy-Item -LiteralPath $sourcePath -Destination $pngPath -Force
+$assetPath = Join-Path $projectRoot "frontend\src\assets\nexus-symbol.png"
 
 # Windows chooses a native size for the taskbar, installer and shortcuts.
 # Each ICO entry contains a PNG resized from the supplied symbol, with alpha intact.
-$source = [System.Drawing.Image]::FromFile($sourcePath)
+$original = [System.Drawing.Bitmap]::new($sourcePath)
+$source = $null
 $entries = @()
 try {
+    # Find the nontransparent bounds without discarding faint antialiased edges.
+    $left = $original.Width
+    $top = $original.Height
+    $right = -1
+    $bottom = -1
+    for ($y = 0; $y -lt $original.Height; $y++) {
+        for ($x = 0; $x -lt $original.Width; $x++) {
+            if ($original.GetPixel($x, $y).A -gt 0) {
+                $left = [Math]::Min($left, $x)
+                $right = [Math]::Max($right, $x)
+                $top = [Math]::Min($top, $y)
+                $bottom = [Math]::Max($bottom, $y)
+            }
+        }
+    }
+    if ($right -lt $left -or $bottom -lt $top) {
+        throw "O símbolo Nexus não contém píxeis visíveis."
+    }
+    # Preserve proportions on a square canvas, leaving 3% padding on each side.
+    $canvasSize = 512
+    $padding = [Math]::Round($canvasSize * 0.03)
+    $visibleWidth = $right - $left + 1
+    $visibleHeight = $bottom - $top + 1
+    $scale = ($canvasSize - 2 * $padding) / [Math]::Max($visibleWidth, $visibleHeight)
+    $width = $visibleWidth * $scale
+    $height = $visibleHeight * $scale
+    $source = [System.Drawing.Bitmap]::new($canvasSize, $canvasSize)
+    $graphics = [System.Drawing.Graphics]::FromImage($source)
+    try {
+        $graphics.CompositingMode = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+        $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $destination = [System.Drawing.RectangleF]::new(($canvasSize - $width) / 2, ($canvasSize - $height) / 2, $width, $height)
+        $bounds = [System.Drawing.RectangleF]::new($left, $top, $visibleWidth, $visibleHeight)
+        $graphics.DrawImage($original, $destination, $bounds, [System.Drawing.GraphicsUnit]::Pixel)
+    } finally {
+        $graphics.Dispose()
+    }
+    $source.Save($pngPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    $source.Save($assetPath, [System.Drawing.Imaging.ImageFormat]::Png)
+
     foreach ($size in @(16, 20, 24, 32, 40, 48, 64, 128, 256)) {
         $bitmap = New-Object System.Drawing.Bitmap $size, $size
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -33,7 +75,8 @@ try {
         }
     }
 } finally {
-    $source.Dispose()
+    if ($null -ne $source) { $source.Dispose() }
+    $original.Dispose()
 }
 
 $icoPath = Join-Path $buildDirectory "icon.ico"

@@ -41,7 +41,7 @@ const result = await new Promise((resolve, reject) => {
 socket.close();
 
 const state = JSON.parse(result);
-if (state.title !== "Nexus" || state.rootChildren < 1 || !state.text.includes("Iniciar reunião") || state.apiStatus !== 200 || !state.hasMediaDevices) {
+if (state.title !== "Nexus AI" || state.rootChildren < 1 || !state.text.includes("Iniciar reunião") || state.apiStatus !== 200 || !state.hasMediaDevices) {
   throw new Error(`Unexpected UI state: ${result}`);
 }
 console.log(result);

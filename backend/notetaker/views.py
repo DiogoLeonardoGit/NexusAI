@@ -12,6 +12,8 @@ from django.utils.dateparse import parse_date, parse_datetime
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view
+from rest_framework.exceptions import ValidationError
+from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 
 from .models import (
@@ -50,28 +52,72 @@ from .serializers import (
     TaskTimeEntrySerializer,
     TranscriptSegmentSerializer,
 )
-from .services.ollama import health as ollama_health
-from .services.ollama import CHAT_SYSTEM_PROMPT, OllamaError, configured_model, generate_json
+from .services.lmstudio import health as lmstudio_health
+from .services.lmstudio import CHAT_SYSTEM_PROMPT, LMStudioError, configured_model, generate_json, list_models
 from .services.pipeline import finalize_session_language
 from .services.retention import delete_audio_file
 from .services.search import retrieve, search_filters
 
 
+def _summary_pending_actions(summary):
+    """Format the same live action list for Markdown and HTML/PDF exports."""
+    actions = []
+    for action in SummarySerializer(summary).data["pending_actions"]:
+        text = f"{action['owner_label']}: {action['title']}"
+        if action["due_is_ambiguous"]:
+            text += " · Prazo por confirmar"
+            if action["date_phrase"]:
+                text += f": {action['date_phrase']}"
+        elif action["due_at"]:
+            due_at = parse_datetime(action["due_at"])
+            text += f" · {timezone.localtime(due_at).strftime('%d/%m/%Y %H:%M')}"
+        actions.append((action["id"], text))
+    return actions
+
+
 @api_view(["GET"])
 def health(request):
     """Report the selected AI provider and model without performing generation."""
-    available = ollama_health()
+    available = lmstudio_health()
     try:
         model = configured_model()
-    except OllamaError:
+    except LMStudioError:
         model = ""
     return Response({
         "status": "ok",
-        "provider": settings.AI_PROVIDER,
+        "provider": "lmstudio",
         "ai_available": available,
-        "ollama": available if settings.AI_PROVIDER == "ollama" else False,
         "model": model,
     })
+
+
+@api_view(["GET"])
+def ai_models(_request):
+    """Expose LM Studio chat models without loading models or running inference."""
+    try:
+        return Response({"models": list_models(), "selected_model": configured_model()})
+    except LMStudioError as exc:
+        return Response({"detail": f"Não foi possível listar os modelos do LM Studio: {exc}"}, status=502)
+
+
+@api_view(["POST"])
+def ai_model_check(request):
+    """Explicitly probe structured output on the saved model without changing it."""
+    if request.data:
+        return Response({"detail": "A verificação usa o modelo guardado nas definições."}, status=400)
+    model = configured_model()
+    try:
+        result = generate_json(
+            'Return exactly {"ok": true}.',
+            {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False},
+            system_prompt="Return only the requested JSON object.",
+            max_output_tokens=512, request_timeout=60,
+        )
+    except LMStudioError as exc:
+        return Response({"detail": f"Não foi possível confirmar a compatibilidade JSON do modelo: {exc}"}, status=502)
+    if result.get("ok") is not True:
+        return Response({"detail": "O modelo não devolveu a resposta JSON esperada."}, status=502)
+    return Response({"model": model, "structured_output": True})
 
 
 def _gitlab_status_groups(config):
@@ -111,21 +157,62 @@ def gitlab_status_tasks(request):
 
 @api_view(["GET", "PATCH"])
 def gitlab_settings(request):
-    """Expose connection state and explicit write opt-in, never credentials."""
+    """Configure an opt-in connection without mixing existing remote identities."""
     from .services import gitlab
-    from .services.gitlab_sync import connection
-    config = connection()
-    if request.method == "PATCH":
-        if not request.data or set(request.data) - {"enabled", "write_enabled"} or any(not isinstance(value, bool) for value in request.data.values()):
-            return Response({"detail": "Indica enabled e/ou write_enabled: true/false."}, status=400)
-        if "enabled" in request.data:
-            config.enabled = request.data["enabled"]
-            config.save(update_fields=["enabled"])
-        if "write_enabled" in request.data:
-            AppSetting.objects.update_or_create(key=gitlab.WRITE_SETTING, defaults={"value": request.data["write_enabled"]})
+    from .services.gitlab_sync import connection, sync_lock
+    with sync_lock:
+        config = connection()
+        if request.method == "PATCH":
+            allowed = {"enabled", "write_enabled", "base_url", "project_path", "primary_labels", "start_label"}
+            if not request.data or set(request.data) - allowed:
+                raise ValidationError({"detail": "Configuração GitLab inválida."})
+            for key in ("enabled", "write_enabled"):
+                if key in request.data and not isinstance(request.data[key], bool):
+                    raise ValidationError({key: "Indica true ou false."})
+            base_url = request.data.get("base_url", config.base_url)
+            if not isinstance(base_url, str):
+                raise ValidationError({"base_url": "Indica um servidor HTTPS válido."})
+            base_url = gitlab.normalize_base_url(base_url) if base_url else ""
+            project_path = request.data.get("project_path", config.project_path)
+            if (not isinstance(project_path, str) or len(project_path) > 500
+                    or (project_path and not re.fullmatch(r"[\w.-]+(?:/[\w.-]+)+", project_path))
+                    or any(part in (".", "..") for part in project_path.split("/"))):
+                raise ValidationError({"project_path": "Indica o caminho grupo/projeto, sem URL."})
+            rules = dict(gitlab.workflow())
+            if "primary_labels" in request.data:
+                labels = request.data["primary_labels"]
+                if (not isinstance(labels, list) or len(labels) > 100
+                        or any(not isinstance(label, str) or not label.strip() or len(label) > 255 for label in labels)):
+                    raise ValidationError({"primary_labels": "Indica uma lista de nomes de etiquetas."})
+                rules["primary_labels"] = list(dict.fromkeys(label.strip() for label in labels))
+            if "start_label" in request.data:
+                label = request.data["start_label"]
+                if not isinstance(label, str) or len(label) > 255:
+                    raise ValidationError({"start_label": "Indica o nome da etiqueta ou deixa vazio."})
+                rules["start_label"] = label.strip()
+            changed = base_url != config.base_url or project_path != config.project_path
+            if changed and (config.gitlabtask_set.exists() or config.gitlablabel_set.exists()
+                            or AppSetting.objects.filter(key__startswith="gitlab_publish_task_").exists()):
+                raise ValidationError({"detail": "Esta ligação já tem dados GitLab. Não é possível trocar de servidor ou projeto sem separar os dados existentes."})
+            enabled = request.data.get("enabled", False if changed else config.enabled)
+            if enabled and "enabled" in request.data and (not base_url or not project_path or changed or not gitlab.has_token()):
+                raise ValidationError({"detail": "Guarda o servidor, o projeto e um token antes de ativar a sincronização."})
+            with transaction.atomic():
+                if changed:
+                    config.user_id = config.project_id = None
+                    config.username, config.error, config.last_sync_at = "", "", None
+                config.base_url, config.project_path, config.enabled = base_url, project_path, enabled
+                config.save()
+                if "write_enabled" in request.data or changed:
+                    AppSetting.objects.update_or_create(key=gitlab.WRITE_SETTING, defaults={"value": False if changed else request.data["write_enabled"]})
+                if {"primary_labels", "start_label"} & set(request.data):
+                    AppSetting.objects.update_or_create(key=gitlab.WORKFLOW_SETTING, defaults={"value": rules})
+            if changed:
+                gitlab.set_token("")
     groups = _gitlab_status_groups(config)
     return Response({"base_url": config.base_url, "project_path": config.project_path, "enabled": config.enabled,
                      "read_only": not gitlab.writes_enabled(), "has_token": gitlab.has_token(),
+                     **gitlab.workflow(),
                      "username": config.username, "last_sync_at": config.last_sync_at, "error": config.error,
                      **{category: links.count() for category, links in groups.items()},
                      "available_tag_ids": list(config.gitlablabel_set.filter(project_id=config.project_id, available=True).values_list("tag_id", flat=True))})
@@ -135,10 +222,60 @@ def gitlab_settings(request):
 def gitlab_credentials(request):
     """Receive a token on the authenticated loopback API and keep it in memory."""
     from .services import gitlab
-    from .services.gitlab_sync import sync_lock
+    from .services.gitlab_sync import connection, sync_lock
     with sync_lock:
-        gitlab.set_token(request.data.get("token"))
+        gitlab.set_token(request.data.get("token"), connection().base_url)
     return Response({"has_token": gitlab.has_token()})
+
+
+@api_view(["GET"])
+def gitlab_labels(_request):
+    """Read project labels for setup without importing tasks or enabling sync."""
+    from .services import gitlab
+    try:
+        client = _gitlab_setup_client({})[0]
+        project = client.project()
+        return Response(_gitlab_project_labels(client, project["id"]))
+    except gitlab.GitLabError as exc:
+        return Response({"detail": str(exc)}, status=502)
+
+
+def _gitlab_setup_client(data):
+    """Validate draft connection details without saving settings or credentials."""
+    from .services import gitlab
+    if set(data) - {"base_url", "project_path", "token"}:
+        raise ValidationError({"detail": "Configuração GitLab inválida."})
+    config = GitLabConnection.objects.filter(pk=1).first() or GitLabConnection()
+    base_url = gitlab.normalize_base_url(data.get("base_url", config.base_url))
+    project_path = data.get("project_path", config.project_path)
+    if (not isinstance(project_path, str) or len(project_path) > 500
+            or not re.fullmatch(r"[\w.-]+(?:/[\w.-]+)+", project_path)
+            or any(part in (".", "..") for part in project_path.split("/"))):
+        raise ValidationError({"project_path": "Indica o caminho grupo/projeto, sem URL."})
+    draft = GitLabConnection(base_url=base_url, project_path=project_path)
+    return gitlab.GitLabClient(draft, inspection=True, token=data.get("token")), config
+
+
+def _gitlab_project_labels(client, project_id):
+    """Return the paginated project and inherited labels for selection controls."""
+    labels = [{"id": item["name"], "name": item["name"], "color": item.get("color", "")}
+              for item in client.pages(f"/projects/{project_id}/labels", include_ancestor_groups="true")]
+    return sorted({label["name"]: label for label in labels}.values(), key=lambda label: label["name"].casefold())
+
+
+@api_view(["POST"])
+def gitlab_connection_check(request):
+    """Check draft credentials and access without persisting or synchronizing."""
+    from .services import gitlab
+    try:
+        client, config = _gitlab_setup_client(request.data)
+        user = client.get("/user")
+        gitlab.validate_identity(config, user)
+        project = client.project()
+        return Response({"username": user["username"], "project_path": project["path_with_namespace"],
+                         "labels": _gitlab_project_labels(client, project["id"])})
+    except gitlab.GitLabError as exc:
+        return Response({"detail": str(exc)}, status=502)
 
 
 @api_view(["GET"])
@@ -155,6 +292,25 @@ def gitlab_milestones(request):
             project_id = config.project_id or client.project()["id"]
             return Response([{"id": item["id"], "title": item["title"], "state": item.get("state", "active")}
                              for item in client.milestones(project_id)])
+        except gitlab.GitLabError as exc:
+            return Response({"detail": str(exc)}, status=502)
+
+
+@api_view(["GET"])
+def gitlab_members(request):
+    """Expose the live member catalogue without enabling or performing remote writes."""
+    from .services import gitlab
+    from .services.gitlab_sync import connection, sync_lock
+    with sync_lock:
+        config = connection()
+        if not config.enabled:
+            return Response({"detail": "Ativa a sincronização GitLab para consultar pessoas."}, status=400)
+        try:
+            client = gitlab.GitLabClient(config)
+            project_id = config.project_id or client.project()["id"]
+            user_id = config.user_id or client.get("/user")["id"]
+            return Response([{**item, "is_self": item["id"] == user_id}
+                             for item in client.members(project_id)])
         except gitlab.GitLabError as exc:
             return Response({"detail": str(exc)}, status=502)
 
@@ -250,10 +406,36 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def retry_processing(self, request, pk=None):
+        """Retry failed audio first without replacing completed transcript segments."""
         session = self.get_object()
-        if session.audio_chunks.exclude(status=AudioChunk.Status.COMPLETE).exists():
+        with transaction.atomic():
+            failed_chunks = list(session.audio_chunks.select_for_update().filter(
+                status=AudioChunk.Status.FAILED,
+            ))
+            if failed_chunks:
+                if any(not chunk.file_path or not Path(chunk.file_path).is_file() for chunk in failed_chunks):
+                    return Response(
+                        {"detail": "Não é possível repetir a transcrição: faltam ficheiros de áudio."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                created = []
+                for chunk in failed_chunks:
+                    job, _ = ProcessingJob.objects.get_or_create(
+                        kind=ProcessingJob.Kind.TRANSCRIBE,
+                        session=session,
+                        chunk=chunk,
+                        status=ProcessingJob.Status.PENDING,
+                    )
+                    chunk.status = AudioChunk.Status.PENDING
+                    chunk.error = ""
+                    chunk.save(update_fields=["status", "error"])
+                    created.append(job.id)
+                # Post-processing can be requested once these observations finish.
+                return Response({"job_ids": created}, status=status.HTTP_202_ACCEPTED)
+        transcription_error = self._transcription_error(session)
+        if transcription_error:
             return Response(
-                {"detail": "A transcrição ainda não terminou."},
+                {"detail": transcription_error},
                 status=status.HTTP_409_CONFLICT,
             )
         phases = [
@@ -289,13 +471,25 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
                 created.append(ProcessingJob.objects.create(kind=kind, session=session).id)
         return Response({"job_ids": created}, status=status.HTTP_202_ACCEPTED)
 
+    def _transcription_error(self, session):
+        """Distinguish active transcription from terminal failures and cancellation."""
+        chunks = session.audio_chunks
+        if chunks.filter(status__in=[AudioChunk.Status.PENDING, AudioChunk.Status.PROCESSING]).exists():
+            return "A transcrição ainda não terminou."
+        if chunks.filter(status=AudioChunk.Status.FAILED).exists():
+            return "A transcrição de parte do áudio falhou. Usa Repetir para tentar recuperar."
+        if chunks.filter(status=AudioChunk.Status.CANCELLED).exists():
+            return "A transcrição foi cancelada. Volta a transcrever antes de continuar."
+        return ""
+
     @action(detail=True, methods=["post"])
     def regenerate_summary(self, request, pk=None):
         """Queue only a replacement meeting summary, preserving all other processing."""
         session = self.get_object()
-        if session.audio_chunks.exclude(status=AudioChunk.Status.COMPLETE).exists():
+        transcription_error = self._transcription_error(session)
+        if transcription_error:
             return Response(
-                {"detail": "A transcrição ainda não terminou."},
+                {"detail": transcription_error},
                 status=status.HTTP_409_CONFLICT,
             )
         if ProcessingJob.objects.filter(
@@ -316,9 +510,10 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def regenerate_tasks(self, request, pk=None):
         session = self.get_object()
-        if session.audio_chunks.exclude(status=AudioChunk.Status.COMPLETE).exists():
+        transcription_error = self._transcription_error(session)
+        if transcription_error:
             return Response(
-                {"detail": "A transcrição ainda não terminou."},
+                {"detail": transcription_error},
                 status=status.HTTP_409_CONFLICT,
             )
         if ProcessingJob.objects.filter(
@@ -435,6 +630,9 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
             lines.extend(["## Resumo", "", summary.content, ""])
             if summary.decisions:
                 lines.extend(["## Decisões", "", *[f"- {item}" for item in summary.decisions], ""])
+            actions = _summary_pending_actions(summary)
+            if actions:
+                lines.extend(["## Ações pendentes", "", *[f"- {text}" for _, text in actions], ""])
             if summary.open_questions:
                 lines.extend([
                     "## Questões em aberto", "",
@@ -452,6 +650,8 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
         for task in session.tasks.all():
             mark = "x" if task.status == Task.Status.DONE else " "
             lines.append(f"- [{mark}] {task.title}")
+            if task.description:
+                lines.extend(f"  {line}" for line in task.description.splitlines())
         response = HttpResponse("\n".join(lines), content_type="text/markdown; charset=utf-8")
         response["Content-Disposition"] = f'attachment; filename="meeting-{session.pk}.md"'
         return response
@@ -476,6 +676,12 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
             parts.extend(["<section><h2>Resumo</h2>", f'<p class="content">{escape(summary.content)}</p>'])
             if summary.decisions:
                 parts.extend(["<h3>Decisões</h3><ul>", *[f"<li>{escape(item)}</li>" for item in summary.decisions], "</ul>"])
+            actions = _summary_pending_actions(summary)
+            if actions:
+                parts.extend(["<h3>Ações pendentes</h3><ul>", *[
+                    f'<li><a href="#task-{task_id}">{escape(text)}</a></li>'
+                    for task_id, text in actions
+                ], "</ul>"])
             if summary.open_questions:
                 parts.extend(["<h3>Questões em aberto</h3><ul>", *[f"<li>{escape(item)}</li>" for item in summary.open_questions], "</ul>"])
             parts.append("</section>")
@@ -493,7 +699,10 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
         parts.append('</ol></section><section><h2>Tarefas</h2><ul class="tasks">')
         for task in session.tasks.all():
             mark = "☑" if task.status == Task.Status.DONE else "☐"
-            parts.append(f"<li>{mark} {escape(task.title)}</li>")
+            parts.append(f'<li id="task-{task.pk}">{mark} {escape(task.title)}')
+            if task.description:
+                parts.append(f'<p class="content">{escape(task.description)}</p>')
+            parts.append("</li>")
         parts.append("</ul></section></body></html>")
         response = HttpResponse("".join(parts), content_type="text/html; charset=utf-8")
         response["Content-Disposition"] = f'attachment; filename="meeting-{session.pk}.html"'
@@ -551,13 +760,13 @@ class TaskViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"])
     def bulk(self, request):
-        """Validate every selected task before atomically adding labels or closing."""
+        """Validate the full batch before atomic edits, local deletion or GitLab hiding."""
         if not isinstance(request.data, dict):
             return Response({"detail": "Indica um objeto com task_ids e action."}, status=400)
         operation = request.data.get("action")
         expected = {"task_ids", "action", "tag_ids"} if operation == "add_labels" else {"task_ids", "action"}
-        if not isinstance(operation, str) or operation not in {"add_labels", "close"} or set(request.data) != expected:
-            return Response({"detail": "Indica task_ids e action: close ou add_labels (com tag_ids)."}, status=400)
+        if not isinstance(operation, str) or operation not in {"add_labels", "close", "delete"} or set(request.data) != expected:
+            return Response({"detail": "Indica task_ids e action: delete, close ou add_labels (com tag_ids)."}, status=400)
         identifiers = request.data.get("task_ids")
         if not isinstance(identifiers, list) or not identifiers or any(type(value) is not int or value <= 0 for value in identifiers):
             return Response({"detail": "Seleciona tarefas com IDs inteiros positivos."}, status=400)
@@ -570,6 +779,18 @@ class TaskViewSet(viewsets.ModelViewSet):
             tasks = list(self.get_queryset().filter(pk__in=identifiers))
             if len(tasks) != len(identifiers):
                 return Response({"detail": "Uma das tarefas selecionadas já não está disponível. Nenhuma foi alterada."}, status=400)
+            if operation == "delete":
+                deleted = hidden = 0
+                # Preserve imported issues and their sync state, matching individual hiding.
+                for task in tasks:
+                    if hasattr(task, "gitlab"):
+                        task.gitlab.hidden = True
+                        task.gitlab.save(update_fields=["hidden"])
+                        hidden += 1
+                    else:
+                        task.delete()
+                        deleted += 1
+                return Response({"deleted": deleted, "hidden": hidden})
             serializers = []
             skipped = 0
             for task in tasks:
@@ -600,30 +821,70 @@ class TaskViewSet(viewsets.ModelViewSet):
         except gitlab.GitLabError as exc:
             return Response({"detail": str(exc)}, status=502)
 
-    @action(detail=True, methods=["post"])
-    def comments(self, request, pk=None):
-        """Send a user-written comment once, respecting sync and identity checks."""
+    def _comment_client(self, task, *, allow_writes=True):
+        """Check visibility and credentials; require write opt-in only for submissions."""
+        from .services import gitlab
+        if not hasattr(task, "gitlab") or not task.gitlab.active or task.gitlab.hidden:
+            raise ValidationError({"detail": "Só podes comentar tarefas ativas ligadas ao GitLab."})
+        link = task.gitlab
+        if not link.connection.enabled or not gitlab.has_token():
+            raise ValidationError({"detail": "Ativa a sincronização e configura o token GitLab."})
+        if allow_writes and not gitlab.writes_enabled():
+            raise ValidationError({"detail": "Ativa a sincronização e a escrita e configura o token GitLab."})
+        client = gitlab.GitLabClient(link.connection, allow_writes=allow_writes)
+        user = client.get("/user")
+        gitlab.validate_identity(link.connection, user)
+        # Assignment does not determine access; the token and GitLab enforce permissions.
+        client.get(f"/projects/{link.project_id}/issues/{link.issue_iid}")
+        return client
+
+    @action(detail=True, methods=["post"], parser_classes=[MultiPartParser], url_path="comment-uploads")
+    def comment_uploads(self, request, pk=None):
+        """Upload one explicitly submitted file without creating a comment or retrying."""
         from .services import gitlab
         task = self.get_object()
-        if not hasattr(task, "gitlab") or not task.gitlab.active or task.gitlab.hidden:
-            return Response({"detail": "Só podes comentar tarefas ativas ligadas ao GitLab."}, status=400)
+        if set(request.data) != {"file"} or len(request.FILES.getlist("file")) != 1:
+            return Response({"detail": "Envia apenas um ficheiro no campo file."}, status=400)
+        try:
+            client = self._comment_client(task)
+            return Response(client.upload_file(task.gitlab, request.FILES["file"]), status=201)
+        except gitlab.GitLabError as exc:
+            return Response({"detail": str(exc)}, status=502)
+
+    @action(detail=True, methods=["get"], url_path="comment-image")
+    def comment_image(self, request, pk=None):
+        """Proxy a private raster attachment without exposing the GitLab credential."""
+        from .services import gitlab
+        task = self.get_object()
+        try:
+            client = self._comment_client(task, allow_writes=False)
+            content, mime = client.comment_image(task.gitlab, request.query_params.get("source"))
+            response = HttpResponse(content, content_type=mime)
+            response["Cache-Control"] = "no-store"
+            response["X-Content-Type-Options"] = "nosniff"
+            return response
+        except gitlab.GitLabError as exc:
+            return Response({"detail": str(exc)}, status=502)
+
+    @action(detail=True, methods=["get", "post"])
+    def comments(self, request, pk=None):
+        """Read remote comments on demand or submit text and confirmed attachment links."""
+        from .services import gitlab
+        task = self.get_object()
+        if request.method == "GET":
+            try:
+                client = self._comment_client(task, allow_writes=False)
+                return Response(client.comments(task.gitlab))
+            except gitlab.GitLabError as exc:
+                return Response({"detail": str(exc)}, status=502)
         if not isinstance(request.data, dict) or set(request.data) != {"body"}:
             return Response({"detail": "Indica apenas o texto do comentário em body."}, status=400)
         body = request.data["body"]
         if not isinstance(body, str) or not body.strip() or len(body) > 100000:
             return Response({"detail": "Escreve um comentário com até 100000 caracteres."}, status=400)
-        link = task.gitlab
-        if not link.connection.enabled or not gitlab.writes_enabled() or not gitlab.has_token():
-            return Response({"detail": "Ativa a sincronização e a escrita e configura o token GitLab."}, status=400)
-        client = gitlab.GitLabClient(link.connection, allow_writes=True)
         try:
-            user = client.get("/user")
-            if user.get("email", "").lower() != gitlab.EXPECTED_EMAIL:
-                raise gitlab.GitLabError("O token tem de pertencer a diogo.leonardo@warpcom.com.")
-            latest = client.get(f"/projects/{link.project_id}/issues/{link.issue_iid}")
-            if not any(person["id"] == user["id"] for person in latest.get("assignees", [])):
-                return Response({"detail": "Esta tarefa já não te está atribuída no GitLab."}, status=400)
-            return Response(client.add_comment(link, body.strip()), status=201)
+            client = self._comment_client(task)
+            return Response(client.add_comment(task.gitlab, body.strip()), status=201)
         except gitlab.GitLabError as exc:
             return Response({"detail": str(exc)}, status=502)
 
@@ -701,11 +962,6 @@ class TaskViewSet(viewsets.ModelViewSet):
             return Response({"detail": "minutes_before must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
         due_at = serializer.validated_data.get("due_at")
         remind_at = due_at - timedelta(minutes=minutes_before) if due_at else None
-        if remind_at and remind_at <= timezone.now():
-            return Response(
-                {"detail": "A hora do lembrete já passou. Escolhe uma data posterior ou menos antecedência."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         with transaction.atomic():
             task = serializer.save(due_is_ambiguous=False, status=Task.Status.TODO)
             task.reminders.filter(
@@ -820,6 +1076,8 @@ class ReminderViewSet(viewsets.ModelViewSet):
         reminders = self.get_queryset().filter(
             status__in=[Reminder.Status.SCHEDULED, Reminder.Status.SNOOZED],
             remind_at__lte=timezone.now(),
+            # Keep past scheduling choices, but never alert if already expired when saved.
+            remind_at__gt=F("created_at"),
         )
         return Response(self.get_serializer(reminders, many=True).data)
 
@@ -865,11 +1123,27 @@ class AppSettingViewSet(viewsets.ModelViewSet):
             "audio_retention_days",
             "audio_max_bytes",
             "default_language",
+            "lmstudio_model",
             "transcription_glossary",
         }
         if set(values) - allowed_keys:
             return Response({"detail": "unsupported setting key"}, status=status.HTTP_400_BAD_REQUEST)
         values = dict(values)
+        if "default_language" in values and values["default_language"] not in CaptureSession.Language.values:
+            return Response({"detail": "O idioma pré-definido deve ser pt ou en."}, status=400)
+        if "lmstudio_model" in values:
+            model = values["lmstudio_model"]
+            if not isinstance(model, str) or not model.strip() or len(model) > 500:
+                return Response({"detail": "Seleciona um modelo de conversação válido."}, status=400)
+            model = model.strip()
+            if model != configured_model():
+                try:
+                    available_models = list_models()
+                except LMStudioError as exc:
+                    return Response({"detail": f"Não foi possível confirmar o modelo no LM Studio: {exc}"}, status=502)
+                if model not in {item["id"] for item in available_models}:
+                    return Response({"detail": "Seleciona um modelo de conversação disponível no LM Studio."}, status=400)
+            values["lmstudio_model"] = model
         if "active_log_window_hours" in values:
             try:
                 values["active_log_window_hours"] = int(values["active_log_window_hours"])
@@ -918,15 +1192,26 @@ def _source(record):
 def search(request):
     try:
         filters = search_filters(request.query_params)
+        limit = min(int(request.query_params.get("limit", 50)), 50)
+        offset = int(request.query_params.get("offset", 0))
+        if limit < 1 or offset < 0:
+            raise ValueError("A paginação requer limit positivo e offset não negativo.")
     except ValueError as exc:
         return Response({"detail": str(exc)}, status=400)
     query = request.query_params.get("q", "").strip()
-    records, _ = retrieve(query, filters) if query or filters else ([], "")
+    # Retrieve one extra ranked source to determine whether another page exists.
+    records, _ = retrieve(
+        query, filters, limit=limit + 1, offset=offset, per_kind_limit=offset + limit + 1,
+    ) if query or filters else ([], "")
+    has_more = len(records) > limit
+    records = records[:limit]
     serializers_by_kind = {"segment": TranscriptSegmentSerializer, "note": NoteSerializer,
                            "task": TaskSerializer, "summary": SummarySerializer, "session": CaptureSessionSerializer}
     result = {plural: serializers_by_kind[kind]([r["item"] for r in records if r["kind"] == kind], many=True).data
               for kind, plural in (("segment", "segments"), ("note", "notes"), ("task", "tasks"), ("summary", "summaries"), ("session", "sessions"))}
     result["sources"] = [_source(record) for record in records]
+    result["has_more"] = has_more
+    result["next_offset"] = offset + len(records) if has_more else None
     return Response(result)
 
 
@@ -940,7 +1225,7 @@ def task_assistant(request):
         return Response({"detail": str(exc)}, status=400)
     except TaskAnswerError as exc:
         return Response({"detail": str(exc)}, status=502)
-    except OllamaError:
+    except LMStudioError:
         return Response({"detail": "A IA local não conseguiu responder. Confirma que o modelo está carregado e tenta novamente."}, status=503)
 
 
@@ -986,8 +1271,8 @@ def chat(request):
             "If evidence is insufficient, say so.\nQuestion: " + question[:2000] + "\nContext:\n" + "\n".join(context_parts),
             schema, system_prompt=CHAT_SYSTEM_PROMPT,
         )
-    except OllamaError:
-        return Response({"detail": "A IA local não está disponível. Usa a pesquisa textual ou verifica o Ollama."}, status=503)
+    except LMStudioError:
+        return Response({"detail": "A IA local não está disponível. Usa a pesquisa textual ou verifica o LM Studio."}, status=503)
     answer = str(result.get("answer", "")).strip()
     sources = []
     for kind in ("segment", "summary", "note", "task", "session"):

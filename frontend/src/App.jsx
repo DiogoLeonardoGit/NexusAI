@@ -7,6 +7,7 @@ import Popup, { useOutsideDismiss } from "./Popup";
 import GitLabSettings, { GitLabIcon, LocalToGitLabIcon } from "./GitLabSettings";
 import Notes from "./Notes";
 import AIQuestionBar from "./AIQuestionBar";
+import GitLabCommentBody from "./GitLabCommentBody";
 import nexusSymbol from "./assets/nexus-symbol.png";
 import AISetupGuide, { useAIAvailability } from "./AISetupGuide";
 import { moveTaskLabels, tasksForLabelView } from "./taskLabels";
@@ -15,7 +16,6 @@ import { startActiveListening, startCapture } from "./capture";
 
 const VIEWS = ["Hoje", "Tarefas", "Projetos", "Reuniões", "Notas", "Pesquisa", "Definições", "Logs"];
 const REMINDER_OPTIONS = [[0, "Na hora"], [5, "5 minutos antes"], [15, "15 minutos antes"], [30, "30 minutos antes"], [60, "1 hora antes"], [1440, "1 dia antes"]];
-const GITLAB_PRIMARY_LABELS = new Set(["To Do", "On Going", "On Testing / Pending Deploy"]);
 
 // GitLab uses working days: a month is four weeks, a week five eight-hour days.
 const GITLAB_TIME_UNITS = [["mo", 576000], ["w", 144000], ["d", 28800], ["h", 3600], ["m", 60]];
@@ -63,6 +63,26 @@ function compareTasks(left, right, order = "default") {
 }
 
 function Spinner() { return <span className="spinner" aria-hidden="true" />; }
+
+// Assignee conflicts contain identities; show their names instead of raw objects.
+function formatTaskConflict(field, value) {
+  return field === "assignees" ? (value || []).map((person) => person.name || `#${person.id}`).join(", ") || "Sem responsável" : String(value);
+}
+
+// Free-text owners stay local; GitLab choices carry a stable member ID.
+function TaskOwnerPicker({ value, onChange, members, disabled, gitlabLinked = false, label = "Responsável da tarefa" }) {
+  const selected = gitlabLinked && value.owner === "self" ? "self" : value.gitlab_assignee_id ? `gitlab:${value.gitlab_assignee_id}` : value.owner;
+  const people = members.filter((person) => !person.is_self);
+  return <label className="task-owner-picker">Responsável<Select aria-label={label} value={selected} disabled={disabled} onChange={(event) => {
+    const choice = event.target.value;
+    const person = choice.startsWith("gitlab:") ? people.find((item) => item.id === Number(choice.slice(7))) : null;
+    onChange(person ? { owner: "other", owner_name: person.name, gitlab_assignee_id: person.id }
+      : { owner: choice, owner_name: "", gitlab_assignee_id: null });
+  }}><option value="self">Eu</option>{!gitlabLinked && <option value="other">Outro interveniente — escrever nome</option>}<option value="unknown" disabled={gitlabLinked}>Sem responsável</option>
+    {selected.startsWith("gitlab:") && !people.some((item) => item.id === value.gitlab_assignee_id) && <option value={selected}>{value.owner_name || `#${value.gitlab_assignee_id}`} (GitLab)</option>}
+    {people.map((person) => <option key={person.id} value={`gitlab:${person.id}`}>{person.name} (@{person.username})</option>)}
+  </Select>{!gitlabLinked && value.owner === "other" && !value.gitlab_assignee_id && <input aria-label="Nome do responsável" disabled={disabled} maxLength={120} value={value.owner_name} onChange={(event) => onChange({ ...value, owner_name: event.target.value })} placeholder="Nome do responsável" required/>}</label>;
+}
 
 function AutoSizeTextarea({ value, ...props }) {
   const input = useRef(null);
@@ -244,8 +264,8 @@ function Projects({ projects, tags, sessions, tasks, notes, summaries, refresh, 
         <div className="project-meeting-content">
           {summaries.filter((summary) => summary.kind === "meeting" && summary.session === meeting.id).map((summary) => <div key={summary.id} role="link" tabIndex={0} className="project-summary-link"
             onClick={() => onOpen({ kind: "summary", object_id: summary.id, meeting_id: meeting.id })}
-            onKeyDown={(event) => { if (event.key === "Enter") onOpen({ kind: "summary", object_id: summary.id, meeting_id: meeting.id }); }}>
-            <SummaryCard summary={summary} title="Resumo"/></div>)}
+            onKeyDown={(event) => { if (event.key === "Enter" && event.target === event.currentTarget) onOpen({ kind: "summary", object_id: summary.id, meeting_id: meeting.id }); }}>
+            <SummaryCard summary={summary} title="Resumo" onOpenTask={onOpen}/></div>)}
           <h4>Notas</h4><div className="card-list">{notes.filter((note) => note.session === meeting.id).map((note) => <button type="button" className="card project-content-link" key={note.id} onClick={() => onOpen({ kind: "note", object_id: note.id, meeting_id: meeting.id })}><strong>{note.title || "Nota pessoal"}</strong><p>{note.body}</p></button>)}</div>
           <h4>Tarefas</h4><TaskList {...taskProps} tasks={projectTasks.filter((task) => task.session === meeting.id)} defaultSession={meeting.id} initialFilter="all"/>
         </div>
@@ -271,7 +291,7 @@ function readTaskSectionOrder() {
 }
 
 // Measure rendered lines so wrapping also counts towards the ten-line preview.
-function TaskDescription({ text }) {
+function TaskDescription({ text, taskId }) {
   const paragraph = useRef(null);
   const id = useId();
   const [expanded, setExpanded] = useState(false), [overflows, setOverflows] = useState(false);
@@ -287,10 +307,14 @@ function TaskDescription({ text }) {
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(node);
+    // Image loading can grow the content while the collapsed viewport stays fixed.
+    observer.observe(node.firstElementChild);
     return () => observer.disconnect();
   }, [text]);
   return <div className="task-description-preview">
-    <p ref={paragraph} id={id} className={`task-description ${expanded ? "" : "is-clamped"}`}>{text}</p>
+    <div ref={paragraph} id={id} className={`task-description ${expanded ? "" : "is-clamped"}`}><div className="task-description-content">
+      {taskId ? <GitLabCommentBody taskId={taskId} text={text} className="gitlab-description-body"/> : text}
+    </div></div>
     {overflows && <button type="button" className="text-button" aria-expanded={expanded} aria-controls={id} onClick={() => setExpanded((value) => !value)}>{expanded ? "Ver menos" : "Ver mais"}</button>}
   </div>;
 }
@@ -298,24 +322,99 @@ function TaskDescription({ text }) {
 // Comments are sent only by this form; drafts remain available after failures.
 function GitLabTaskComment({ task, gitlabStatus, onError, disabled }) {
   const [body, setBody] = useState(""), [sending, setSending] = useState(false), [result, setResult] = useState("");
+  const [attachments, setAttachments] = useState([]), [draggingFiles, setDraggingFiles] = useState(false);
+  const [open, setOpen] = useState(false), [comments, setComments] = useState([]);
+  const [loadingComments, setLoadingComments] = useState(false), [commentsError, setCommentsError] = useState("");
+  const [commentsRevision, setCommentsRevision] = useState(0);
+  const fileInput = useRef(null), attachmentSequence = useRef(0);
   const submitting = useRef(false);
-  const reason = !task.gitlab.active || task.gitlab.hidden ? "Esta tarefa não está disponível para comentários."
-    : !gitlabStatus?.enabled || gitlabStatus.read_only || !gitlabStatus.has_token ? "Ativa a sincronização e a escrita e configura o token GitLab." : "";
+  const readReason = !task.gitlab.active || task.gitlab.hidden ? "Esta tarefa não está disponível para comentários."
+    : !gitlabStatus?.enabled || !gitlabStatus.has_token ? "Ativa a sincronização e configura o token GitLab." : "";
+  const reason = readReason || (gitlabStatus.read_only ? "Ativa a escrita nas definições GitLab para comentar." : "");
+  // Fetch only while expanded; discard outdated responses after closing or changing tasks.
+  useEffect(() => {
+    if (!open || readReason) return;
+    const controller = new AbortController();
+    setLoadingComments(true); setCommentsError(""); setComments([]);
+    api(`/tasks/${task.id}/comments/`, { signal: controller.signal }).then((items) => {
+      if (!Array.isArray(items)) throw new Error("Resposta de comentários inválida.");
+      if (!controller.signal.aborted) setComments(items);
+    }).catch((error) => {
+      if (!controller.signal.aborted) setCommentsError(error.message);
+    }).finally(() => {
+      if (!controller.signal.aborted) setLoadingComments(false);
+    });
+    return () => controller.abort();
+  }, [open, readReason, task.id, commentsRevision]);
+  const blocked = sending || disabled || Boolean(reason);
+  const isFileDrag = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
+  // Selecting files only changes the draft; remote uploads begin on Enviar.
+  const addFiles = (files) => {
+    if (submitting.current || disabled || reason) return;
+    const additions = Array.from(files).map((file) => ({ id: ++attachmentSequence.current, file, markdown: null }));
+    setAttachments((current) => [...current, ...additions]); setResult("");
+  };
   const submit = async (event) => {
     event.preventDefault();
-    if (submitting.current || disabled || reason || !body.trim()) return;
-    submitting.current = true; setSending(true); setResult("");
+    if (submitting.current || disabled || reason || (!body.trim() && !attachments.length)) return;
+    submitting.current = true; setSending(true); setDraggingFiles(false); setResult("");
     try {
-      await api(`/tasks/${task.id}/comments/`, { method: "POST", body: JSON.stringify({ body: body.trim() }) });
-      setBody(""); setResult("Comentário enviado para o GitLab.");
+      const links = [];
+      for (const attachment of attachments) {
+        let markdown = attachment.markdown;
+        if (!markdown) {
+          setResult(`A enviar ${attachment.file.name}…`);
+          const form = new FormData(); form.append("file", attachment.file);
+          const uploaded = await api(`/tasks/${task.id}/comment-uploads/`, { method: "POST", body: form });
+          if (typeof uploaded?.markdown !== "string" || !uploaded.markdown.trim()) throw new Error("O GitLab não confirmou o link do ficheiro. Verifica o upload antes de tentar novamente.");
+          markdown = uploaded.markdown;
+          // Keep acknowledged links if a later upload or the comment fails.
+          setAttachments((current) => current.map((item) => item.id === attachment.id ? { ...item, markdown } : item));
+        }
+        links.push(markdown);
+      }
+      const comment = [body.trim(), ...links].filter(Boolean).join("\n\n");
+      if (comment.length > 100000) throw new Error("O comentário com os anexos excede 100000 caracteres. Reduz o texto ou o número de anexos.");
+      setResult("A enviar comentário…");
+      await api(`/tasks/${task.id}/comments/`, { method: "POST", body: JSON.stringify({ body: comment }) });
+      setBody(""); setAttachments([]); setResult("Comentário enviado para o GitLab.");
+      setCommentsRevision((value) => value + 1);
     } catch (error) { setResult(error.message); onError(error.message); }
     finally { submitting.current = false; setSending(false); }
   };
-  return <details className="task-comment"><summary>Comentar no GitLab</summary>
+  return <details className="task-comment" onToggle={(event) => {
+    if (event.target === event.currentTarget) setOpen(event.currentTarget.open);
+  }}><summary>Comentar no GitLab</summary>
+    {open && <section className="gitlab-comment-history" aria-label="Comentários no GitLab" aria-busy={!readReason && loadingComments}>
+      {readReason ? <p className="muted">{readReason}</p> : loadingComments ? <p role="status"><Spinner/> A carregar comentários…</p>
+        : commentsError ? <div role="alert"><p>{commentsError}</p><button type="button" className="text-button" onClick={() => setCommentsRevision((value) => value + 1)}>Tentar novamente</button></div>
+          : comments.length ? <ol>{comments.map((comment) => <li key={comment.id}>
+            <div className="gitlab-comment-heading"><strong>{comment.author?.name || comment.author?.username || "Utilizador GitLab"}</strong>
+              {comment.author?.username && <span>@{comment.author.username}</span>}
+              {comment.created_at && <time dateTime={comment.created_at}>{new Date(comment.created_at).toLocaleString("pt-PT")}</time>}
+            </div><GitLabCommentBody taskId={task.id} text={comment.body}/>
+          </li>)}</ol> : <p className="muted">Ainda não existem comentários no GitLab.</p>}
+    </section>}
     <form onSubmit={submit}>
-      <textarea aria-label={`Comentário para o GitLab: ${task.title}`} placeholder="Escreve um comentário…" rows={3} maxLength={100000} value={body} disabled={sending || disabled || Boolean(reason)} onChange={(event) => { setBody(event.target.value); setResult(""); }}/>
+      <div className={`comment-dropzone ${draggingFiles ? "is-dragging" : ""}`} onDragEnter={(event) => {
+        if (!isFileDrag(event)) return;
+        event.preventDefault(); event.stopPropagation(); if (!blocked) setDraggingFiles(true);
+      }} onDragOver={(event) => {
+        if (!isFileDrag(event)) return;
+        event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = blocked ? "none" : "copy";
+      }} onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setDraggingFiles(false);
+      }} onDrop={(event) => {
+        if (!isFileDrag(event) && !event.dataTransfer?.files?.length) return;
+        event.preventDefault(); event.stopPropagation(); setDraggingFiles(false); addFiles(event.dataTransfer.files);
+      }}>
+        <textarea aria-label={`Comentário para o GitLab: ${task.title}`} placeholder="Escreve um comentário ou arrasta ficheiros para aqui…" rows={3} maxLength={100000} value={body} disabled={blocked} onChange={(event) => { setBody(event.target.value); setResult(""); }}/>
+        <div className="comment-attachment-controls"><small>{draggingFiles ? "Larga os ficheiros para anexar" : "Arrasta ficheiros para aqui ou seleciona-os. Serão enviados ao carregar em Enviar."}</small><button type="button" className="text-button" disabled={blocked} onClick={() => fileInput.current?.click()}>Anexar ficheiros</button></div>
+        <input ref={fileInput} type="file" multiple hidden disabled={blocked} aria-label="Ficheiros para o comentário GitLab" onChange={(event) => { addFiles(event.target.files); event.target.value = ""; }}/>
+        {attachments.length > 0 && <ul className="comment-attachments" aria-label="Anexos do comentário">{attachments.map((attachment) => <li key={attachment.id}><span>{attachment.file.name}<small>{attachment.markdown ? "Upload confirmado" : "Por enviar"}</small></span><button type="button" className="text-button" aria-label={`Remover anexo ${attachment.file.name}`} disabled={blocked} onClick={() => { setAttachments((current) => current.filter((item) => item.id !== attachment.id)); setResult(""); }}>Remover</button></li>)}</ul>}
+      </div>
       {reason && <small>{reason}</small>}
-      <button type="submit" className="primary-action" disabled={sending || disabled || Boolean(reason) || !body.trim()}>{sending && <Spinner/>}{sending ? "A enviar…" : "Enviar"}</button>
+      <button type="submit" className="primary-action" disabled={blocked || (!body.trim() && !attachments.length)}>{sending && <Spinner/>}{sending ? "A enviar…" : "Enviar"}</button>
       {result && <small role="status">{result}</small>}
     </form>
   </details>;
@@ -326,6 +425,23 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const formId = showSections ? "new-task-form" : `new-task-${localFormId}`;
   const [title, setTitle] = useState(""), [description, setDescription] = useState("");
   const [newSession, setNewSession] = useState(defaultSession || "");
+  const [newOwner, setNewOwner] = useState({ owner: "self", owner_name: "", gitlab_assignee_id: null });
+  const [ownerFilter, setOwnerFilter] = useState("all");
+  const [members, setMembers] = useState([]), [membersLoading, setMembersLoading] = useState(false);
+  const [membersError, setMembersError] = useState(""), [membersRetry, setMembersRetry] = useState(0);
+  // Refresh the live catalogue when the connection changes; discard stale replies.
+  useEffect(() => {
+    let cancelled = false;
+    setMembers([]); setMembersError(""); setMembersLoading(false);
+    if (!gitlabStatus?.enabled || !gitlabStatus?.has_token) return;
+    setMembersLoading(true);
+    api("/gitlab/members/").then((items) => {
+      if (!Array.isArray(items)) throw new Error("Resposta inválida ao consultar pessoas do GitLab.");
+      if (!cancelled) setMembers(items);
+    }).catch((error) => { if (!cancelled) setMembersError(error.message); })
+      .finally(() => { if (!cancelled) setMembersLoading(false); });
+    return () => { cancelled = true; };
+  }, [gitlabStatus?.enabled, gitlabStatus?.has_token, gitlabStatus?.project_id, membersRetry]);
   const [sectionName, setSectionName] = useState(""), [columnTag, setColumnTag] = useState("");
   const [localCreateOpen, setLocalCreateOpen] = useState(false), [layout, setLayout] = useState(() => localStorage.getItem("taskLayout") || "list");
   // The Tarefas page controls creation from its global filter row; other usages stay local.
@@ -372,8 +488,8 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const createTask = async (event) => {
     event.preventDefault();
     if (!title.trim()) return;
-    const saved = await run("new", () => api("/tasks/", { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim(), owner: "self", status: "todo", session: newSession ? Number(newSession) : null }) }));
-    if (saved) { setTitle(""); setDescription(""); setShowCreate(false); }
+    const saved = await run("new", () => api("/tasks/", { method: "POST", body: JSON.stringify({ title: title.trim(), description: description.trim(), ...newOwner, status: "todo", session: newSession ? Number(newSession) : null }) }));
+    if (saved) { setTitle(""); setDescription(""); setNewOwner({ owner: "self", owner_name: "", gitlab_assignee_id: null }); setShowCreate(false); }
   };
   // Persist section changes through the same API/refresh flow as task edits.
   const createSection = async (event) => {
@@ -427,9 +543,10 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     const initialEstimate = task.estimate_seconds ? formatTrackedTime(task.estimate_seconds) : "";
     const initialMinutes = task.reminder_minutes_before ?? 15;
     setEditingTask({ id: task.id, title: task.title, description: task.description || "", owner: task.owner, owner_name: task.owner_name || "",
+      gitlab_assignee_id: task.gitlab_assignee_id ?? null,
       gitlabLinked: Boolean(task.gitlab), milestone_id: task.gitlab?.milestone?.id ?? null,
       tags: [...(task.tags || [])], session: task.session ?? null,
-      original: { milestone_id: task.gitlab?.milestone?.id ?? null, dueAt: initialDueAt, minutesBefore: initialMinutes, estimateDuration: initialEstimate, estimateSeconds: task.estimate_seconds || 0, tags: [...(task.tags || [])], session: task.session ?? null } });
+      original: { owner: task.owner, gitlab_assignee_id: task.gitlab_assignee_id ?? null, milestone_id: task.gitlab?.milestone?.id ?? null, dueAt: initialDueAt, minutesBefore: initialMinutes, estimateDuration: initialEstimate, estimateSeconds: task.estimate_seconds || 0, tags: [...(task.tags || [])], session: task.session ?? null } });
     setDueAt(initialDueAt); setMinutesBefore(initialMinutes);
     setEstimateDuration(initialEstimate); setTimeDuration("");
   };
@@ -437,8 +554,12 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const saveTask = async () => {
     if (busy || !editingTask?.title.trim()) return;
     const original = editingTask.original;
-    const changes = { title: editingTask.title.trim(), description: editingTask.description.trim(), owner: editingTask.owner,
-      owner_name: editingTask.owner === "other" ? editingTask.owner_name.trim() : "" };
+    const changes = { title: editingTask.title.trim(), description: editingTask.description.trim() };
+    // Only an explicit owner selection replaces a GitLab issue's full assignee list.
+    if (!editingTask.gitlabLinked || editingTask.owner !== original.owner || editingTask.gitlab_assignee_id !== original.gitlab_assignee_id) {
+      Object.assign(changes, { owner: editingTask.owner, owner_name: editingTask.owner === "other" ? editingTask.owner_name.trim() : "",
+        gitlab_assignee_id: editingTask.gitlab_assignee_id });
+    }
     let estimate = original.estimateSeconds;
     if (estimateDuration.trim() !== original.estimateDuration) {
       estimate = parseGitLabDuration(estimateDuration);
@@ -474,7 +595,21 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   };
   // Search narrows the existing status/owner view before sorting.
   const searchTerm = taskSearch.trim().toLocaleLowerCase("pt-PT");
+  // Include imported assignees even when they have left the current member catalogue.
+  const ownerOptions = new Map(members.map((person) => [`gitlab:${person.id}`, `${person.name} (@${person.username})`]));
+  for (const task of tasks) {
+    for (const person of task.gitlab?.assignees || []) ownerOptions.set(`gitlab:${person.id}`, person.username ? `${person.name} (@${person.username})` : person.name);
+    if (task.gitlab_assignee_id && !ownerOptions.has(`gitlab:${task.gitlab_assignee_id}`)) ownerOptions.set(`gitlab:${task.gitlab_assignee_id}`, task.owner_name || `#${task.gitlab_assignee_id}`);
+    if (task.owner === "other" && !task.gitlab_assignee_id && !task.gitlab && task.owner_name) ownerOptions.set(`name:${task.owner_name}`, task.owner_name);
+  }
   const visible = tasks.filter((task) => {
+    if (ownerFilter === "self" && task.owner !== "self") return false;
+    if (ownerFilter === "none" && task.owner !== "unknown") return false;
+    if (ownerFilter.startsWith("gitlab:")) {
+      const id = Number(ownerFilter.slice(7));
+      if (task.gitlab_assignee_id !== id && !task.gitlab?.assignees?.some((person) => person.id === id)) return false;
+    }
+    if (ownerFilter.startsWith("name:") && (task.gitlab || task.gitlab_assignee_id || task.owner !== "other" || task.owner_name !== ownerFilter.slice(5))) return false;
     if (searchTerm && !`${task.title}\n${task.description || ""}`.toLocaleLowerCase("pt-PT").includes(searchTerm)) return false;
     if (filter === "all") return true;
     if (filter === "done") return task.status === "done";
@@ -496,17 +631,27 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const endSelection = () => {
     setSelecting(false); setSelectedIds([]); setBulkLabels([]); setActionResult("");
   };
-  // One backend transaction applies the batch; the sync worker delivers linked changes.
+  // One transaction applies the batch; deletion only hides linked GitLab tasks.
   const applyBulk = async (action) => {
     if (busy || !selectedTaskIds.length || (action === "add_labels" && !applicableLabels.length)) return;
     const openCount = selectedTasks.filter((task) => task.status !== "done").length;
     if (action === "close" && (!openCount || !window.confirm(`Fechar ${openCount} tarefa(s) selecionada(s)? Os lembretes serão cancelados e as labels de progresso serão removidas. As alterações GitLab serão sincronizadas automaticamente quando a escrita estiver ativa.`))) return;
+    if (action === "delete") {
+      const linkedCount = selectedTasks.filter((task) => task.gitlab).length;
+      const localCount = selectedTasks.length - linkedCount;
+      const effects = [];
+      if (localCount) effects.push(`${localCount} tarefa(s) local(is), os seus lembretes e registos de tempo serão eliminados definitivamente.`);
+      if (linkedCount) effects.push(`${linkedCount} tarefa(s) GitLab serão apenas ocultadas nesta app, sem alterações no GitLab.`);
+      if (!window.confirm(`Eliminar ${selectedTasks.length} tarefa(s) selecionada(s)?\n\n${effects.join("\n")}`)) return;
+    }
     setActionResult("");
     const saved = await run("bulk", async () => {
       const response = await api("/tasks/bulk/", { method: "POST", body: JSON.stringify({
         task_ids: selectedTaskIds, action, ...(action === "add_labels" ? { tag_ids: applicableLabels } : {}),
       }) });
-      setActionResult(`${response.updated} tarefa(s) atualizadas${response.skipped ? ` · ${response.skipped} já concluídas` : ""}.`);
+      setActionResult(action === "delete"
+        ? [response.deleted && `${response.deleted} tarefa(s) eliminadas`, response.hidden && `${response.hidden} tarefa(s) ocultadas nesta app`].filter(Boolean).join(" · ") + "."
+        : `${response.updated} tarefa(s) atualizadas${response.skipped ? ` · ${response.skipped} já concluídas` : ""}.`);
     });
     if (saved) { setSelectedIds([]); setBulkLabels([]); }
   };
@@ -514,12 +659,14 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
   const publishDisabledReason = (task) => {
     if (task.gitlab_export) return "Envio sem confirmação. Verifica o GitLab; a criação não será repetida.";
     if (editingTask?.id === task.id) return "Guarda a edição antes de enviar o ticket.";
-    if (task.status !== "todo" || task.owner !== "self") return "Só podes enviar tarefas abertas com responsável Eu.";
+    if (task.status !== "todo") return "Só podes enviar tarefas abertas.";
+    if (task.owner === "other" && !task.gitlab_assignee_id) return "Escolhe um utilizador GitLab para atribuir este ticket. Um nome escrito fica apenas na app.";
     if (!gitlabStatus?.enabled || gitlabStatus.read_only || !gitlabStatus.has_token) return "Ativa a sincronização e a escrita e configura o token GitLab.";
     const assigned = tags.filter((tag) => task.tags?.includes(tag.id));
     const invalid = (task.tags || []).filter((id) => !gitlabStatus.available_tag_ids?.includes(id));
     if (invalid.length) return `Estas labels não existem no GitLab: ${invalid.map((id) => tags.find((tag) => tag.id === id)?.name || `#${id}`).join(", ")}`;
-    if (!assigned.some((tag) => GITLAB_PRIMARY_LABELS.has(tag.name))) return "Escolhe pelo menos uma label principal: To Do, On Going ou On Testing / Pending Deploy.";
+    const primaryLabels = gitlabStatus.primary_labels || [];
+    if (primaryLabels.length && !assigned.some((tag) => primaryLabels.includes(tag.name))) return `Escolhe pelo menos uma etiqueta principal configurada: ${primaryLabels.join(", ")}.`;
     if (assigned.some((tag) => tag.name.includes(","))) return "A API GitLab não permite enviar labels com vírgulas.";
     return "";
   };
@@ -532,11 +679,11 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     });
   };
   // Targets override filters and folded groups so notification navigation is visible.
-  useEffect(() => { if (targetId) { setFilter("all"); setTaskSearch(""); } }, [targetId, targetKey]);
+  useEffect(() => { if (targetId) { setFilter("all"); setTaskSearch(""); setOwnerFilter("all"); } }, [targetId, targetKey]);
   // A source click scrolls once after the target is visible; polling must not pull the user back.
   useEffect(() => { scrolledTarget.current = null; }, [targetId, targetKey]);
   useEffect(() => {
-    if (!targetId || filter !== "all" || taskSearch || scrolledTarget.current) return;
+    if (!targetId || filter !== "all" || taskSearch || ownerFilter !== "all" || scrolledTarget.current) return;
     const frame = requestAnimationFrame(() => {
       const card = document.querySelector(`[data-task-id="${targetId}"]`);
       if (!card) return;
@@ -544,7 +691,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
       scrolledTarget.current = { id: targetId, key: targetKey };
     });
     return () => cancelAnimationFrame(frame);
-  }, [targetId, targetKey, tasks, filter, taskSearch]);
+  }, [targetId, targetKey, tasks, filter, taskSearch, ownerFilter]);
   const renderTask = (task, column = null, boardDetail = false) => {
         const overdue = task.status !== "done" && task.due_at && new Date(task.due_at).getTime() < Date.now();
         const reminderFired = task.status !== "done" && task.reminder_status === "notified";
@@ -596,14 +743,14 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
               title={publishDisabledReason(task) || "Enviar ticket para o GitLab"} disabled={Boolean(busy) || Boolean(publishDisabledReason(task))}
               onClick={() => publishLocalTask(task)}>{busy === `publish-${task.id}` ? <Spinner/> : <LocalToGitLabIcon/>}</button>} {isEditing ? <><button className="text-button" onClick={saveTask} disabled={!editingTask.title.trim() || Boolean(busy)}>{busy === `edit-${task.id}` && <Spinner/>}Concluir</button><button className="text-button secondary-text" disabled={Boolean(busy)} onClick={() => setEditingTask(null)}>Cancelar</button></> : <><button className="text-button" disabled={Boolean(busy)} onClick={() => beginTaskEdit(task)}>Editar</button><button className="text-button danger" onClick={() => deleteTask(task)} disabled={busy === `delete-${task.id}`}>{busy === `delete-${task.id}` && <Spinner/>}{task.gitlab ? "Ocultar nesta app" : "Eliminar"}</button></>}</div>
           </div>
-          {isEditing ? <AutoSizeTextarea className="task-description-input" disabled={Boolean(busy)} value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <TaskDescription text={task.description}/>}
+          {isEditing ? <AutoSizeTextarea className="task-description-input" disabled={Boolean(busy)} value={editingTask.description} onChange={(event) => setEditingTask({ ...editingTask, description: event.target.value })} placeholder="Descrição (opcional)"/> : task.description && <TaskDescription text={task.description} taskId={task.gitlab ? task.id : null}/>}
 
           
           <div className="task-labels">{tags.filter((tag) => task.tags?.includes(tag.id)).map((tag) => <span className="label-chip" key={tag.id}><i style={{ backgroundColor: tag.color || "#6699cc" }}/>{tag.name}</span>)}</div>
           {task.gitlab?.pending && <small className="sync-pending">Alterações locais pendentes de envio</small>}
           {task.gitlab && !isEditing && <GitLabTaskComment task={task} gitlabStatus={gitlabStatus} onError={onError} disabled={Boolean(busy)}/>}
           {task.gitlab && Object.keys(task.gitlab.conflicts).length > 0 && <div className="sync-conflict" role="alert"><strong>Conflito com o GitLab</strong><p>{Object.keys(task.gitlab.conflicts).join(", ")}</p>
-            {Object.entries(task.gitlab.conflicts).map(([field, values]) => <div className="conflict-values" key={field}><strong>{{ title: "Título", description: "Descrição", estimate_seconds: "Estimativa (segundos)", start_date: "Data de início", due_date: "Data limite", milestone_id: "Milestone", state: "Estado" }[field] || field}</strong><p>Na app: {String(values.local)}</p><p>No GitLab: {String(values.remote)}</p></div>)}
+            {Object.entries(task.gitlab.conflicts).map(([field, values]) => <div className="conflict-values" key={field}><strong>{{ title: "Título", description: "Descrição", estimate_seconds: "Estimativa (segundos)", start_date: "Data de início", due_date: "Data limite", milestone_id: "Milestone", state: "Estado", assignees: "Responsável" }[field] || field}</strong><p>Na app: {formatTaskConflict(field, values.local)}</p><p>No GitLab: {formatTaskConflict(field, values.remote)}</p></div>)}
             <button disabled={Boolean(busy)} onClick={() => run(`resolve-${task.id}`, () => api(`/tasks/${task.id}/resolve/`, { method: "POST", body: JSON.stringify({ choice: "local" }) }))}>Manter alterações locais</button>
             <button disabled={Boolean(busy)} onClick={() => run(`resolve-${task.id}`, () => api(`/tasks/${task.id}/resolve/`, { method: "POST", body: JSON.stringify({ choice: "remote" }) }))}>Usar versão GitLab</button></div>}
           <div className={`task-meta ${isEditing ? "editing" : ""}`}>
@@ -613,7 +760,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
             {task.time_tracking?.uncertain_seconds > 0 && <small className="task-time-uncertain" role="alert">Envio de {formatTrackedTime(task.time_tracking.uncertain_seconds)} por confirmar. Verifica o GitLab.</small>}
           </div>
           <div className={`task-meta task-details ${isEditing ? "editing" : ""}`}>
-            {isEditing && !task.gitlab ? <><Select aria-label="Responsável da tarefa" disabled={Boolean(busy)} value={editingTask.owner} onChange={(event) => setEditingTask({ ...editingTask, owner: event.target.value })}><option value="self">Eu</option><option value="other">Outro interveniente</option><option value="unknown">Por definir</option></Select>{editingTask.owner === "other" && <input value={editingTask.owner_name} onChange={(event) => setEditingTask({ ...editingTask, owner_name: event.target.value })} placeholder="Nome do responsável"/>}</> : <span className={task.gitlab ? "task-owner-fixed" : undefined} title={task.gitlab ? "Responsável gerido no GitLab" : undefined}>{task.gitlab || task.owner === "self" ? "Eu" : task.owner_name || "Outro interveniente"}</span>}
+            {isEditing ? <TaskOwnerPicker value={editingTask} gitlabLinked={Boolean(task.gitlab)} onChange={(changes) => setEditingTask((current) => ({ ...current, ...changes }))} members={members} disabled={Boolean(busy) || Boolean(task.gitlab && (!task.gitlab.active || task.gitlab.hidden || !gitlabStatus?.enabled || !gitlabStatus?.has_token || membersLoading || membersError))}/> : <span>{task.gitlab?.assignees?.length ? task.gitlab.assignees.map((person) => person.name).join(", ") : task.owner === "self" ? "Eu" : task.owner_name || "Sem responsável"}</span>}
             {!isEditing && <span>· Criada a {new Date(task.created_at).toLocaleString()} {task.creation_source === "gitlab" ? "no GitLab" : task.creation_source === "system" ? "pelo Sistema" : "por ti"}</span>}
             {task.due_at && <span>· Limite: {new Date(task.due_at).toLocaleString()}</span>}
             {task.gitlab?.start_date && <span>· Início: {formatCalendarDate(task.gitlab.start_date)}</span>}
@@ -666,6 +813,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
         <div className="bulk-label-actions"><div className="bulk-label-picker">{!selectedTasks.length && <small>Seleciona pelo menos uma tarefa</small>}<MultiSelect label="Etiquetas para adicionar às tarefas selecionadas" options={compatibleLabels} value={applicableLabels} disabled={Boolean(busy)} emptyMessage="Não existem etiquetas compatíveis com as tarefas selecionadas." onChange={setBulkLabels}/></div>
         <button type="button" className="secondary-action" disabled={Boolean(busy) || !selectedTasks.length || !applicableLabels.length} onClick={() => applyBulk("add_labels")}>Adicionar labels</button></div>
         <div className="bulk-completion-actions"><button type="button" className="primary-action" disabled={Boolean(busy) || !selectedTasks.some((task) => task.status !== "done")} onClick={() => applyBulk("close")}>{busy === "bulk" && <Spinner/>}Fechar selecionadas</button>
+        <button type="button" className="text-button danger" disabled={Boolean(busy) || !selectedTasks.length} onClick={() => applyBulk("delete")}>Eliminar selecionadas</button>
         </div>
         </div>
       </details>;
@@ -673,6 +821,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
     <div className="task-filter-row"><div className="filters">{[["todo", "A fazer"], ["mine", "Minhas tarefas"], ["others", "Pendentes de outros intervenientes"], ["done", "Concluídas"], ["all", "Todas"]].map(([value, label]) => <button type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)} key={value}>{label}</button>)}</div>{showSections && <div className="view-switch" aria-label="Apresentação das tarefas">{[["list", "Lista"], ["board", "Quadro"]].map(([value, text]) => <button type="button" key={value} aria-pressed={layout === value} className={layout === value ? "active" : ""} onClick={() => { setLayout(value); localStorage.setItem("taskLayout", value); }}>{text}</button>)}</div>}{!settingsFilters && (showSections || compactCreate) && !onCreateOpenChange && <TaskCreateButton formId={formId} open={showCreate} onClick={() => setShowCreate((value) => !value)}/>}</div>
     <div className="task-search-filters">
       <label className="task-search-field">Pesquisar tarefas<input type="search" placeholder="Pesquisar no título ou descrição…" value={taskSearch} onChange={(event) => setTaskSearch(event.target.value)}/></label>
+      <label>Responsável<Select aria-label="Filtrar tarefas por responsável" value={ownerFilter} onChange={(event) => setOwnerFilter(event.target.value)}><option value="all">Todos</option><option value="self">Eu</option><option value="none">Sem responsável</option>{[...ownerOptions].sort((a, b) => a[1].localeCompare(b[1], "pt-PT")).map(([id, name]) => <option key={id} value={id}>{name}</option>)}</Select></label>
       <label>Ordenar por<Select value={taskOrder} onChange={(event) => setTaskOrder(event.target.value)}><option value="default">Predefinido</option><option value="created-asc">Data de criação: crescente</option><option value="created-desc">Data de criação: decrescente</option><option value="due-asc">Data limite: crescente</option><option value="due-desc">Data limite: decrescente</option></Select></label>
       {taskSelectionControl}
     </div>
@@ -691,7 +840,9 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
       {labelViewControls}
     </Popup><TaskCreateButton formId={formId} open={showCreate} onClick={() => setShowCreate((value) => !value)}/></div>}
     {actionResult && <p className="task-action-result" role="status">{actionResult}</p>}
-    {((!showSections && !compactCreate) || showCreate) && <form id={formId} className="quick-task" onSubmit={createTask}><input aria-label="Título da nova tarefa" autoFocus={showSections || compactCreate} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><AutoSizeTextarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><label className="new-task-meeting">Reunião<Select aria-label="Reunião da nova tarefa" disabled={Boolean(busy) || Boolean(defaultSession)} value={newSession} onChange={(event) => setNewSession(event.target.value)}><option value="">Sem reunião</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title || "Reunião sem título"}</option>)}</Select></label><button disabled={Boolean(busy) || !title.trim()}>{busy === "new" && <Spinner/>}Adicionar</button>{(showSections || compactCreate) && <button type="button" className="secondary" onClick={() => setShowCreate(false)}>Cancelar</button>}</form>}
+    {((!showSections && !compactCreate) || showCreate) && <form id={formId} className="quick-task" onSubmit={createTask}><input aria-label="Título da nova tarefa" autoFocus={showSections || compactCreate} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Adicionar uma tarefa…"/><AutoSizeTextarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Descrição (opcional)"/><label className="new-task-meeting">Reunião<Select aria-label="Reunião da nova tarefa" disabled={Boolean(busy) || Boolean(defaultSession)} value={newSession} onChange={(event) => setNewSession(event.target.value)}><option value="">Sem reunião</option>{sessions.map((session) => <option key={session.id} value={session.id}>{session.title || "Reunião sem título"}</option>)}</Select></label><TaskOwnerPicker label="Responsável da nova tarefa" value={newOwner} onChange={setNewOwner} members={members} disabled={Boolean(busy)}/><button disabled={Boolean(busy) || !title.trim()}>{busy === "new" && <Spinner/>}Adicionar</button>{(showSections || compactCreate) && <button type="button" className="secondary" onClick={() => setShowCreate(false)}>Cancelar</button>}</form>}
+    {membersLoading && <small role="status">A consultar pessoas do GitLab…</small>}
+    {membersError && <div role="alert">Não foi possível consultar pessoas do GitLab: {membersError} <button type="button" disabled={Boolean(busy)} onClick={() => setMembersRetry((value) => value + 1)}>Tentar novamente</button></div>}
     {taskFilterControls}
     {!settingsFilters && labelViewControls}
     {today ? <div className="today-groups">{["Atrasadas", "Hoje", "Próximos sete dias", "Sem prazo"].map((group) => {
@@ -749,8 +900,20 @@ function DailySummaryPicker({ summaries, date, onDateChange, busy, onGenerate })
   </Popup>;
 }
 
-function SummaryCard({ summary, title = "Resumo" }) {
-  return <article className="card summary"><h3>{title}</h3><p>{summary.content}</p>{summary.decisions?.length > 0 && <><h4>Decisões</h4><ul>{summary.decisions.map((item, index) => <li key={index}>{item}</li>)}</ul></>}{summary.open_questions?.length > 0 && <><h4>Questões em aberto</h4><ul>{summary.open_questions.map((item, index) => <li key={index}>{item}</li>)}</ul></>}</article>;
+function SummaryCard({ summary, title = "Resumo", onOpenTask }) {
+  return <article className="card summary">
+    <h3>{title}</h3><p>{summary.content}</p>
+    {summary.decisions?.length > 0 && <><h4>Decisões</h4><ul>{summary.decisions.map((item, index) => <li key={index}>{item}</li>)}</ul></>}
+    {summary.pending_actions?.length > 0 && <><h4>Ações pendentes</h4><ul>{summary.pending_actions.map((action) => <li key={action.id}>
+      <strong>{action.owner_label}:</strong>{" "}
+      {onOpenTask ? <button type="button" className="text-button" onClick={(event) => {
+        event.stopPropagation(); onOpenTask({ kind: "task", object_id: action.id, meeting_id: summary.session });
+      }}>{action.title}</button> : action.title}
+      {action.due_is_ambiguous ? ` · Prazo por confirmar${action.date_phrase ? `: ${action.date_phrase}` : ""}`
+        : action.due_at ? ` · ${new Date(action.due_at).toLocaleString("pt-PT")}` : ""}
+    </li>)}</ul></>}
+    {summary.open_questions?.length > 0 && <><h4>Questões em aberto</h4><ul>{summary.open_questions.map((item, index) => <li key={index}>{item}</li>)}</ul></>}
+  </article>;
 }
 
 function ProcessingBadge({ processing, onRetry, onCancel, retrying = false, cancelling = false }) {
@@ -895,7 +1058,7 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
     <section className="meeting-panel" hidden={meetingPanel !== "Organização"}><article className="card"><h3>Projeto</h3><OrganizationFields item={selected} projects={projects} tags={tags} onSave={(changes) => run("organization", () => api(`/sessions/${selected.id}/`, { method: "PATCH", body: JSON.stringify(changes) }))}/></article>
     </section><section className="meeting-panel" hidden={meetingPanel !== "Resumo"}>
     {selected.summaries.length === 0 && <article className="card summary pending-summary">{!["failed", "cancelled"].includes(selected.processing.state) && <Spinner/>}<p>{selected.processing.state === "failed" ? "Não foi possível gerar o resumo. Usa Repetir para tentar novamente." : selected.processing.state === "cancelled" ? "O processamento desta reunião foi cancelado." : "O resumo aparecerá quando o processamento terminar."}</p></article>}
-    {selected.summaries.map((summary) => <SummaryCard summary={summary} key={summary.id}/>)}
+    {selected.summaries.map((summary) => <SummaryCard summary={summary} key={summary.id} onOpenTask={taskProps.onOpenSource}/>)}
     </section><section className="meeting-panel" hidden={meetingPanel !== "Organização"}>
     {selected.speakers.length > 0 && <article className="card participants"><h3>Participantes</h3>{selected.speakers.map((speaker) => { const isEditing = editingSpeaker?.id === speaker.id; return <div className="participant-row" key={speaker.id}><div className="participant-field"><span>{speaker.kind === "self" ? "A minha voz" : "Participante"}</span>{isEditing ? <input value={editingSpeaker.label} onChange={(event) => setEditingSpeaker({ ...editingSpeaker, label: event.target.value })} autoFocus/> : <strong>{speaker.label}</strong>}</div><div className="participant-actions">{isEditing ? <><button className="text-button" onClick={() => saveSpeaker(speaker)} disabled={!editingSpeaker.label.trim() || busy === `speaker-${speaker.id}`}>Concluir</button><button className="text-button secondary-text" onClick={() => setEditingSpeaker(null)}>Cancelar</button></> : <button className="text-button" onClick={() => setEditingSpeaker({ id: speaker.id, label: speaker.label })}>Editar</button>}{speaker.kind !== "self" && speaker.label !== "Outros" && !isEditing && <button className="text-button" onClick={() => mergeSpeaker(speaker)} disabled={busy === `merge-${speaker.id}`}>{busy === `merge-${speaker.id}` && <Spinner/>}Fundir em Outros</button>}</div></div>; })}</article>}
     </section><section className="meeting-panel" hidden={meetingPanel !== "Notas"}>
@@ -919,23 +1082,76 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
 
 function Settings({ ai, onOpenAISetup, microphoneId, setMicrophoneId, keepDisplayAwake, setKeepDisplayAwake, autoMeetingEnabled, setAutoMeetingEnabled, onError }) {
   const [devices, setDevices] = useState([]), [launchAtLogin, setLaunchAtLogin] = useState(false), [retentionDays, setRetentionDays] = useState(7), [maxGb, setMaxGb] = useState(5), [logHours, setLogHours] = useState(24), [defaultLanguage, setDefaultLanguage] = useState("pt"), [glossary, setGlossary] = useState(""), [busy, setBusy] = useState(false);
+  const [models, setModels] = useState([]), [selectedModel, setSelectedModel] = useState(""), [savedModel, setSavedModel] = useState("");
+  const [modelsLoading, setModelsLoading] = useState(false), [modelError, setModelError] = useState("");
+  const [checkingCompatibility, setCheckingCompatibility] = useState(false), [compatibility, setCompatibility] = useState(null);
+  const [savedMessage, setSavedMessage] = useState("");
+  const loadModels = useCallback(async () => {
+    setModelsLoading(true); setModelError("");
+    try {
+      const result = await api("/ai/models/");
+      if (!Array.isArray(result.models) || typeof result.selected_model !== "string") throw new Error("Lista de modelos inválida.");
+      setModels(result.models); setSavedModel(result.selected_model);
+      setSelectedModel((previous) => previous || result.selected_model);
+    } catch (error) { setModelError(error.message); }
+    finally { setModelsLoading(false); }
+  }, []);
+  useEffect(() => { loadModels(); }, [loadModels]);
   useEffect(() => {
     navigator.mediaDevices?.enumerateDevices().then((items) => setDevices(items.filter((item) => item.kind === "audioinput"))).catch(console.error);
     window.notetaker?.getLaunchAtLogin().then(setLaunchAtLogin).catch(console.error);
     api("/settings/").then((items) => { const values = Object.fromEntries(items.map((item) => [item.key, item.value])); if (values.audio_retention_days) setRetentionDays(values.audio_retention_days); if (values.audio_max_bytes) setMaxGb(Math.max(1, Math.round(values.audio_max_bytes / 1024 ** 3))); if (values.active_log_window_hours) setLogHours(values.active_log_window_hours); if (["pt", "en"].includes(values.default_language)) setDefaultLanguage(values.default_language); if (typeof values.transcription_glossary === "string") setGlossary(values.transcription_glossary); }).catch((error) => onError(error.message));
   }, [onError]);
   const save = async () => {
-    setBusy(true);
+    setBusy(true); setSavedMessage("");
     try { localStorage.setItem("microphoneDeviceId", microphoneId); await window.notetaker?.setLaunchAtLogin(launchAtLogin); await api("/settings/bulk_upsert/", { method: "POST", body: JSON.stringify({ settings: {
       audio_retention_days: Number(retentionDays), audio_max_bytes: Number(maxGb) * 1024 ** 3, active_log_window_hours: Number(logHours),
       default_language: defaultLanguage, transcription_glossary: glossary,
-    } }) }); } catch (error) { onError(error.message); } finally { setBusy(false); }
+      ...(selectedModel ? { lmstudio_model: selectedModel } : {}),
+    } }) });
+      if (selectedModel) setSavedModel(selectedModel);
+      setCompatibility(null); setSavedMessage("Definições guardadas.");
+      await ai.check();
+    } catch (error) { onError(error.message); } finally { setBusy(false); }
   };
-  return <article className="settings-grid card"><div><div className="ai-model-heading"><span>Modelo para resumos, tarefas e perguntas à IA</span><div className="ai-model-actions"><button type="button" aria-label="Guia de instalação e configuração da IA" title="Guia de instalação e configuração da IA" onClick={onOpenAISetup}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><circle cx="12" cy="7.5" r=".7" fill="currentColor" stroke="none"/></svg></button><button type="button" aria-label={ai.checking ? "A verificar o modelo de IA" : "Verificar novamente o modelo de IA"} title={ai.checking ? "A verificar…" : "Verificar novamente"} disabled={ai.checking} aria-busy={ai.checking} onClick={() => ai.check()}><svg className={ai.checking ? "ai-retry-spinning" : undefined} aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></svg></button></div></div><strong>{ai.health ? `${ai.health.provider === "lmstudio" ? "LM Studio" : ai.health.provider === "ollama" ? "Ollama" : ai.health.provider} · ${ai.health.model || "Não configurado"} · ${ai.health.ai_available ? "Disponível" : "Indisponível"}` : ai.error ? "Não foi possível verificar o modelo" : "A verificar o modelo…"}</strong>{ai.error && <small role="status">{ai.error}</small>}</div><div><label>Modelo de transcrição</label><strong>Faster Whisper Medium · PT/EN</strong></div><div><label>Microfone</label><Select value={microphoneId} onChange={(event) => setMicrophoneId(event.target.value)}><option value="">Predefinido do Windows</option>{devices.map((device) => <option value={device.deviceId} key={device.deviceId}>{device.label || "Microfone"}</option>)}</Select></div><div><label>Idioma para reuniões curtas</label><Select value={defaultLanguage} onChange={(event) => setDefaultLanguage(event.target.value)}><option value="pt">Português</option><option value="en">English</option></Select></div><div className="settings-limits wide"><label>Retenção máxima (dias)<input type="number" min="1" max="7" value={retentionDays} onChange={(event) => setRetentionDays(event.target.value)}/></label><label>Limite de áudio (GB)<input type="number" min="1" value={maxGb} onChange={(event) => setMaxGb(event.target.value)}/></label><label>Janela dos logs (horas)<input type="number" min="1" value={logHours} onChange={(event) => setLogHours(event.target.value)}/></label></div><div className="wide"><label>Glossário de nomes, empresas e siglas</label><textarea value={glossary} onChange={(event) => setGlossary(event.target.value)} placeholder="Warpcom, SecureNet, onboarding, Oracle…"/></div><label className="toggle"><input type="checkbox" checked={launchAtLogin} onChange={(event) => setLaunchAtLogin(event.target.checked)}/> Iniciar com o Windows</label><label className="toggle">
+  const currentModel = selectedModel || savedModel || ai.health?.model || "";
+  const modelChanged = currentModel !== (savedModel || ai.health?.model || "");
+  const verifyCompatibility = async () => {
+    setCheckingCompatibility(true); setCompatibility(null);
+    try {
+      const result = await api("/ai/models/check/", { method: "POST" });
+      if (result.structured_output !== true || result.model !== currentModel) throw new Error("Não foi possível confirmar o modelo verificado.");
+      setCompatibility({ error: false, text: "Compatibilidade JSON confirmada." });
+    } catch (error) { setCompatibility({ error: true, text: error.message }); }
+    finally { setCheckingCompatibility(false); }
+  };
+  return <article className="settings-grid card">
+    <div className="ai-model-field">
+      <div className="ai-model-heading"><span>Modelo para resumos, tarefas e perguntas à IA</span><div className="ai-model-actions">
+        <button type="button" className="ai-compatibility-check" aria-label="Verificar compatibilidade JSON" title={checkingCompatibility ? "A verificar compatibilidade JSON…" : "Verificar compatibilidade JSON"} aria-busy={checkingCompatibility} disabled={!ai.health?.ai_available || modelChanged || busy || checkingCompatibility || ai.checking} onClick={verifyCompatibility}><svg className={checkingCompatibility ? "ai-retry-spinning" : undefined} aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="m8 4-5 8 5 8m8-16 5 8-5 8M9 12l2 2 4-4"/></svg><span className="sr-only">Verificar compatibilidade JSON</span></button>
+        <button type="button" aria-label="Guia de instalação e configuração da IA" title="Guia de instalação e configuração da IA" onClick={onOpenAISetup}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><circle cx="12" cy="7.5" r=".7" fill="currentColor" stroke="none"/></svg></button>
+        <button type="button" aria-label="Atualizar modelos e disponibilidade" title="Atualizar modelos e disponibilidade" disabled={ai.checking || modelsLoading || busy || checkingCompatibility} aria-busy={ai.checking || modelsLoading} onClick={() => { ai.check(); loadModels(); }}><svg className={ai.checking || modelsLoading ? "ai-retry-spinning" : undefined} aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></svg></button>
+      </div></div>
+      <Select aria-label="Modelo de IA" value={currentModel} disabled={modelsLoading || busy || checkingCompatibility || !models.length} onChange={(event) => { setSelectedModel(event.target.value); setCompatibility(null); setSavedMessage(""); }}>
+        {!currentModel && <option value="" disabled>Sem modelos disponíveis</option>}
+        {currentModel && !models.some((model) => model.id === currentModel) && <option value={currentModel} disabled>{currentModel} (não listado)</option>}
+        {models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}{model.loaded ? "" : " · Por carregar"}</option>)}
+      </Select>
+      {ai.error && <small role="status">{ai.error}</small>}
+      {modelError && <small role="alert">{modelError}</small>}
+      {modelChanged && <small role="status">Modelo por guardar.</small>}
+      {compatibility && <small role={compatibility.error ? "alert" : "status"}>{compatibility.text}</small>}
+    </div>
+    <div><label>Modelo de transcrição</label><strong>Faster Whisper Medium · PT/EN</strong></div>
+    <div><label>Microfone</label><Select value={microphoneId} onChange={(event) => setMicrophoneId(event.target.value)}><option value="">Predefinido do Windows</option>{devices.map((device) => <option value={device.deviceId} key={device.deviceId}>{device.label || "Microfone"}</option>)}</Select></div>
+    <div><label>Idioma pré-definido</label><Select aria-label="Idioma pré-definido" value={defaultLanguage} onChange={(event) => { setDefaultLanguage(event.target.value); setSavedMessage(""); }}><option value="pt">Português</option><option value="en">English</option></Select></div>
+    <div className="settings-limits wide"><label>Retenção máxima (dias)<input type="number" min="1" max="7" value={retentionDays} onChange={(event) => setRetentionDays(event.target.value)}/></label><label>Limite de áudio (GB)<input type="number" min="1" value={maxGb} onChange={(event) => setMaxGb(event.target.value)}/></label><label>Janela dos logs (horas)<input type="number" min="1" value={logHours} onChange={(event) => setLogHours(event.target.value)}/></label></div>
+    <div className="wide"><label>Glossário de nomes, empresas e siglas</label><textarea value={glossary} onChange={(event) => setGlossary(event.target.value)} placeholder="Nomes e termos específicos das tuas reuniões"/></div>
+    <label className="toggle"><input type="checkbox" checked={launchAtLogin} onChange={(event) => setLaunchAtLogin(event.target.checked)}/> Iniciar com o Windows</label><label className="toggle">
   <input type="checkbox" checked={keepDisplayAwake}
     onChange={(event) => setKeepDisplayAwake(event.target.checked)}/>
   Manter o ecrã ativo
-</label><label className="toggle"><input type="checkbox" checked={autoMeetingEnabled} onChange={(event) => setAutoMeetingEnabled(event.target.checked)}/> Iniciar reunião ao entrar no Teams ou Webex</label><small>Deteção nas aplicações do Windows. Termina a captura pelo botão Terminar reunião.</small><button className="save" onClick={save} disabled={busy}>{busy && <Spinner/>}Guardar definições</button></article>;
+</label><label className="toggle"><input type="checkbox" checked={autoMeetingEnabled} onChange={(event) => setAutoMeetingEnabled(event.target.checked)}/> Iniciar reunião automaticamente ao entrar numa chamada Teams ou Webex</label><button className="save" onClick={save} disabled={busy || checkingCompatibility}>{busy && <Spinner/>}Guardar definições</button>{savedMessage && <p className="wide" role="status">{savedMessage}</p>}</article>;
 }
 
 export default function App() {
@@ -953,10 +1169,18 @@ export default function App() {
   const [projects, setProjects] = useState([]), [tags, setTags] = useState([]), [notes, setNotes] = useState([]), [participants, setParticipants] = useState([]);
   const [gitlabStatus, setGitlabStatus] = useState(null), [gitlabBusy, setGitlabBusy] = useState(false);
   const [projectFilter, setProjectFilter] = useState(""), [tagFilter, setTagFilter] = useState(""), [participantFilter, setParticipantFilter] = useState(""), [dateFrom, setDateFrom] = useState(""), [dateTo, setDateTo] = useState("");
+  const [searchLoading, setSearchLoading] = useState(false), [loadingMore, setLoadingMore] = useState(false);
+  const searchRequest = useRef(0), loadingMoreRequest = useRef(null);
+  const searchParameters = useMemo(() => new URLSearchParams({
+    q: query.trim(), project: projectFilter, tag: tagFilter, participant: participantFilter,
+    date_from: dateFrom, date_to: dateTo, limit: "50",
+  }).toString(), [query, projectFilter, tagFilter, participantFilter, dateFrom, dateTo]);
+  const visibleResults = results?.searchKey === searchParameters ? results : null;
   const [taskTarget, setTaskTarget] = useState(null), [contentDetail, setContentDetail] = useState(null);
   const [taskCreateOpen, setTaskCreateOpen] = useState(false);
   const [autoMeetingEnabled, setAutoMeetingEnabled] = useState(() => localStorage.getItem("autoMeetingEnabled") !== "false");
   const [detectedMeetings, setDetectedMeetings] = useState({ calls: [], error: "" });
+  const previousDetectionError = useRef("");
   const consumedMeetings = useRef(new Set()), captureTransition = useRef(false);
   const meetingEndNotice = useRef(null);
   const trayCommandHandler = useRef(null), trayState = useRef(null);
@@ -975,7 +1199,13 @@ export default function App() {
     window.notetaker?.setMeetingDetection?.(autoMeetingEnabled).then(receive).catch((error) => { if (!cancelled) setError(error.message); });
     return () => { cancelled = true; unsubscribe?.(); };
   }, [autoMeetingEnabled]);
-  useEffect(() => { if (detectedMeetings.error) setError(detectedMeetings.error); }, [detectedMeetings.error]);
+  useEffect(() => {
+    const previous = previousDetectionError.current;
+    previousDetectionError.current = detectedMeetings.error;
+    if (detectedMeetings.error) setError(detectedMeetings.error);
+    // Recovery clears only the detector's own warning, preserving unrelated errors.
+    else if (previous) setError((current) => current === previous ? "" : current);
+  }, [detectedMeetings.error]);
   useEffect(() => {
     localStorage.setItem("keepDisplayAwake", String(keepDisplayAwake));
     window.notetaker?.setDisplayAwake(keepDisplayAwake);
@@ -1185,19 +1415,49 @@ export default function App() {
   }, [autoMeetingEnabled, detectedMeetings, meetingCapture, captureBusy]);
   useEffect(() => {
     answerRequest.current += 1; setChatAnswer(null);
-    const trimmedQuery = query.trim();
-    if (!trimmedQuery && !projectFilter && !tagFilter && !participantFilter && !dateFrom && !dateTo) { setResults(null); return undefined; }
-    let cancelled = false;
+    const requestId = ++searchRequest.current;
+    loadingMoreRequest.current = null;
+    setResults(null); setLoadingMore(false);
+    const parameters = new URLSearchParams(searchParameters);
+    if (!["q", "project", "tag", "participant", "date_from", "date_to"].some((key) => parameters.get(key))) {
+      setSearchLoading(false); return undefined;
+    }
+    setSearchLoading(true);
     const timer = setTimeout(async () => {
       try {
-        const nextResults = await api(`/search/?${new URLSearchParams({ q: trimmedQuery, project: projectFilter, tag: tagFilter, participant: participantFilter, date_from: dateFrom, date_to: dateTo })}`);
-        if (!cancelled) setResults(nextResults);
+        const nextResults = await api(`/search/?${searchParameters}&offset=0`);
+        if (requestId === searchRequest.current) setResults({ ...nextResults, searchKey: searchParameters });
       } catch (nextError) {
-        if (!cancelled) setError(nextError.message);
+        if (requestId === searchRequest.current) setError(nextError.message);
+      } finally {
+        if (requestId === searchRequest.current) setSearchLoading(false);
       }
     }, 250);
-    return () => { cancelled = true; clearTimeout(timer); };
-  }, [query, projectFilter, tagFilter, participantFilter, dateFrom, dateTo]);
+    return () => { searchRequest.current += 1; clearTimeout(timer); };
+  }, [searchParameters]);
+  // Append only to the same query/filter generation; stale page responses are ignored.
+  const loadMoreSearch = async () => {
+    if (!visibleResults?.has_more || searchLoading || loadingMoreRequest.current) return;
+    const requestId = searchRequest.current;
+    const token = {};
+    loadingMoreRequest.current = token; setLoadingMore(true);
+    try {
+      const nextResults = await api(`/search/?${searchParameters}&offset=${visibleResults.next_offset}`);
+      if (requestId !== searchRequest.current) return;
+      setResults((current) => {
+        if (current?.searchKey !== searchParameters) return current;
+        const seen = new Set(current.sources.map((source) => source.id));
+        return { ...nextResults, searchKey: searchParameters,
+          sources: [...current.sources, ...nextResults.sources.filter((source) => !seen.has(source.id))] };
+      });
+    } catch (nextError) {
+      if (requestId === searchRequest.current) setError(nextError.message);
+    } finally {
+      if (loadingMoreRequest.current === token) {
+        loadingMoreRequest.current = null; setLoadingMore(false);
+      }
+    }
+  };
   const ask = async () => {
     if (!query.trim()) return;
     const requestId = ++answerRequest.current;
@@ -1270,7 +1530,7 @@ export default function App() {
       {view === "Pesquisa" && <><label>Participante<Select value={participantFilter} onChange={(event) => setParticipantFilter(event.target.value)}><option value="">Todos</option>{participants.map((item) => <option key={item.id} value={item.id}>{item.label} · {sessions.find((session) => session.id === item.session)?.title || "Reunião"}</option>)}</Select></label><label>Desde<input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)}/></label><label>Até<input type="date" value={dateTo} min={dateFrom} onChange={(event) => setDateTo(event.target.value)}/></label></>}
       <button type="button" className="text-button" onClick={() => { setProjectFilter(""); setTagFilter(""); setParticipantFilter(""); setDateFrom(""); setDateTo(""); }}>Limpar filtros</button>
     </div>  </>;
-  return <main className="shell"><AISetupGuide {...ai} open={aiSetupOpen} onClose={() => setAISetupOpen(false)}/><aside><div className="brand"><img className="brand-mark" src={nexusSymbol} alt=""/><strong>Nexus</strong></div><nav>{VIEWS.map((item) => <button className={view === item ? "active" : ""} onClick={() => selectView(item)} key={item}>{item}</button>)}</nav><div className="sidebar-controls">
+  return <main className="shell"><AISetupGuide {...ai} open={aiSetupOpen} onClose={() => setAISetupOpen(false)}/><aside><div className="brand"><img className="brand-mark" src={nexusSymbol} alt=""/><strong>Nexus AI</strong></div><nav>{VIEWS.map((item) => <button className={view === item ? "active" : ""} onClick={() => selectView(item)} key={item}>{item}</button>)}</nav><div className="sidebar-controls">
       <button type="button" className="sidebar-control" role="switch" aria-label="Escuta ativa" aria-checked={activeEnabled} disabled={captureBusy || Boolean(meetingCapture)} onClick={toggleActiveListening} title={meetingCapture ? "Reunião em curso" : activeListening ? "Escuta ativa" : "Captura pausada"}>
         <span aria-hidden="true" className={activeListening || meetingCapture ? "live-dot" : "idle-dot"}/><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/></svg><span className="sidebar-control-label">{meetingCapture ? "Reunião em curso" : "Escuta ativa"}</span><span aria-hidden="true" className="sidebar-toggle"/>
       </button>
@@ -1281,11 +1541,11 @@ export default function App() {
     <div ref={aiQuestionPanel}/>
     {error && <div className="error">{error}<button onClick={() => setError("")}>×</button></div>}{notice && <div className="notice">{notice}<button onClick={() => setNotice("")}>×</button></div>}
     {["Hoje", "Reuniões", "Pesquisa"].includes(view) && <div className="organization-toolbar"><Popup className="filter-panel"><summary>Filtros <span className="filter-indicator">{activeOrganizationFilterCount || ""}</span></summary>{organizationFilters}</Popup></div>}
-    {view === "Notas" && <Notes notes={notes} sessions={sessions} projects={projects} refresh={refresh} onError={setError} onOpenSource={openSource} targetId={contentDetail?.id} OrganizationMenu={OrganizationMenu}/>}
+    {view === "Notas" && <Notes notes={notes} sessions={sessions} projects={projects} refresh={refresh} onError={setError} onOpenSource={openSource} targetId={contentDetail?.id} OrganizationMenu={OrganizationMenu} AutoSizeTextarea={AutoSizeTextarea}/>}
     {view === "Projetos" && <Projects taskProps={taskProps} projects={projects} tags={tags} sessions={sessions} tasks={tasks} notes={notes} summaries={summaries} refresh={refresh} onError={setError} onOpen={openSource} onProjectSaved={(item) => setProjects((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))} onTagSaved={(item) => setTags((items) => [...items.filter((existing) => existing.id !== item.id), item].sort((a, b) => a.name.localeCompare(b.name)))}/>}
-    {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList {...taskProps} settingsFilters={view === "Tarefas" ? organizationFilters : null} activeFilterCount={activeOrganizationFilterCount} tasks={organizationTasks} today={view === "Hoje"} showSections={view === "Tarefas"} createOpen={view === "Tarefas" ? taskCreateOpen : undefined} onCreateOpenChange={view === "Tarefas" ? setTaskCreateOpen : undefined}/>} {view === "Reuniões" && <Meetings tasks={tasks} taskProps={taskProps} projects={projects} tags={tags} key={meetingsKey} sessions={organizationSessions} refresh={refresh} onError={setError} target={meetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{contentDetail && <article className="card"><h3>{contentDetail.title || "Nota pessoal"}</h3><p>{contentDetail.body}</p><OrganizationMenu item={contentDetail} projects={projects} tags={tags} onSave={async (changes) => {
+    {view === "Hoje" && latestDaily && <SummaryCard summary={latestDaily} title={latestDaily.summary_date ? `Resumo de ${formatCalendarDate(latestDaily.summary_date)}` : "Resumo mais recente"}/>} {(view === "Hoje" || view === "Tarefas") && <TaskList {...taskProps} initialFilter="mine" settingsFilters={view === "Tarefas" ? organizationFilters : null} activeFilterCount={activeOrganizationFilterCount} tasks={organizationTasks} today={view === "Hoje"} showSections={view === "Tarefas"} createOpen={view === "Tarefas" ? taskCreateOpen : undefined} onCreateOpenChange={view === "Tarefas" ? setTaskCreateOpen : undefined}/>} {view === "Reuniões" && <Meetings tasks={tasks} taskProps={taskProps} projects={projects} tags={tags} key={meetingsKey} sessions={organizationSessions} refresh={refresh} onError={setError} target={meetingTarget} onNotice={setNotice}/>} {view === "Pesquisa" && <><div className="search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Pesquisar ou perguntar sobre as reuniões…"/><button type="button" onClick={ask} disabled={asking}>{asking && <Spinner/>}{asking ? "A pensar…" : "Pesquisa de IA"}</button></div>{contentDetail && <article className="card"><h3>{contentDetail.title || "Nota pessoal"}</h3><p>{contentDetail.body}</p><OrganizationMenu item={contentDetail} projects={projects} tags={tags} onSave={async (changes) => {
       try { const saved = await api(`/notes/${contentDetail.id}/`, { method: "PATCH", body: JSON.stringify(changes) }); setContentDetail(saved); await refresh(); }
       catch (nextError) { setError(nextError.message); }
-    }}/><button onClick={() => setContentDetail(null)}>Fechar</button></article>}{chatAnswer && <article className="card answer"><h3>Resposta</h3><p>{chatAnswer.answer}</p>{chatAnswer.warning && <small>{chatAnswer.warning}</small>}<ReferenceInfo label="Fontes da resposta">{chatAnswer.sources?.length ? <span className="answer-sources">{chatAnswer.sources.map((source) => <button key={source.id} onClick={() => openSource(source)}><span>{source.meeting_title} · {source.speaker}</span><small>{source.text}</small></button>)}</span> : <span className="reference-text">Sem evidência suficiente.</span>}</ReferenceInfo></article>}{results && <div className="card-list search-results">{results.sources?.length ? results.sources.map((source) => <button className="card search-result" key={source.id} onClick={() => openSource(source)}><div className="search-result-meta"><span>{{segment: "Transcrição", summary: "Resumo", note: "Nota", task: "Tarefa", session: "Reunião"}[source.kind]}</span><span>{source.title || source.meeting_title}</span></div><p>{source.text}</p></button>) : <div className="empty">Não foram encontrados resultados locais.</div>}</div>}</>} {view === "Definições" && <Settings ai={ai} onOpenAISetup={() => setAISetupOpen(true)} microphoneId={microphoneId} setMicrophoneId={setMicrophoneId}
+    }}/><button onClick={() => setContentDetail(null)}>Fechar</button></article>}{chatAnswer && <article className="card answer"><h3>Resposta</h3><p>{chatAnswer.answer}</p>{chatAnswer.warning && <small>{chatAnswer.warning}</small>}<ReferenceInfo label="Fontes da resposta">{chatAnswer.sources?.length ? <span className="answer-sources">{chatAnswer.sources.map((source) => <button key={source.id} onClick={() => openSource(source)}><span>{source.meeting_title} · {source.speaker}</span><small>{source.text}</small></button>)}</span> : <span className="reference-text">Sem evidência suficiente.</span>}</ReferenceInfo></article>}{searchLoading && <p role="status">A pesquisar…</p>}{visibleResults && <div className="card-list search-results">{visibleResults.sources?.length ? visibleResults.sources.map((source) => <button className="card search-result" key={source.id} onClick={() => openSource(source)}><div className="search-result-meta"><span>{{segment: "Transcrição", summary: "Resumo", note: "Nota", task: "Tarefa", session: "Reunião"}[source.kind]}</span><span>{source.title || source.meeting_title}</span></div><p>{source.text}</p></button>) : <div className="empty">Não foram encontrados resultados locais.</div>}{visibleResults.has_more && <button type="button" className="secondary-action" onClick={loadMoreSearch} disabled={loadingMore} aria-busy={loadingMore}>{loadingMore && <Spinner/>}{loadingMore ? "A carregar…" : "Ver mais"}</button>}</div>}</>} {view === "Definições" && <Settings ai={ai} onOpenAISetup={() => setAISetupOpen(true)} microphoneId={microphoneId} setMicrophoneId={setMicrophoneId}
   keepDisplayAwake={keepDisplayAwake} setKeepDisplayAwake={setKeepDisplayAwake} autoMeetingEnabled={autoMeetingEnabled} setAutoMeetingEnabled={setAutoMeetingEnabled} onError={setError}/>} {view === "Definições" && <GitLabSettings onError={setError} refresh={refresh}/>} {view === "Logs" && <ListeningLogs logs={logs}/>}</section></main>;
 }
