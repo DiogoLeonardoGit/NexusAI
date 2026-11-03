@@ -601,13 +601,20 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .gitlab-status-list .gitlab-status-task-error { color: #f0c0ac; }
 .gitlab-credentials { display: grid; gap: 12px; padding: 20px 0; border-top: 1px solid #303949; }
 .gitlab-configuration { margin-bottom: 20px; }
+.gitlab-configuration-panel { margin-bottom: 20px; }
+.gitlab-configuration-panel > summary { cursor: pointer; color: #e0e7ef; font-size: 14px; }
+.gitlab-configuration-panel[open] > summary { margin-bottom: 16px; }
+.gitlab-configuration-actions { padding-top: 14px; border-top: 1px solid #303949; }
+.gitlab-configuration .custom-select { width: 100%; min-width: 0; }
+.gitlab-configuration .selected-labels { flex-wrap: wrap; }
+.gitlab-configuration .label-chip { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
 .gitlab-configuration fieldset { display: grid; gap: 14px; min-width: 0; margin: 0; padding: 0; border: 0; }
 .gitlab-configuration legend { padding: 0 0 14px; color: #e0e7ef; font-size: 14px; }
 .gitlab-configuration details { display: grid; gap: 12px; }
 .gitlab-configuration details label { margin-top: 12px; }
 .gitlab-configuration summary { cursor: pointer; color: #aab6c6; font-size: 13px; }
 .gitlab-configuration label, .gitlab-credentials > label { display: grid; gap: 8px; min-width: 0; color: #c3cddb; font-size: 12px; }
-.gitlab-configuration :is(input, textarea), .gitlab-credentials input { box-sizing: border-box; width: 100%; min-width: 0; padding: var(--field-padding); border: 1px solid #3b485a; border-radius: 8px; color: #e8edf4; background: #151d28; font: inherit; }
+.gitlab-configuration :is(input:not([type="checkbox"]), textarea), .gitlab-credentials input { box-sizing: border-box; width: 100%; min-width: 0; padding: var(--field-padding); border: 1px solid #3b485a; border-radius: 8px; color: #e8edf4; background: #151d28; font: inherit; }
 .gitlab-configuration textarea { resize: vertical; }
 .gitlab-configuration button { justify-self: start; }
 .gitlab-credentials-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }

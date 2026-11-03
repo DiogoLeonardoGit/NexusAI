@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { api } from "./api";
+import MultiSelect from "./MultiSelect";
+import Select from "./Select";
 
 const STATUS_CATEGORIES = [["pending", "Pendentes"], ["conflicts", "Conflitos"], ["hidden", "Ocultas"], ["inactive", "Sem atribuição / acesso"]];
 const FIELD_LABELS = { title: "Título", description: "Descrição", state: "Estado", labels: "Etiquetas", due_date: "Prazo", milestone_id: "Milestone", estimate_seconds: "Estimativa", start_date: "Data de início" };
@@ -26,6 +28,9 @@ export default function GitLabSettings({ onError, refresh }) {
   const [loadError, setLoadError] = useState("");
   const [draft, setDraft] = useState(null), [token, setToken] = useState("");
   const [savedMessage, setSavedMessage] = useState("");
+  const [configurationOpen, setConfigurationOpen] = useState(null);
+  const [labelCatalogue, setLabelCatalogue] = useState({ connection: "", labels: [] });
+  const [labelsLoading, setLabelsLoading] = useState(false), [labelsError, setLabelsError] = useState("");
   const [category, setCategory] = useState(null), [detailsRetry, setDetailsRetry] = useState(0);
   const [details, setDetails] = useState({ category: null, loading: false, results: [], error: "" });
   const panelId = useId(), statButtons = useRef({});
@@ -55,7 +60,8 @@ export default function GitLabSettings({ onError, refresh }) {
       const result = await api("/gitlab/");
       setConfig(result);
       setDraft((previous) => previous || { base_url: result.base_url || "", project_path: result.project_path || "",
-        primary_labels: (result.primary_labels || []).join("\n"), start_label: result.start_label || "" });
+        primary_labels: result.primary_labels || [], start_label: result.start_label || "" });
+      setConfigurationOpen((previous) => previous ?? !(result.base_url && result.project_path && result.has_token));
       setLoadError("");
     } catch (error) {
       setLoadError(error.message);
@@ -67,6 +73,18 @@ export default function GitLabSettings({ onError, refresh }) {
     const timer = setInterval(() => load().catch((error) => onError(error.message)), 10000);
     return () => clearInterval(timer);
   }, [load, onError]);
+  useEffect(() => {
+    if (!config?.has_token || !config.base_url || !config.project_path) return;
+    const controller = new AbortController();
+    let cancelled = false;
+    setLabelsLoading(true); setLabelsError("");
+    api("/gitlab/labels/", { signal: controller.signal }).then((labels) => {
+      if (!Array.isArray(labels)) throw new Error("Lista de etiquetas inválida.");
+      if (!cancelled) setLabelCatalogue({ connection: `${config.base_url}/${config.project_path}`, labels });
+    }).catch((error) => { if (!cancelled) setLabelsError(error.message); })
+      .finally(() => { if (!cancelled) setLabelsLoading(false); });
+    return () => { cancelled = true; controller.abort(); };
+  }, [config?.base_url, config?.project_path, config?.has_token]);
   const run = async (operation) => {
     if (busy) return;
     setBusy(true);
@@ -85,11 +103,30 @@ export default function GitLabSettings({ onError, refresh }) {
   if (!config) return <article className="card gitlab-settings">{loadError ? <><p role="alert">Não foi possível carregar a integração GitLab: {loadError}</p><button type="button" disabled={busy} onClick={retryLoad}>Tentar novamente</button></> : "A carregar integração GitLab…"}</article>;
   const projectName = config.project_path?.split("/").at(-1) || "Não configurado";
   const connectionChanged = draft.base_url !== (config.base_url || "") || draft.project_path !== (config.project_path || "");
+  const connectionKey = `${draft.base_url.trim().replace(/\/$/, "")}/${draft.project_path.trim()}`;
+  const connectionComplete = Boolean(draft.base_url.trim() && draft.project_path.trim() && (config.has_token || token.trim()));
+  const projectLabels = labelCatalogue.connection === connectionKey ? labelCatalogue.labels : [];
+  const labelOptions = [...projectLabels, ...[...draft.primary_labels, draft.start_label].filter(Boolean)
+    .filter((name) => !projectLabels.some((label) => label.name === name))
+    .filter((name, index, names) => names.indexOf(name) === index).map((name) => ({ id: name, name }))];
   const saveToken = async (value) => {
     if (window.notetaker?.saveGitLabToken) await window.notetaker.saveGitLabToken(value);
     else await api("/gitlab/credentials/", { method: "POST", body: JSON.stringify({ token: value }) });
     setToken("");
     setSavedMessage(value ? "Token guardado." : "Token removido.");
+  };
+  const testConnection = async () => {
+    if (busy || !connectionComplete) return;
+    setBusy(true); setSavedMessage(""); setLabelsError("");
+    try {
+      const result = await api("/gitlab/check/", { method: "POST", body: JSON.stringify({
+        base_url: draft.base_url.trim(), project_path: draft.project_path.trim(),
+        ...(!config.has_token ? { token: token.trim() } : {}),
+      }) });
+      setLabelCatalogue({ connection: connectionKey, labels: result.labels });
+      setSavedMessage(`Conexão confirmada: ${result.username} · ${result.project_path}.`);
+    } catch (error) { onError(error.message); }
+    finally { setBusy(false); }
   };
   const listing = details.category === category ? details : { loading: true, results: [], error: "" };
   return <article className="card gitlab-settings" aria-busy={busy}>
@@ -104,35 +141,49 @@ export default function GitLabSettings({ onError, refresh }) {
       <div><dt>Última sincronização</dt><dd><strong>{config.last_sync_at ? new Date(config.last_sync_at).toLocaleString() : "Ainda não realizada"}</strong><span>{config.enabled ? "Atualização a cada 60 segundos" : "Ativa a ligação para importar tarefas"}</span></dd></div>
     </dl>
 
+    <details className="gitlab-configuration-panel" open={configurationOpen ?? false} onToggle={(event) => setConfigurationOpen(event.currentTarget.open)}>
+    <summary>Configurações</summary>
     <form className="gitlab-configuration" onSubmit={(event) => {
       event.preventDefault();
+      if (!connectionComplete) return;
       run(async () => {
         const saved = await api("/gitlab/", { method: "PATCH", body: JSON.stringify({ base_url: draft.base_url.trim(), project_path: draft.project_path.trim(),
-          primary_labels: draft.primary_labels.split("\n").map((label) => label.trim()).filter(Boolean), start_label: draft.start_label.trim() }) });
-        if (connectionChanged && window.notetaker?.saveGitLabToken) await window.notetaker.saveGitLabToken("");
+          primary_labels: draft.primary_labels, start_label: draft.start_label }) });
+        setConfig(saved);
         setDraft({ base_url: saved.base_url || "", project_path: saved.project_path || "",
-          primary_labels: (saved.primary_labels || []).join("\n"), start_label: saved.start_label || "" });
-        setSavedMessage("Configuração guardada.");
+          primary_labels: saved.primary_labels || [], start_label: saved.start_label || "" });
+        if (connectionChanged && config.has_token && window.notetaker?.saveGitLabToken) await window.notetaker.saveGitLabToken("");
+        if (!config.has_token && token.trim()) await saveToken(token.trim());
+        setSavedMessage(connectionChanged && config.has_token ? "Configuração guardada. Introduz um token para esta ligação." : "Configuração guardada.");
       });
     }}>
       <fieldset disabled={busy}>
-        <legend>Ligação</legend>
         <label>Servidor GitLab<input type="url" required value={draft.base_url} placeholder="https://gitlab.example.com" onChange={(event) => { setDraft({ ...draft, base_url: event.target.value }); setSavedMessage(""); }}/></label>
         <label>Caminho do projeto<input required maxLength={500} value={draft.project_path} placeholder="grupo/projeto" onChange={(event) => { setDraft({ ...draft, project_path: event.target.value }); setSavedMessage(""); }}/></label>
         <details><summary>Regras de etiquetas</summary>
-          <label>Etiquetas principais obrigatórias (opcional, uma por linha)<textarea rows={3} value={draft.primary_labels} onChange={(event) => setDraft({ ...draft, primary_labels: event.target.value })}/></label>
-          <label>Etiqueta que define a data de início (opcional)<input maxLength={255} value={draft.start_label} onChange={(event) => setDraft({ ...draft, start_label: event.target.value })}/></label>
+          <label>Etiquetas principais obrigatórias (opcional)<MultiSelect options={labelOptions} value={draft.primary_labels}
+            label="Etiquetas principais obrigatórias" disabled={busy || labelsLoading || !projectLabels.length}
+            emptyMessage={labelsLoading ? "A carregar etiquetas…" : "Conecta o repositório para selecionar etiquetas."}
+            onChange={(primary_labels) => { setDraft({ ...draft, primary_labels }); setSavedMessage(""); }}/></label>
+          <label>Etiqueta de data de início (opcional, ao selecionar por exemplo On Going, quando a tarefa tiver essa tag é definida automaticamente a data de inicio com a data atual)
+            <Select aria-label="Etiqueta de data de início" value={draft.start_label} disabled={busy || labelsLoading || !projectLabels.length}
+              onChange={(event) => { setDraft({ ...draft, start_label: event.target.value }); setSavedMessage(""); }}>
+              <option value="">Nenhuma</option>{labelOptions.map((label) => <option key={label.id} value={label.name}>{label.name}</option>)}
+            </Select>
+          </label>
+          {labelsError && <p role="alert">Não foi possível carregar as etiquetas: {labelsError}</p>}
         </details>
-        <button type="submit" className="secondary-action">Guardar configuração</button>
+        <span className={`gitlab-token-state ${config.has_token ? "is-configured" : ""}`}>{config.has_token ? "Token configurado" : "Token por configurar"}</span>
+        {!config.has_token && <label>Token pessoal GitLab<input type="password" autoComplete="off" required maxLength={4096} value={token} onChange={(event) => { setToken(event.target.value); setSavedMessage(""); }}/></label>}
+        <div className="gitlab-sync-actions gitlab-configuration-actions">
+          <button type="button" className="secondary-action" disabled={busy || !connectionComplete} onClick={(event) => { if (event.currentTarget.form.reportValidity()) testConnection(); }}>Testar conexão</button>
+          <button type="submit" className="secondary-action" disabled={busy || !connectionComplete}>Guardar configuração</button>
+          {config.has_token && <button type="button" className="secondary-action" disabled={busy} onClick={() => run(() => saveToken(""))}>Remover token</button>}
+        </div>
+        {!config.has_token && !window.notetaker?.saveGitLabToken && <p role="status">No browser, o token fica apenas em memória até o backend reiniciar.</p>}
       </fieldset>
     </form>
-    <form className="gitlab-credentials" onSubmit={(event) => { event.preventDefault(); run(() => saveToken(token)); }}>
-      <span className={`gitlab-token-state ${config.has_token ? "is-configured" : ""}`}>{config.has_token ? "Token configurado" : "Token por configurar"}</span>
-      <label>Token pessoal GitLab<input type="password" autoComplete="off" maxLength={4096} value={token} disabled={busy || connectionChanged || !config.base_url || !config.project_path} onChange={(event) => { setToken(event.target.value); setSavedMessage(""); }}/></label>
-      <div className="gitlab-sync-actions"><button type="submit" className="secondary-action" disabled={busy || connectionChanged || !token.trim() || !config.base_url || !config.project_path}>{config.has_token ? "Substituir token" : "Guardar token"}</button>
-        <button type="button" className="secondary-action" disabled={busy || !config.has_token} onClick={() => run(() => saveToken(""))}>Remover token</button></div>
-      {!window.notetaker?.saveGitLabToken && <p role="status">No browser, o token fica apenas em memória até o backend reiniciar.</p>}
-    </form>
+    </details>
     {savedMessage && <p role="status">{savedMessage}</p>}
 
     <div className="gitlab-sync-stats" role="group" aria-label="Resumo da sincronização">

@@ -1128,6 +1128,7 @@ function Settings({ ai, onOpenAISetup, microphoneId, setMicrophoneId, keepDispla
   return <article className="settings-grid card">
     <div className="ai-model-field">
       <div className="ai-model-heading"><span>Modelo para resumos, tarefas e perguntas à IA</span><div className="ai-model-actions">
+        <button type="button" className="ai-compatibility-check" aria-label="Verificar compatibilidade JSON" title={checkingCompatibility ? "A verificar compatibilidade JSON…" : "Verificar compatibilidade JSON"} aria-busy={checkingCompatibility} disabled={!ai.health?.ai_available || modelChanged || busy || checkingCompatibility || ai.checking} onClick={verifyCompatibility}><svg className={checkingCompatibility ? "ai-retry-spinning" : undefined} aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="m8 4-5 8 5 8m8-16 5 8-5 8M9 12l2 2 4-4"/></svg><span className="sr-only">Verificar compatibilidade JSON</span></button>
         <button type="button" aria-label="Guia de instalação e configuração da IA" title="Guia de instalação e configuração da IA" onClick={onOpenAISetup}><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><circle cx="12" cy="7.5" r=".7" fill="currentColor" stroke="none"/></svg></button>
         <button type="button" aria-label="Atualizar modelos e disponibilidade" title="Atualizar modelos e disponibilidade" disabled={ai.checking || modelsLoading || busy || checkingCompatibility} aria-busy={ai.checking || modelsLoading} onClick={() => { ai.check(); loadModels(); }}><svg className={ai.checking || modelsLoading ? "ai-retry-spinning" : undefined} aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 20 12M4 12a8 8 0 0 0 13.9 5.9"/></svg></button>
       </div></div>
@@ -1136,11 +1137,9 @@ function Settings({ ai, onOpenAISetup, microphoneId, setMicrophoneId, keepDispla
         {currentModel && !models.some((model) => model.id === currentModel) && <option value={currentModel} disabled>{currentModel} (não listado)</option>}
         {models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.id}{model.loaded ? "" : " · Por carregar"}</option>)}
       </Select>
-      <strong>{ai.health ? `LM Studio · ${ai.health.model || "Não configurado"} · ${ai.health.ai_available ? "Disponível" : "Indisponível"}` : ai.error ? "Não foi possível verificar o modelo" : "A verificar o modelo…"}</strong>
       {ai.error && <small role="status">{ai.error}</small>}
       {modelError && <small role="alert">{modelError}</small>}
       {modelChanged && <small role="status">Modelo por guardar.</small>}
-      <button type="button" className="secondary-action ai-compatibility-check" disabled={!ai.health?.ai_available || modelChanged || busy || checkingCompatibility || ai.checking} onClick={verifyCompatibility}>{checkingCompatibility ? "A verificar compatibilidade…" : "Verificar compatibilidade JSON"}</button>
       {compatibility && <small role={compatibility.error ? "alert" : "status"}>{compatibility.text}</small>}
     </div>
     <div><label>Modelo de transcrição</label><strong>Faster Whisper Medium · PT/EN</strong></div>

@@ -21,6 +21,8 @@ router.register("active-listening-logs", views.ActiveListeningLogViewSet, basena
 
 urlpatterns = [
     path("gitlab/", views.gitlab_settings),
+    path("gitlab/check/", views.gitlab_connection_check),
+    path("gitlab/labels/", views.gitlab_labels),
     path("gitlab/tasks/", views.gitlab_status_tasks),
     path("gitlab/milestones/", views.gitlab_milestones),
     path("gitlab/members/", views.gitlab_members),

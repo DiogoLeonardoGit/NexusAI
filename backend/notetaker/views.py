@@ -229,6 +229,56 @@ def gitlab_credentials(request):
 
 
 @api_view(["GET"])
+def gitlab_labels(_request):
+    """Read project labels for setup without importing tasks or enabling sync."""
+    from .services import gitlab
+    try:
+        client = _gitlab_setup_client({})[0]
+        project = client.project()
+        return Response(_gitlab_project_labels(client, project["id"]))
+    except gitlab.GitLabError as exc:
+        return Response({"detail": str(exc)}, status=502)
+
+
+def _gitlab_setup_client(data):
+    """Validate draft connection details without saving settings or credentials."""
+    from .services import gitlab
+    if set(data) - {"base_url", "project_path", "token"}:
+        raise ValidationError({"detail": "Configuração GitLab inválida."})
+    config = GitLabConnection.objects.filter(pk=1).first() or GitLabConnection()
+    base_url = gitlab.normalize_base_url(data.get("base_url", config.base_url))
+    project_path = data.get("project_path", config.project_path)
+    if (not isinstance(project_path, str) or len(project_path) > 500
+            or not re.fullmatch(r"[\w.-]+(?:/[\w.-]+)+", project_path)
+            or any(part in (".", "..") for part in project_path.split("/"))):
+        raise ValidationError({"project_path": "Indica o caminho grupo/projeto, sem URL."})
+    draft = GitLabConnection(base_url=base_url, project_path=project_path)
+    return gitlab.GitLabClient(draft, inspection=True, token=data.get("token")), config
+
+
+def _gitlab_project_labels(client, project_id):
+    """Return the paginated project and inherited labels for selection controls."""
+    labels = [{"id": item["name"], "name": item["name"], "color": item.get("color", "")}
+              for item in client.pages(f"/projects/{project_id}/labels", include_ancestor_groups="true")]
+    return sorted({label["name"]: label for label in labels}.values(), key=lambda label: label["name"].casefold())
+
+
+@api_view(["POST"])
+def gitlab_connection_check(request):
+    """Check draft credentials and access without persisting or synchronizing."""
+    from .services import gitlab
+    try:
+        client, config = _gitlab_setup_client(request.data)
+        user = client.get("/user")
+        gitlab.validate_identity(config, user)
+        project = client.project()
+        return Response({"username": user["username"], "project_path": project["path_with_namespace"],
+                         "labels": _gitlab_project_labels(client, project["id"])})
+    except gitlab.GitLabError as exc:
+        return Response({"detail": str(exc)}, status=502)
+
+
+@api_view(["GET"])
 def gitlab_milestones(request):
     """Read the live catalogue without enabling writes or starting synchronization."""
     from .services import gitlab

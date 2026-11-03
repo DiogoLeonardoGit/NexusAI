@@ -167,9 +167,15 @@ def has_token():
 class GitLabClient:
     """Restrict authenticated requests to the configured HTTPS instance."""
 
-    def __init__(self, connection, *, allow_writes=False):
+    def __init__(self, connection, *, allow_writes=False, inspection=False, token=None):
+        """Allow explicit setup checks with an optional, non-persisted credential."""
+        if token is not None and (not inspection or not isinstance(token, str)
+                                  or len(token) > 4096 or any(char in token for char in "\r\n")):
+            raise ValidationError({"detail": "Token inválido."})
         self.connection = connection
         self.allow_writes = allow_writes
+        self.inspection = inspection
+        self.token = token.strip() if token is not None else None
         self.opener = build_opener(NoRedirects())
 
     def request(self, path, method="GET", data=None, query=None, *, graphql=False, upload=None, image=False):
@@ -182,9 +188,15 @@ class GitLabClient:
             raise GitLabError("Destino GitLab inválido.")
         if image and (method != "GET" or not re.fullmatch(r"/projects/\d+/uploads/[a-fA-F0-9]{32}/[^/]+", path)):
             raise GitLabError("Destino de imagem inválido.")
-        self.connection.refresh_from_db(fields=["enabled"])
-        if not self.connection.enabled:
-            raise GitLabDisabled("Sincronização desativada.")
+        if self.inspection:
+            project_path = "/projects/" + quote(self.connection.project_path, safe="")
+            if (method != "GET" or graphql or upload is not None or image
+                    or (path not in ("/user", project_path) and not re.fullmatch(r"/projects/\d+/labels", path))):
+                raise GitLabError("Consulta de configuração GitLab inválida.")
+        else:
+            self.connection.refresh_from_db(fields=["enabled"])
+            if not self.connection.enabled:
+                raise GitLabDisabled("Sincronização desativada.")
         # GraphQL reads use POST too; only explicit query documents are read-only.
         graphql_read = (graphql and method == "POST" and isinstance(data, dict)
                         and data.get("query", "").lstrip().startswith("query ")
@@ -194,6 +206,9 @@ class GitLabClient:
         with _credential_lock:
             credential = _token
             credential_origin = _token_origin
+        if self.inspection and self.token is not None:
+            credential = self.token
+            credential_origin = base_url
         if not credential:
             raise GitLabError("Configura o token pessoal nas definições GitLab.")
         if credential_origin != base_url:
