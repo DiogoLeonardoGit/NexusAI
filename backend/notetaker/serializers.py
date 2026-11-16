@@ -93,6 +93,8 @@ class ProcessingStatusSerializer(serializers.Serializer):
     total_audio_ms = serializers.IntegerField()
     remaining_audio_ms = serializers.IntegerField()
     retranscription_available = serializers.BooleanField()
+    retranscription_missing_chunks = serializers.IntegerField()
+    transcription_complete = serializers.BooleanField()
     phase = serializers.CharField()
     message = serializers.CharField()
     retryable = serializers.BooleanField()
@@ -137,10 +139,10 @@ class CaptureSessionSerializer(serializers.ModelSerializer):
             instance.audio_chunks.filter(status=AudioChunk.Status.COMPLETE)
             .values_list("duration_ms", flat=True)
         )
-        retranscription_available = bool(total_chunks) and all(
+        available_chunks = sum(bool(
             chunk.file_path and Path(chunk.file_path).is_file()
-            for chunk in instance.audio_chunks.all()
-        )
+        ) for chunk in instance.audio_chunks.all())
+        retranscription_available = available_chunks > 0
         active_chunks = instance.audio_chunks.filter(
             status__in=[AudioChunk.Status.PENDING, AudioChunk.Status.PROCESSING]
         ).count()
@@ -244,6 +246,8 @@ class CaptureSessionSerializer(serializers.ModelSerializer):
                 "total_audio_ms": total_audio_ms,
                 "remaining_audio_ms": max(0, total_audio_ms - processed_audio_ms),
                 "retranscription_available": retranscription_available,
+                "retranscription_missing_chunks": total_chunks - available_chunks,
+                "transcription_complete": chunks_finished,
                 "phase": phase,
                 "message": message,
                 "retryable": state == "failed",

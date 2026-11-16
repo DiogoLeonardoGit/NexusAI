@@ -18,6 +18,12 @@ contextBridge.exposeInMainWorld("notetaker", {
     return () => ipcRenderer.removeListener("notification:open", listener);
   },
   notify: (payload) => ipcRenderer.invoke("notification:show", payload),
+  dismissCaptureReminder: () => ipcRenderer.invoke("notification:capture:dismiss"),
+  onNotificationAction: (callback) => {
+    const listener = (_event, action) => callback(action);
+    ipcRenderer.on("notification:action", listener);
+    return () => ipcRenderer.removeListener("notification:action", listener);
+  },
   exportPdf: (options) => ipcRenderer.invoke("export:pdf", options),
   exportText: (options) => ipcRenderer.invoke("export:text", options),
   setCaptureState: (state) => ipcRenderer.send("capture:state", state),

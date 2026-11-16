@@ -19,6 +19,17 @@ const appDisplayName = "Nexus AI";
 const userDataPath = path.join(app.getPath("appData"), appDisplayName);
 let powerSaveBlockerId = null;
 const activeNotifications = new Set();
+let captureReminder = null;
+
+// Retire old prompts, including those already stored in Windows Action Center.
+function dismissCaptureReminder() {
+  const previous = captureReminder;
+  captureReminder = null;
+  if (previous) {
+    previous.close();
+    activeNotifications.delete(previous);
+  }
+}
 const meetingDetector = new MeetingDetector((state) => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("meeting:detection", state);
 });
@@ -403,14 +414,38 @@ ipcMain.handle("gitlab:open", async (event, value) => {
   if (url.protocol !== "https:" || url.origin !== config.base_url || url.username || url.password) throw new Error("Ligação GitLab inválida.");
   await shell.openExternal(url.href);
 });
-ipcMain.handle("notification:show", (_event, payload) => {
+ipcMain.handle("notification:capture:dismiss", (event) => {
+  if (event.sender !== mainWindow?.webContents) return false;
+  dismissCaptureReminder();
+  return true;
+});
+ipcMain.handle("notification:show", (event, payload) => {
+  if (event.sender !== mainWindow?.webContents) return false;
   if (!Notification.isSupported()) return false;
-  const notification = new Notification({ title: payload.title, body: payload.body });
+  const isCaptureReminder = payload.target?.kind === "capture-reminder";
+  if (isCaptureReminder) dismissCaptureReminder();
+  const notification = new Notification({
+    title: payload.title, body: payload.body,
+    ...(isCaptureReminder ? {
+      actions: [{ type: "button", text: "Sim" }, { type: "button", text: "Não" }],
+    } : {}),
+  });
+  if (isCaptureReminder) captureReminder = notification;
   // Retain each notification until Windows dismisses it or delivers its click.
   activeNotifications.add(notification);
   const release = () => activeNotifications.delete(notification);
   notification.on("close", release);
   notification.on("failed", release);
+  if (isCaptureReminder) notification.on("action", (details) => {
+    // Only the latest prompt can affect the current recording.
+    if (captureReminder !== notification || ![0, 1].includes(details.actionIndex)) return;
+    dismissCaptureReminder();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("notification:action", {
+        ...payload.target, action: details.actionIndex === 0 ? "stop" : "continue",
+      });
+    }
+  });
   notification.on("click", () => {
     release();
     if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -472,6 +507,7 @@ ipcMain.handle("login:set", (_event, enabled) => {
 
 app.on("before-quit", () => {
   app.isQuitting = true;
+  dismissCaptureReminder();
   meetingDetector.setEnabled(false);
   backendProcesses.forEach((process) => process.kill());
 });

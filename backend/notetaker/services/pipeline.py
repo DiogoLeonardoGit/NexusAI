@@ -224,10 +224,15 @@ def next_pending_job():
 
 def _enqueue_untranscribed_chunks(session: CaptureSession, current_chunk_id=None):
     chunks = AudioChunk.objects.filter(session=session, segments__isnull=True).exclude(
-        status=AudioChunk.Status.CANCELLED
-    ).distinct()
+        status__in=[AudioChunk.Status.CANCELLED, AudioChunk.Status.COMPLETE]
+    ).exclude(file_path="").distinct()
     for candidate in chunks:
-        if candidate.pk == current_chunk_id:
+        if candidate.pk == current_chunk_id or not Path(candidate.file_path).is_file():
+            continue
+        if ProcessingJob.objects.filter(
+            chunk=candidate, kind=ProcessingJob.Kind.TRANSCRIBE,
+            status__in=[ProcessingJob.Status.PENDING, ProcessingJob.Status.RUNNING],
+        ).exists():
             continue
         if candidate.status != AudioChunk.Status.PENDING:
             candidate.status = AudioChunk.Status.PENDING
@@ -652,7 +657,7 @@ def _consolidate_meeting_notes(job, partials, requested_language, *, summary_fac
                 )
                 schema = MEETING_SUMMARY_FINAL_SCHEMA if final else MEETING_SUMMARY_REDUCTION_SCHEMA
                 system_prompt = MEETING_SUMMARY_FINAL_PROMPT if final else MEETING_SUMMARY_REDUCTION_PROMPT
-                output_tokens = 2048
+                output_tokens = 4096
             else:
                 instruction = (
                     "Produce the final whole-meeting summary and consolidated tasks."
@@ -662,13 +667,15 @@ def _consolidate_meeting_notes(job, partials, requested_language, *, summary_fac
                 )
                 schema = MEETING_CONSOLIDATION_SCHEMA
                 system_prompt = MEETING_CONSOLIDATION_SYSTEM_PROMPT
-                output_tokens = 3072 if final else 2048
+                output_tokens = 4096
             result = generate_json(
                 f"{instruction} Notes are in chronological order. Write in {requested_language}.\n"
                 + "\n".join(json.dumps(item, ensure_ascii=False) for item in batch),
                 schema,
                 system_prompt=system_prompt,
                 max_output_tokens=output_tokens,
+                # Larger meeting responses need time to finish on local hardware.
+                request_timeout=1200,
             )
             if summary_facts is not None and not final:
                 result = {"facts": _referenced_summary_facts(result, summary_facts)}
@@ -705,7 +712,9 @@ def _analyze_meeting_transcript(job, transcript, segments, prompt_label, languag
             f"Write in {requested_language}.\n{piece}",
             MEETING_ANALYSIS_SCHEMA,
             system_prompt=MEETING_ANALYSIS_SYSTEM_PROMPT,
-            max_output_tokens=2048,
+            # Preserve detailed task descriptions and evidence without cutting JSON.
+            max_output_tokens=4096,
+            request_timeout=1200,
         )
         partials.append({
             "part": index + 1,

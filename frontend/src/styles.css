@@ -25,8 +25,11 @@ select, textarea, .custom-select .select-trigger {
 }
 input:not(:where([type="checkbox"], [type="radio"], [type="color"], [type="range"], [type="file"], [type="hidden"], [type="button"], [type="submit"], [type="reset"], [type="image"])), select { height: var(--field-height); }
 
-button:disabled { cursor: wait; opacity: .65; }
+button:disabled { cursor: not-allowed; opacity: .65; }
 button { cursor: pointer; }
+.capture-end-prompt { display: flex; align-items: center; gap: 12px; }
+.capture-end-prompt span { flex: 1; }
+.notice.capture-end-prompt button { position: static; width: auto; height: auto; padding: 6px 14px; }
 .shell { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
 aside { position: sticky; top: 0; height: 100dvh; overflow: hidden; display: flex; flex-direction: column; padding: 28px 18px; border-right: 1px solid #222936; background: #10141b; }
 .brand { display: flex; align-items: center; gap: 11px; padding: 0 10px 30px; }
@@ -713,3 +716,9 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 @media (prefers-reduced-motion: reduce) { .ai-retry-spinning { animation: none; } }
 .ai-setup-actions button { padding: 10px 14px; border: 1px solid #46525e; border-radius: 8px; color: #e8edf4; background: #253041; }
 .ai-setup-dialog button:focus-visible { outline: 2px solid var(--nexus-cyan); outline-offset: 3px; }
+/* Audio editing uses the same wall-clock timeline for both capture sources. */
+.audio-trim fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+.audio-trim label { display: flex; flex-direction: column; gap: 6px; }
+.audio-trim .trim-fields { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+.audio-trim input[type="range"], .audio-trim audio { width: 100%; margin: 12px 0; }
+.audio-trim output, .audio-trim small { display: block; }

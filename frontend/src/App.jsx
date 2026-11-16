@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { api, apiText } from "./api";
+import AudioTrimEditor, { transcriptionNotice } from "./AudioTrimEditor";
 import Select from "./Select";
 import MultiSelect from "./MultiSelect";
 import Popup, { useOutsideDismiss } from "./Popup";
@@ -90,9 +91,20 @@ function AutoSizeTextarea({ value, ...props }) {
   useLayoutEffect(() => {
     const element = input.current;
     const resize = () => {
+      // Measuring at auto height briefly collapses long fields and can scroll
+      // their containers. Restore those positions after the full height is back.
+      const scrollPositions = [];
+      for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+        scrollPositions.push({ element: parent, top: parent.scrollTop, left: parent.scrollLeft });
+      }
       element.style.height = "auto";
       const border = element.offsetHeight - element.clientHeight;
       element.style.height = `${element.scrollHeight + border}px`;
+      element.scrollTop = 0;
+      for (const position of scrollPositions) {
+        if (position.element.scrollTop !== position.top) position.element.scrollTop = position.top;
+        if (position.element.scrollLeft !== position.left) position.element.scrollLeft = position.left;
+      }
     };
     resize();
     let width = element.getBoundingClientRect().width;
@@ -354,6 +366,16 @@ function GitLabTaskComment({ task, gitlabStatus, onError, disabled }) {
     const additions = Array.from(files).map((file) => ({ id: ++attachmentSequence.current, file, markdown: null }));
     setAttachments((current) => [...current, ...additions]); setResult("");
   };
+  // Clipboard images share the attachment draft; plain-text paste stays native.
+  const pasteImages = (event) => {
+    if (blocked || submitting.current) return;
+    const images = Array.from(event.clipboardData?.items || [])
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile()).filter(Boolean);
+    if (!images.length) return;
+    event.preventDefault();
+    addFiles(images);
+  };
   const submit = async (event) => {
     event.preventDefault();
     if (submitting.current || disabled || reason || (!body.trim() && !attachments.length)) return;
@@ -408,8 +430,8 @@ function GitLabTaskComment({ task, gitlabStatus, onError, disabled }) {
         if (!isFileDrag(event) && !event.dataTransfer?.files?.length) return;
         event.preventDefault(); event.stopPropagation(); setDraggingFiles(false); addFiles(event.dataTransfer.files);
       }}>
-        <textarea aria-label={`Comentário para o GitLab: ${task.title}`} placeholder="Escreve um comentário ou arrasta ficheiros para aqui…" rows={3} maxLength={100000} value={body} disabled={blocked} onChange={(event) => { setBody(event.target.value); setResult(""); }}/>
-        <div className="comment-attachment-controls"><small>{draggingFiles ? "Larga os ficheiros para anexar" : "Arrasta ficheiros para aqui ou seleciona-os. Serão enviados ao carregar em Enviar."}</small><button type="button" className="text-button" disabled={blocked} onClick={() => fileInput.current?.click()}>Anexar ficheiros</button></div>
+        <textarea aria-label={`Comentário para o GitLab: ${task.title}`} placeholder="Escreve um comentário, cola imagens (Ctrl+V) ou arrasta ficheiros para aqui…" rows={3} maxLength={100000} value={body} disabled={blocked} onPaste={pasteImages} onChange={(event) => { setBody(event.target.value); setResult(""); }}/>
+        <div className="comment-attachment-controls"><small>{draggingFiles ? "Larga os ficheiros para anexar" : "Cola imagens na caixa de comentário (Ctrl+V), arrasta ficheiros ou seleciona-os. Serão enviados ao carregar em Enviar."}</small><button type="button" className="text-button" disabled={blocked} onClick={() => fileInput.current?.click()}>Anexar ficheiros</button></div>
         <input ref={fileInput} type="file" multiple hidden disabled={blocked} aria-label="Ficheiros para o comentário GitLab" onChange={(event) => { addFiles(event.target.files); event.target.value = ""; }}/>
         {attachments.length > 0 && <ul className="comment-attachments" aria-label="Anexos do comentário">{attachments.map((attachment) => <li key={attachment.id}><span>{attachment.file.name}<small>{attachment.markdown ? "Upload confirmado" : "Por enviar"}</small></span><button type="button" className="text-button" aria-label={`Remover anexo ${attachment.file.name}`} disabled={blocked} onClick={() => { setAttachments((current) => current.filter((item) => item.id !== attachment.id)); setResult(""); }}>Remover</button></li>)}</ul>}
       </div>
@@ -941,7 +963,10 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
   const [meetingPanel, setMeetingPanel] = useState("Resumo");
   const open = async (id) => {
     try { const meeting = await api(`/sessions/${id}/`); setSelected(meeting); setTitle(meeting.title); setEditingTitle(false); setEditingSpeaker(null); }
-    catch (error) { onError(error.message); }
+    catch (error) {
+      if (error.status === 404) { setSelected(null); await refresh(); }
+      else onError(error.message);
+    }
   };
   useEffect(() => {
     if (!target?.meetingId) return;
@@ -959,11 +984,18 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
   useEffect(() => { if (selected?.title) setTitle(selected.title); }, [selected?.title]);
   useEffect(() => {
     if (!selected?.id) return undefined;
+    const controller = new AbortController();
     const timer = setInterval(() => {
-      api(`/sessions/${selected.id}/`).then(setSelected).catch((error) => onError(error.message));
+      api(`/sessions/${selected.id}/`, { signal: controller.signal }).then((meeting) => {
+        if (!controller.signal.aborted) setSelected(meeting);
+      }).catch((error) => {
+        if (controller.signal.aborted) return;
+        if (error.status === 404) { setSelected(null); refresh(); }
+        else onError(error.message);
+      });
     }, 5000);
-    return () => clearInterval(timer);
-  }, [selected?.id, onError]);
+    return () => { controller.abort(); clearInterval(timer); };
+  }, [selected?.id, onError, refresh]);
   const run = async (key, operation) => {
     setBusy(key);
     try { await operation(); if (selected) await open(selected.id); await refresh(); }
@@ -998,9 +1030,19 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
   const regenerateTasks = () => run("tasks", () => api(
     `/sessions/${selected.id}/regenerate_tasks/`, { method: "POST" }
   ));
-    const retranscribe = () => window.confirm(
-    "Voltar a transcrever substituirá apenas a transcrição. O resumo e as tarefas não serão recalculados. Continuar?"
-  ) && run("retranscribe", () => api(`/sessions/${selected.id}/retranscribe/`, { method: "POST" }));
+  const retranscribe = () => {
+    const missing = selected.processing.retranscription_missing_chunks > 0;
+    const warning = missing ? "Faltam ficheiros de áudio. A transcrição será substituída apenas com os áudios disponíveis e o texto dos áudios em falta será removido. " : "Voltar a transcrever substituirá apenas a transcrição. ";
+    if (window.confirm(`${warning}O resumo e as tarefas não serão recalculados. Continuar?`)) {
+      run("retranscribe", () => api(`/sessions/${selected.id}/retranscribe/`, {
+        method: "POST", body: JSON.stringify({ confirm_missing_audio: missing }),
+      }));
+    }
+  };
+  const verifyTranscriptions = () => run("verify", async () => {
+    const result = await api(`/sessions/${selected.id}/verify_transcriptions/`, { method: "POST" });
+    onNotice?.(transcriptionNotice(result));
+  });
   const deleteMeeting = async () => {
     if (!window.confirm("Eliminar esta reunião, a transcrição e o resumo? Esta ação não pode ser anulada.")) return;
     setBusy("delete");
@@ -1041,9 +1083,12 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
   <summary>Reprocessar</summary>
   <div className="export-menu">
     <button onClick={retranscribe}
-      disabled={busy === "retranscribe" || !selected.processing.retranscription_available}>
+      title={!selected.processing.retranscription_available ? "Não existem ficheiros de áudio disponíveis para voltar a transcrever." : ""}
+      disabled={busy === "retranscribe" || !selected.processing.retranscription_available || ["pending", "processing"].includes(selected.processing.state)}>
       {busy === "retranscribe" && <Spinner/>}Voltar a transcrever
     </button>
+    <button onClick={verifyTranscriptions} disabled={Boolean(busy) || selected.status !== "complete" || ["pending", "processing"].includes(selected.processing.state)}>Verificar transcrições</button>
+    {!selected.processing.retranscription_available && <small>Não existem ficheiros de áudio disponíveis.</small>}
     <button onClick={regenerateSummary}
       disabled={busy === "summary" || ["pending", "processing"].includes(selected.processing.state)}>
       {busy === "summary" && <Spinner/>}Voltar a resumir
@@ -1066,6 +1111,7 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
     </section><section className="meeting-panel" hidden={meetingPanel !== "Tarefas"}>
       <TaskList key={selected.id} {...taskProps} targetId={null} tasks={tasks.filter((task) => task.session === selected.id)} defaultSession={selected.id}/>
     </section><section className="meeting-panel" hidden={meetingPanel !== "Transcrição"}>
+    <AudioTrimEditor key={`${selected.id}-${selected.started_at}-${selected.ended_at}`} meeting={selected} disabled={Boolean(busy) || selected.status !== "complete" || ["pending", "processing"].includes(selected.processing.state)} onApplied={async () => { await open(selected.id); await refresh(); }} onError={onError} onNotice={onNotice}/>
     {!groupedSegments.length && <p className="empty">A transcrição aparecerá quando estiver disponível.</p>}
     <div className="transcript">{groupedSegments.map((group) => {
       const editing = editingTranscript === group.id;
@@ -1183,6 +1229,8 @@ export default function App() {
   const previousDetectionError = useRef("");
   const consumedMeetings = useRef(new Set()), captureTransition = useRef(false);
   const meetingEndNotice = useRef(null);
+  const meetingEndAction = useRef(null);
+  const [captureEndPrompt, setCaptureEndPrompt] = useState(null);
   const trayCommandHandler = useRef(null), trayState = useRef(null);
   const [keepDisplayAwake, setKeepDisplayAwake] = useState(
     () => localStorage.getItem("keepDisplayAwake") === "true"
@@ -1190,6 +1238,7 @@ export default function App() {
   const activeController = useRef(null), activeStarting = useRef(false), meetingStarting = useRef(false), activeRequested = useRef(activeEnabled);
   const answerRequest = useRef(0);
   const notificationState = useRef({ initialized: false, taskIds: new Set(), summaryIds: new Set() });
+  const refreshError = useRef("");
   useEffect(() => {
     let cancelled = false;
     const receive = (state) => { if (!cancelled) setDetectedMeetings(state); };
@@ -1217,8 +1266,15 @@ export default function App() {
       const setters = [setTasks, setSessions, setSummaries, setLogs, setTaskSections, setProjects, setTags, setNotes, setParticipants, setGitlabStatus];
       const loaded = await Promise.allSettled(endpoints.map((endpoint) => api(`/${endpoint}/`)));
       loaded.forEach((result, index) => { if (result.status === "fulfilled") setters[index](result.value); });
-      const failures = loaded.flatMap((result, index) => result.status === "rejected" ? [`${endpoints[index]}: ${result.reason.message}`] : []);
-      if (failures.length) setError(failures.join("; "));
+      const failures = loaded.flatMap((result) => result.status === "rejected" ? [result.reason.message] : []);
+      if (failures.length) {
+        refreshError.current = [...new Set(failures)].join(" ");
+        setError(refreshError.current);
+      } else if (refreshError.current) {
+        const recovered = refreshError.current;
+        refreshError.current = "";
+        setError((current) => current === recovered ? "" : current);
+      }
       if (loaded.slice(0, 3).some((result) => result.status === "rejected")) return;
       const [nextTasks, nextSessions, nextSummaries] = loaded.slice(0, 3).map((result) => result.value);
       const tracked = notificationState.current;
@@ -1338,6 +1394,8 @@ export default function App() {
       if (meetingCapture) {
         // Suppress reminders as soon as a manual stop begins, including uploads.
         meetingEndNotice.current = null;
+        setCaptureEndPrompt(null);
+        window.notetaker?.dismissCaptureReminder?.().catch(() => console.warn("Não foi possível retirar a notificação da gravação."));
         detectedMeetings.calls.forEach((call) => consumedMeetings.current.add(call.id));
         await meetingCapture.stop();
         setMeetingCapture(null);
@@ -1348,7 +1406,8 @@ export default function App() {
         meetingStarting.current = true;
         await stopActiveMode();
         const controller = await startCapture((nextError) => setError(nextError.message), microphoneId, Boolean(detectedCall) || fromTray);
-        meetingEndNotice.current = { capture: controller, sawCall: Boolean(detectedCall) || detectedMeetings.calls.length > 0, notified: false };
+        // Tray/button starts remain manual even if a call happens to be present.
+        meetingEndNotice.current = { capture: controller, automatic: Boolean(detectedCall), lastNotifiedAt: 0 };
         setMeetingCapture(controller);
         window.notetaker?.setCaptureState("meeting");
         if (detectedCall) {
@@ -1397,21 +1456,46 @@ export default function App() {
     present.forEach((id) => consumedMeetings.current.add(id));
     toggleMeeting(next);
   }, [autoMeetingEnabled, detectedMeetings, meetingCapture, captureBusy]);
-  // The detector already confirms absence over three successful observations.
-  // Remind once per recording, after a call was seen; never stop the recorder here.
-  useEffect(() => {
-    if (!meetingCapture) { meetingEndNotice.current = null; return; }
+  // Native actions are tied to a session, and rechecked against the latest state.
+  meetingEndAction.current = async (action) => {
     const tracked = meetingEndNotice.current;
-    if (!tracked || tracked.capture !== meetingCapture) return;
-    if (!autoMeetingEnabled) { tracked.sawCall = false; return; }
-    if (detectedMeetings.error || captureBusy || captureTransition.current) return;
-    if (detectedMeetings.calls.length) { tracked.sawCall = true; return; }
-    if (!tracked.sawCall || tracked.notified) return;
-    tracked.notified = true;
-    const body = "A chamada terminou. A gravação continua ativa — termina-a quando quiseres.";
-    setNotice(body);
-    window.notetaker?.notify({ title: "A chamada terminou", body, target: { kind: "capture-reminder" } })
-      .catch((error) => setError(`Não foi possível mostrar a notificação: ${error.message}`));
+    if (!tracked?.automatic || tracked.capture !== meetingCapture ||
+        action.meeting_id !== meetingCapture?.session.id ||
+        !autoMeetingEnabled || detectedMeetings.error || detectedMeetings.calls.length ||
+        captureBusy || captureTransition.current) return;
+    tracked.lastNotifiedAt = Date.now();
+    setCaptureEndPrompt(null);
+    window.notetaker?.dismissCaptureReminder?.().catch(() => console.warn("Não foi possível retirar a notificação da gravação."));
+    if (action.action === "stop") await toggleMeeting();
+  };
+  useEffect(() => window.notetaker?.onNotificationAction?.((action) => {
+    if (action.kind === "capture-reminder") {
+      meetingEndAction.current?.(action).catch(() => setError("Não foi possível responder à notificação. Usa Terminar reunião para parar a gravação."));
+    }
+  }), []);
+  // Three successful detector misses establish absence. Ignoring or declining
+  // never stops capture; one deadline survives the detector's frequent updates.
+  useEffect(() => {
+    const tracked = meetingEndNotice.current;
+    if (!meetingCapture || !tracked?.automatic || tracked.capture !== meetingCapture ||
+        !autoMeetingEnabled || detectedMeetings.error || detectedMeetings.calls.length) {
+      if (tracked) tracked.lastNotifiedAt = 0;
+      setCaptureEndPrompt(null);
+      window.notetaker?.dismissCaptureReminder?.().catch(() => setError("Não foi possível atualizar a notificação da gravação."));
+      return;
+    }
+    const check = () => {
+      if (captureBusy || captureTransition.current || meetingEndNotice.current !== tracked) return;
+      if (tracked.lastNotifiedAt && Date.now() - tracked.lastNotifiedAt < 5 * 60_000) return;
+      tracked.lastNotifiedAt = Date.now();
+      const meetingId = meetingCapture.session.id;
+      setCaptureEndPrompt(meetingId);
+      window.notetaker?.notify({ title: "A chamada terminou", body: "Queres parar a gravação?", target: { kind: "capture-reminder", meeting_id: meetingId } })
+        .catch(() => setError("Não foi possível mostrar a notificação. Podes responder ao alerta na aplicação."));
+    };
+    check();
+    const timer = setInterval(check, 5000);
+    return () => clearInterval(timer);
   }, [autoMeetingEnabled, detectedMeetings, meetingCapture, captureBusy]);
   useEffect(() => {
     answerRequest.current += 1; setChatAnswer(null);
@@ -1489,7 +1573,10 @@ export default function App() {
         setMeetingTarget({ meetingId: source.meeting_id, segmentId: source.segment_id, noteId: source.kind === "note" ? source.object_id : null, nonce: Date.now() });
         setView("Reuniões"); setContentDetail(null);
       } else setNotice("O conteúdo associado já não está disponível.");
-    } catch (nextError) { setError(`Não foi possível abrir o conteúdo: ${nextError.message}`); }
+    } catch (nextError) {
+      if (nextError.status === 404) setNotice("O conteúdo associado já não está disponível.");
+      else setError(`Não foi possível abrir o conteúdo: ${nextError.message}`);
+    }
   }, []);
   useEffect(() => window.notetaker?.onNotificationOpen(openSource), [openSource]);
   const selectView = (nextView) => {
@@ -1539,6 +1626,11 @@ export default function App() {
       </button>
     </div></aside><section className="content"><header><div className="header-title"><p className="eyebrow">LOCAL · PRIVADO</p><h1>{view}</h1></div><div className="header-question"><AIQuestionBar onOpenSource={openSource} panelContainer={aiQuestionPanel}/></div><div className="header-actions"><div className="daily-summary-button"><button onClick={() => generateDaily(localDateValue())} disabled={Boolean(dailyJob)}>{dailyJob && <Spinner/>}Resumo do dia</button><DailySummaryPicker summaries={dailySummaries.slice(0, 5)} date={dailyDate} onDateChange={setDailyDate} busy={Boolean(dailyJob)} onGenerate={generateSelectedDaily}/></div><button className={`capture ${meetingCapture ? "active" : ""}`} onClick={() => toggleMeeting()} disabled={captureBusy}>{captureBusy && <Spinner/>}{meetingCapture ? "Terminar reunião" : "Iniciar reunião"}</button></div></header>
     <div ref={aiQuestionPanel}/>
+    {captureEndPrompt !== null && <div className="notice capture-end-prompt" role="alert">
+      <span>A chamada terminou. Queres parar a gravação?</span>
+      <button disabled={captureBusy} onClick={() => meetingEndAction.current?.({ meeting_id: captureEndPrompt, action: "stop" })}>Sim</button>
+      <button disabled={captureBusy} onClick={() => meetingEndAction.current?.({ meeting_id: captureEndPrompt, action: "continue" })}>Não</button>
+    </div>}
     {error && <div className="error">{error}<button onClick={() => setError("")}>×</button></div>}{notice && <div className="notice">{notice}<button onClick={() => setNotice("")}>×</button></div>}
     {["Hoje", "Reuniões", "Pesquisa"].includes(view) && <div className="organization-toolbar"><Popup className="filter-panel"><summary>Filtros <span className="filter-indicator">{activeOrganizationFilterCount || ""}</span></summary>{organizationFilters}</Popup></div>}
     {view === "Notas" && <Notes notes={notes} sessions={sessions} projects={projects} refresh={refresh} onError={setError} onOpenSource={openSource} targetId={contentDetail?.id} OrganizationMenu={OrganizationMenu} AutoSizeTextarea={AutoSizeTextarea}/>}

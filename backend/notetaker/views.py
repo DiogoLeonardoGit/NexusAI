@@ -6,7 +6,7 @@ from pathlib import Path
 from django.conf import settings
 from django.db import transaction
 from django.db.models import F
-from django.http import HttpResponse
+from django.http import HttpResponse, FileResponse
 from django.utils.html import escape
 from django.utils.dateparse import parse_date, parse_datetime
 from django.utils import timezone
@@ -56,6 +56,7 @@ from .services.lmstudio import health as lmstudio_health
 from .services.lmstudio import CHAT_SYSTEM_PROMPT, LMStudioError, configured_model, generate_json, list_models
 from .services.pipeline import finalize_session_language
 from .services.retention import delete_audio_file
+from .services.audio_editing import audio_path, require_idle, trim_session, verify_transcriptions
 from .services.search import retrieve, search_filters
 
 
@@ -365,6 +366,52 @@ def active_listening(request):
 class CaptureSessionViewSet(viewsets.ModelViewSet):
     queryset = CaptureSession.objects.all()
 
+    @action(detail=True, methods=["get"])
+    def audio_chunks(self, request, pk=None):
+        """Expose timeline metadata without local filesystem paths."""
+        return Response([{
+            "id": chunk.pk, "source": chunk.source, "started_at": chunk.started_at,
+            "duration_ms": chunk.duration_ms, "available": audio_path(chunk) is not None,
+        } for chunk in self.get_object().audio_chunks.all()])
+
+    @action(detail=True, methods=["get"], url_path=r"audio-chunks/(?P<chunk_id>\d+)")
+    def play_audio(self, request, pk=None, chunk_id=None):
+        """Serve audio through the authenticated meeting API."""
+        chunk = self.get_object().audio_chunks.filter(pk=chunk_id).first()
+        path = audio_path(chunk) if chunk else None
+        if path is None:
+            return Response({"detail": "Áudio indisponível."}, status=404)
+        return FileResponse(path.open("rb"), content_type=chunk.mime_type)
+
+    @action(detail=True, methods=["post"])
+    def verify_transcriptions(self, request, pk=None):
+        """Fill coverage gaps without replacing existing transcript text."""
+        session = self.get_object()
+        try:
+            with transaction.atomic():
+                session = CaptureSession.objects.select_for_update().get(pk=session.pk)
+                require_idle(session)
+                result = verify_transcriptions(session)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=409)
+        return Response(result, status=202 if result["job_ids"] else 200)
+
+    @action(detail=True, methods=["post"])
+    def trim(self, request, pk=None):
+        """Apply a confirmed cut to a completed meeting."""
+        session = self.get_object()
+        if request.data.get("confirm_delete") is not True:
+            return Response({"detail": "Confirma a eliminação definitiva do áudio e texto fora do intervalo."}, status=400)
+        start = parse_datetime(str(request.data.get("start", "")))
+        end = parse_datetime(str(request.data.get("end", "")))
+        if not start or not end or timezone.is_naive(start) or timezone.is_naive(end):
+            return Response({"detail": "Indica início e fim com fuso horário."}, status=400)
+        try:
+            result = trim_session(session.pk, start, end)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=409)
+        return Response(result, status=202 if result["job_ids"] else 200)
+
     def get_serializer_class(self):
         return CaptureSessionDetailSerializer if self.action == "retrieve" else CaptureSessionSerializer
 
@@ -532,12 +579,21 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=["post"])
     def retranscribe(self, request, pk=None):
-        """Replace only derived transcript data when all original audio remains local."""
+        """Replace the transcript using remaining audio after explicit confirmation."""
         session = self.get_object()
-        chunks = list(session.audio_chunks.all())
-        if not chunks or any(not chunk.file_path or not Path(chunk.file_path).is_file() for chunk in chunks):
+        all_chunks = list(session.audio_chunks.all())
+        chunks = [chunk for chunk in all_chunks if chunk.file_path and Path(chunk.file_path).is_file()]
+        available_ids = {chunk.pk for chunk in chunks}
+        missing_ids = [chunk.pk for chunk in all_chunks if chunk.pk not in available_ids]
+        if not chunks:
             return Response(
                 {"detail": "Os ficheiros de áudio desta sessão já não estão disponíveis."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if missing_ids and request.data.get("confirm_missing_audio") is not True:
+            return Response(
+                {"detail": "Faltam ficheiros de áudio. Confirma que pretendes substituir a transcrição apenas com os áudios disponíveis.",
+                 "missing_chunks": len(missing_ids)},
                 status=status.HTTP_409_CONFLICT,
             )
         if ProcessingJob.objects.filter(
@@ -550,6 +606,11 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
             )
         with transaction.atomic():
             session.segments.all().delete()
+            # Retain historical chunk/job references, but retire absent audio from
+            # transcription and retry queues. Its old text is deliberately removed.
+            session.audio_chunks.filter(pk__in=missing_ids).update(
+                file_path="", size_bytes=0, status=AudioChunk.Status.COMPLETE, error="",
+            )
             for chunk in chunks:
                 chunk.status = AudioChunk.Status.PENDING
                 chunk.error = ""
@@ -559,7 +620,7 @@ class CaptureSessionViewSet(viewsets.ModelViewSet):
                     session=session,
                     chunk=chunk,
                 )
-        return Response({"status": "queued", "chunks": len(chunks)}, status=status.HTTP_202_ACCEPTED)
+        return Response({"status": "queued", "chunks": len(chunks), "skipped_chunks": len(missing_ids)}, status=status.HTTP_202_ACCEPTED)
 
     @action(detail=True, methods=["post"])
     def cancel_processing(self, request, pk=None):
