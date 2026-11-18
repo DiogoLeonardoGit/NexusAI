@@ -720,5 +720,33 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .audio-trim fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 .audio-trim label { display: flex; flex-direction: column; gap: 6px; }
 .audio-trim .trim-fields { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
-.audio-trim input[type="range"], .audio-trim audio { width: 100%; margin: 12px 0; }
+/* Selection handles and playback share one timeline; fields display its bounds. */
+.audio-trim .trim-fields label { flex: 1 1 180px; min-width: 0; }
+.audio-trim .trim-fields input { width: 100%; padding: var(--field-padding); border: 1px solid #303949; border-radius: 9px; color: #dce4ee; background: #131922; font-variant-numeric: tabular-nums; }
+.audio-trim .trim-fields input:focus-visible { outline: 2px solid var(--nexus-cyan); outline-offset: 2px; }
+.audio-trim .custom-select { width: 100%; }
+.audio-trim .secondary-action { min-height: 40px; max-width: 100%; line-height: 1.4; white-space: normal; transition: background-color .15s, border-color .15s; }
+.audio-trim .secondary-action:hover:not(:disabled) { border-color: var(--nexus-cyan); background: #243246; }
+.audio-trim .secondary-action:focus-visible { outline: 2px solid var(--nexus-cyan); outline-offset: 3px; }
+.audio-trim .secondary-action:disabled { opacity: .5; }
+.audio-trim .trim-apply { color: #ffc5ce; border-color: #713844; background: #2c171c; }
+.audio-trim .trim-apply:hover:not(:disabled) { border-color: #d66b80; background: #43212a; }
+.trim-timeline { position: relative; height: 44px; margin: 20px 14px 0; }
+.trim-seek-track { position: absolute; inset: 0; cursor: pointer; border-radius: 6px; }
+.trim-seek-track::before { content: ""; position: absolute; top: 19px; left: 0; right: 0; height: 6px; border-radius: 999px; background: #344055; }
+.trim-selected { position: absolute; top: 19px; left: var(--trim-start); right: calc(100% - var(--trim-end)); height: 6px; background: var(--nexus-cyan); }
+.trim-playhead { position: absolute; z-index: 1; top: 10px; bottom: 10px; left: var(--trim-cursor); width: 2px; background: #fff; pointer-events: none; box-shadow: 0 0 0 1px #0c1930; }
+.trim-handle { position: absolute; z-index: 2; top: 4px; width: 24px; height: 36px; padding: 0; display: grid; place-items: center; transform: translateX(-50%); border: 1px solid #5ee4f5; border-radius: 7px; color: #0c1930; background: var(--nexus-cyan); cursor: ew-resize; touch-action: none; }
+.trim-handle-start { left: var(--trim-start); }
+.trim-handle-end { left: var(--trim-end); }
+.trim-handle span { width: 6px; height: 14px; border-inline: 2px solid currentColor; pointer-events: none; }
+.trim-handle:hover:not(:disabled) { background: #80edfa; }
+.trim-handle:focus-visible, .trim-seek-track:focus-visible { z-index: 3; outline: 2px solid var(--nexus-cyan); outline-offset: 4px; }
+.trim-seek-track[aria-disabled="true"] { cursor: not-allowed; opacity: .5; }
+.trim-time-scale { display: flex; justify-content: space-between; gap: 12px; margin: 4px 0 18px; color: #9aa8bb; font-size: 12px; font-variant-numeric: tabular-nums; }
+.trim-playback { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 0 0 12px; }
+.audio-trim .trim-play-toggle { display: grid; place-items: center; flex: 0 0 44px; width: 44px; height: 44px; padding: 0; border-radius: 50%; color: var(--nexus-cyan); }
+.trim-playback output { font-variant-numeric: tabular-nums; }
+.trim-playback output span, .trim-playback small { color: #9aa8bb; }
+.trim-playback small { margin-left: auto; }
 .audio-trim output, .audio-trim small { display: block; }

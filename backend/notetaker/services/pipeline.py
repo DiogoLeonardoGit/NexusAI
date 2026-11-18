@@ -627,6 +627,7 @@ def _consolidate_meeting_notes(job, partials, requested_language, *, summary_fac
 
     Summary-only reductions use their own schemas and prompts without task requirements.
     Intermediate reductions keep resolutions so the final pass can reconcile distant parts.
+    Each intermediate batch must shrink; retry it once with stronger compression guidance.
     Nothing is persisted during reduction.
     Fail instead of truncating notes if the model cannot compress oversized material.
     """
@@ -668,25 +669,48 @@ def _consolidate_meeting_notes(job, partials, requested_language, *, summary_fac
                 schema = MEETING_CONSOLIDATION_SCHEMA
                 system_prompt = MEETING_CONSOLIDATION_SYSTEM_PROMPT
                 output_tokens = 4096
-            result = generate_json(
-                f"{instruction} Notes are in chronological order. Write in {requested_language}.\n"
-                + "\n".join(json.dumps(item, ensure_ascii=False) for item in batch),
-                schema,
-                system_prompt=system_prompt,
-                max_output_tokens=output_tokens,
-                # Larger meeting responses need time to finish on local hardware.
-                request_timeout=1200,
-            )
-            if summary_facts is not None and not final:
-                result = {"facts": _referenced_summary_facts(result, summary_facts)}
+            notes = "\n".join(json.dumps(item, ensure_ascii=False) for item in batch)
+            input_size = sum(len(json.dumps(item, ensure_ascii=False)) for item in batch)
+            # Retry only the batch that fails to shrink, always from its original notes.
+            for compression_attempt in range(2):
+                _ensure_job_active(job.pk, touch=True)
+                compression = ""
+                if not final:
+                    compression = (
+                        f" The serialized JSON output must be shorter than the {input_size} input characters."
+                        f" Aim for at most {int(input_size * 0.75)} characters, including keys and source IDs."
+                        " Shorten wording and merge repetition without dropping distinct facts, requirements,"
+                        " classifications, supporting references or required verbatim evidence."
+                    )
+                    if compression_attempt:
+                        compression += (
+                            " The previous attempt did not reduce the size enough. Apply stronger compression:"
+                            " use concise factual clauses, remove redundant explanations and repeated wording."
+                            " Do not expand the notes or remove distinct agreements to meet the target."
+                        )
+                result = generate_json(
+                    f"{instruction}{compression} Notes are in chronological order. Write in {requested_language}.\n"
+                    + notes,
+                    schema,
+                    system_prompt=system_prompt,
+                    max_output_tokens=output_tokens,
+                    # Larger meeting responses need time to finish on local hardware.
+                    request_timeout=1200,
+                )
+                if summary_facts is not None and not final:
+                    result = {"facts": _referenced_summary_facts(result, summary_facts)}
+                _ensure_job_active(job.pk, touch=True)
+                if final or len(json.dumps(result, ensure_ascii=False)) < input_size:
+                    break
+            else:
+                raise LMStudioError(
+                    "O modelo não reduziu o tamanho das notas da reunião após duas tentativas "
+                    "de compressão. Não foi possível avançar para o resumo final."
+                )
             reduced.append(result)
             _ensure_job_active(job.pk, touch=True)
         if final:
             return reduced[0]
-        previous_size = sum(len(json.dumps(item, ensure_ascii=False)) for item in partials)
-        reduced_size = sum(len(json.dumps(item, ensure_ascii=False)) for item in reduced)
-        if reduced_size >= previous_size:
-            raise LMStudioError("Não foi possível consolidar a reunião sem perder contexto.")
         partials = reduced
 
 
