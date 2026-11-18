@@ -23,6 +23,62 @@ _token_origin = os.getenv("NOTETAKER_GITLAB_TOKEN_ORIGIN", "")
 _credential_lock = threading.Lock()
 
 
+def description_markdown(text):
+    """Make plain paragraph newlines visible in GitLab without rewriting Markdown blocks.
+
+    Two trailing spaces express a hard break. Existing breaks, blank lines, lists,
+    headings, tables, HTML blocks and fenced/indented code retain their source text.
+    Applying this at both the outbox and transport boundary is intentionally idempotent.
+    """
+    lines = text.splitlines(keepends=True)
+    contents, endings, protected = [], [], []
+    fence = None
+    inline_code = None
+    html_block = False
+    block_start = re.compile(
+        r"^ {0,3}(?:#{1,6}(?:\s|$)|>|(?:[-+*]|\d+[.)])\s|"
+        r"(?:[-*_]\s*){3,}$|(?:=+|-+)\s*$|\[[^\]]+\]:|<)"
+    )
+    for raw in lines:
+        ending = "\r\n" if raw.endswith("\r\n") else raw[-1:] if raw.endswith(("\n", "\r")) else ""
+        line = raw[:-len(ending)] if ending else raw
+        contents.append(line)
+        endings.append(ending)
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence:
+            protected.append(True)
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip():
+                fence = None
+            continue
+        if marker:
+            fence = marker[1]
+            protected.append(True)
+            continue
+        if not line.strip():
+            html_block = False
+        elif line.lstrip().startswith("<"):
+            html_block = True
+        in_code = inline_code is not None
+        for token in re.finditer(r"(?<!\\)(`+)", line):
+            if inline_code is None:
+                inline_code = token[1]
+            elif token[1] == inline_code:
+                inline_code = None
+        protected.append(
+            not line.strip() or html_block or in_code or inline_code is not None
+            or line.startswith(("    ", "\t")) or "|" in line or bool(block_start.match(line))
+        )
+    result = []
+    for index, line in enumerate(contents):
+        if index + 1 < len(contents) and not protected[index] and not protected[index + 1]:
+            # A trailing backslash only creates a break when it is not itself escaped.
+            backslashes = len(line) - len(line.rstrip("\\"))
+            if not (line.endswith("  ") or backslashes % 2 or re.search(r"<br\s*/?>\s*$", line, re.IGNORECASE)):
+                line += "  "
+        result.append(line + endings[index])
+    return "".join(result)
+
+
 def normalize_base_url(value):
     """Accept only an explicit HTTPS origin, without credentials or URL suffixes."""
     if not isinstance(value, str) or len(value) > 200 or any(char.isspace() for char in value):
@@ -388,7 +444,7 @@ class GitLabClient:
     def create_task(self, task, project_id, user_id, labels):
         """Create one explicitly approved issue; labels must be prevalidated by the caller."""
         return self.request(f"/projects/{project_id}/issues", "POST", {
-            "title": task.title, "description": task.description,
+            "title": task.title, "description": description_markdown(task.description),
             "assignee_ids": [user_id] if user_id is not None else [], "labels": ",".join(sorted(labels)),
         })[0]
 
@@ -411,6 +467,8 @@ class GitLabClient:
                 raise GitLabError("Não foi possível confirmar a estimativa no GitLab.")
             estimate_updated = True
         payload = {key: value for key, value in changes.items() if key in {"title", "description", "due_date"}}
+        if "description" in payload:
+            payload["description"] = description_markdown(payload["description"])
         if "assignees" in changes:
             payload["assignee_ids"] = [person["id"] for person in changes["assignees"]]
         if "milestone_id" in changes:

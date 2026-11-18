@@ -148,7 +148,8 @@ def local_state(task):
     """Calendar deadlines stay on Task; remote-only planning uses the existing outbox."""
     link = getattr(task, "gitlab", None)
     planning = {**link.snapshot, **link.pending} if link else {}
-    values = {"title": task.title, "description": task.description,
+    # Compare the same idempotent Markdown representation that the client sends.
+    values = {"title": task.title, "description": gitlab.description_markdown(task.description),
             "state": "closed" if task.status == Task.Status.DONE else "opened",
             "labels": sorted(task.tags.values_list("name", flat=True)),
             "estimate_seconds": task.estimate_seconds,

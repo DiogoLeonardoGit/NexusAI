@@ -226,7 +226,9 @@ p { margin: 0; color: #94a0b1; line-height: 1.5; }
 button.search-result:hover { border-color: var(--nexus-blue); }
 .search-result-meta { display: flex; gap: 10px; margin-bottom: 6px; color: #94a0b1; font-size: 12px; }
 .search-result-meta span:first-child { color: var(--nexus-cyan); font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
-.quick-task { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(200px, 1.5fr) minmax(160px, 1fr) minmax(180px, 1fr) auto auto; align-items: end; gap: 10px; margin-bottom: 18px; }
+.quick-task { display: grid; grid-template-columns: minmax(160px, 1.3fr) minmax(160px, 1fr) minmax(180px, 1fr) auto auto; align-items: end; gap: 10px; margin-bottom: 18px; }
+.quick-task > input, .quick-task > label, .quick-task > button { grid-row: 1; min-width: 0; }
+.quick-task > .markdown-editor { grid-column: 1 / -1; grid-row: 2; }
 .quick-task input, .quick-task textarea, .quick-task select { padding: var(--field-padding); border: 1px solid #303949; border-radius: 10px; color: #e8edf4; background: #131922; }
 .quick-task input, .quick-task textarea, .quick-task select, .quick-task button { height: var(--field-height); }
 .quick-task textarea { min-height: var(--field-height); line-height: var(--field-line-height); overflow-y: hidden; resize: none; }
@@ -257,6 +259,12 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .settings-grid .toggle { display: flex; align-items: center; gap: 9px; color: #dbe3ed; }
 .settings-grid .save, .notes button { width: fit-content; padding: 9px 14px; border: 0; border-radius: 8px; color: var(--nexus-night); background: var(--nexus-cyan); font-weight: 700; }
 .meeting-card { display: flex; justify-content: space-between; align-items: center; width: 100%; color: inherit; text-align: left; }
+.meeting-card { cursor: pointer; gap: 16px; }
+.meeting-card > div { min-width: 0; }
+.meeting-open { padding: 0; border: 0; color: inherit; background: transparent; font: inherit; font-weight: inherit; text-align: left; overflow-wrap: anywhere; }
+.meeting-project-link { color: var(--nexus-cyan); text-underline-offset: 3px; overflow-wrap: anywhere; }
+.meeting-open:hover, .meeting-project-link:hover { color: #a5e8f4; }
+.meeting-open:focus-visible, .meeting-project-link:focus-visible { outline: 2px solid var(--nexus-cyan); outline-offset: 4px; border-radius: 3px; }
 .back { margin-bottom: 18px; border: 0; color: #a8b3c3; background: transparent; }
 .meeting-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
 .meeting-title button, .meeting-title summary { padding: 9px 13px; border: 1px solid #394354; border-radius: 8px; color: #dfe6ef; background: #171d26; list-style: none; cursor: pointer; }
@@ -427,8 +435,14 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .tag-pill { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border: 1px solid var(--nexus-blue); border-radius: 20px; color: #a5e8f4; background: #162c50; font-size: 12px; }
 .tag-pill:hover { border-color: var(--nexus-cyan); }
 .project-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
-.project-tile { display: grid; gap: 10px; padding: 20px; border: 1px solid #344055; border-radius: 12px; color: #e8edf4; text-align: left; background: #111822; }
-.project-tile p { margin: 0; color: #9aa8bb; line-height: 1.5; overflow-wrap: anywhere; }
+.project-tile { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 20px; border: 1px solid #344055; border-radius: 12px; color: #e8edf4; text-align: left; background: #111822; }
+.project-tile p { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; margin: 0; color: #9aa8bb; line-height: 1.5; overflow-wrap: anywhere; }
+.project-tile small { margin-top: auto; padding-top: 8px; }
+.project-heading-content { width: 100%; min-width: 0; }
+.project-title-row { display: flex; align-items: center; gap: 20px; }
+.project-title-row h2 { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.project-title-row .project-edit-button { flex: 0 0 auto; white-space: nowrap; min-width: 140px; }
+.project-heading-content > p { overflow-wrap: anywhere; white-space: pre-wrap; }
 .project-tile small, .project-meeting small { color: #8794a7; }
 .project-tile:hover { border-color: #a5e8f4; }
 .project-tile.selected { border-color: var(--nexus-cyan); background: #162c50; }
@@ -750,3 +764,31 @@ button.search-result:hover { border-color: var(--nexus-blue); }
 .trim-playback output span, .trim-playback small { color: #9aa8bb; }
 .trim-playback small { margin-left: auto; }
 .audio-trim output, .audio-trim small { display: block; }
+
+/* Reusable Markdown editing and rendering for task descriptions and GitLab comments. */
+.markdown-editor { width: 100%; min-width: 0; border: 1px solid #303949; border-radius: 10px; background: #131922; overflow: hidden; }
+.markdown-editor:focus-within { border-color: var(--nexus-cyan); }
+.markdown-editor .markdown-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 3px; padding: 6px; border-bottom: 1px solid #303949; background: #10161f; }
+.markdown-editor .markdown-toolbar button { display: grid; place-items: center; flex: 0 0 30px; width: 30px; min-width: 30px; height: 30px; min-height: 30px; padding: 0; border: 1px solid transparent; border-radius: 5px; color: #cbd4df; background: transparent; font-size: 13px; line-height: 1; }
+.markdown-editor .markdown-toolbar button:hover:not(:disabled) { border-color: #3b485a; color: var(--nexus-cyan); background: #1b2533; }
+.markdown-editor .markdown-toolbar button:focus-visible { outline: 2px solid var(--nexus-cyan); outline-offset: -2px; }
+.markdown-editor textarea { display: block; box-sizing: border-box; width: 100%; min-height: var(--field-height); margin: 0; padding: var(--field-padding); border: 0; border-radius: 0; outline: none; color: #e8edf4; background: transparent; font: inherit; line-height: var(--field-line-height); overflow-y: hidden; resize: none; }
+.markdown-body { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.markdown-body p { margin: 0 0 .65em; white-space: normal; }
+.markdown-body > :last-child, .markdown-body li > :last-child { margin-bottom: 0; }
+.markdown-body :is(h1, h2, h3, h4, h5, h6) { margin: .8em 0 .4em; font-size: 1.15em; line-height: 1.4; }
+.markdown-body > :first-child { margin-top: 0; }
+.markdown-body a { color: var(--nexus-cyan); text-underline-offset: 3px; }
+.markdown-body a:focus-visible { outline: 2px solid var(--nexus-cyan); outline-offset: 2px; }
+.markdown-body code { padding: 2px 5px; border-radius: 4px; color: #c2eaf4; background: #0b1119; font-family: Consolas, monospace; font-size: .9em; white-space: pre-wrap; }
+.markdown-body pre { max-width: 100%; margin: .6em 0; padding: 12px; border: 1px solid #303949; border-radius: 7px; background: #0b1119; overflow-x: auto; white-space: pre; }
+.markdown-body pre code { padding: 0; white-space: pre; }
+.markdown-body blockquote { margin: .6em 0; padding: 4px 0 4px 12px; border-left: 3px solid var(--nexus-blue); color: #aab6c8; }
+.markdown-body hr { border: 0; border-top: 1px solid #303949; margin: 12px 0; }
+.markdown-body :is(ul, ol), .gitlab-comment-history .markdown-body :is(ul, ol) { display: block; margin: .4em 0; padding: 0 0 0 24px; border: 0; }
+.markdown-body ul, .gitlab-comment-history .markdown-body ul { list-style: disc; }
+.markdown-body ol, .gitlab-comment-history .markdown-body ol { list-style: decimal; }
+.markdown-body li, .gitlab-comment-history .markdown-body li { display: list-item; margin: .25em 0; padding: 0; border: 0; border-radius: 0; background: transparent; }
+.markdown-body li p { margin-bottom: .25em; }
+.markdown-body .markdown-check-item, .gitlab-comment-history .markdown-body .markdown-check-item { list-style: none; }
+.markdown-body .markdown-check-item > input { float: left; width: 14px; height: 14px; min-height: 0; margin: .25em 7px 0 -21px; padding: 0; accent-color: var(--nexus-cyan); opacity: 1; }
