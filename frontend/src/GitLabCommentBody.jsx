@@ -1,5 +1,6 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { apiImage } from "./api";
+import MarkdownBody from "./MarkdownBody";
 
 // Each attachment loads only near the viewport and aborts when its comment closes.
 function CommentImage({ taskId, source, alt, width, height }) {
@@ -47,6 +48,9 @@ function imageDimension(attributes, name) {
 // Group adjacent Markdown images; text between galleries keeps its original order.
 export default function GitLabCommentBody({ taskId, text = "", className = "gitlab-comment-body" }) {
   const pattern = /!\[([^\]\n]*)\]\((<[^<>\n]+>|(?:[^\s<>()]|\([^()\s]*\))+)(?:\s+"[^"\n]*")?\)(?:\{([^{}\n]*)\})?/g;
+  // Markdown image examples inside code must stay text rather than trigger downloads.
+  const codeRanges = Array.from(text.matchAll(/(?<fence>^ {0,3}(?<marker>`{3,}|~{3,})[^\n]*\n[\s\S]*?^ {0,3}\k<marker>[`~]*[ \t]*(?=\n|$))|(?<inline>`+)[^`]*?\k<inline>/gm),
+    (match) => [match.index, match.index + match[0].length]);
   const parts = [];
   let gallery = [];
   let start = 0;
@@ -56,10 +60,11 @@ export default function GitLabCommentBody({ taskId, text = "", className = "gitl
     gallery = [];
   };
   for (const match of text.matchAll(pattern)) {
+    if (codeRanges.some(([from, to]) => match.index >= from && match.index < to)) continue;
     const between = text.slice(start, match.index);
     if (between.trim()) {
       flushGallery();
-      parts.push(<Fragment key={`text-${match.index}`}>{between.replace(/^\n+|\n+$/g, "")}</Fragment>);
+      parts.push(<MarkdownBody key={`text-${match.index}`} text={between.replace(/^\n+|\n+$/g, "")}/>);
     }
     const source = match[2].replace(/^<|>$/g, "");
     gallery.push(<CommentImage key={`${match.index}-${source}`} taskId={taskId} source={source} alt={match[1]}
@@ -68,6 +73,6 @@ export default function GitLabCommentBody({ taskId, text = "", className = "gitl
   }
   const hasImages = gallery.length > 0 || parts.length > 0;
   flushGallery();
-  parts.push(<Fragment key="tail">{hasImages ? text.slice(start).replace(/^\n+/, "") : text}</Fragment>);
+  parts.push(<MarkdownBody key="tail" text={hasImages ? text.slice(start).replace(/^\n+/, "") : text}/>);
   return <div className={className}>{parts}</div>;
 }

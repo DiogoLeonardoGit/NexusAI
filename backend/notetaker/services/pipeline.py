@@ -224,10 +224,15 @@ def next_pending_job():
 
 def _enqueue_untranscribed_chunks(session: CaptureSession, current_chunk_id=None):
     chunks = AudioChunk.objects.filter(session=session, segments__isnull=True).exclude(
-        status=AudioChunk.Status.CANCELLED
-    ).distinct()
+        status__in=[AudioChunk.Status.CANCELLED, AudioChunk.Status.COMPLETE]
+    ).exclude(file_path="").distinct()
     for candidate in chunks:
-        if candidate.pk == current_chunk_id:
+        if candidate.pk == current_chunk_id or not Path(candidate.file_path).is_file():
+            continue
+        if ProcessingJob.objects.filter(
+            chunk=candidate, kind=ProcessingJob.Kind.TRANSCRIBE,
+            status__in=[ProcessingJob.Status.PENDING, ProcessingJob.Status.RUNNING],
+        ).exists():
             continue
         if candidate.status != AudioChunk.Status.PENDING:
             candidate.status = AudioChunk.Status.PENDING
@@ -622,6 +627,7 @@ def _consolidate_meeting_notes(job, partials, requested_language, *, summary_fac
 
     Summary-only reductions use their own schemas and prompts without task requirements.
     Intermediate reductions keep resolutions so the final pass can reconcile distant parts.
+    Each intermediate batch must shrink; retry it once with stronger compression guidance.
     Nothing is persisted during reduction.
     Fail instead of truncating notes if the model cannot compress oversized material.
     """
@@ -652,7 +658,7 @@ def _consolidate_meeting_notes(job, partials, requested_language, *, summary_fac
                 )
                 schema = MEETING_SUMMARY_FINAL_SCHEMA if final else MEETING_SUMMARY_REDUCTION_SCHEMA
                 system_prompt = MEETING_SUMMARY_FINAL_PROMPT if final else MEETING_SUMMARY_REDUCTION_PROMPT
-                output_tokens = 2048
+                output_tokens = 4096
             else:
                 instruction = (
                     "Produce the final whole-meeting summary and consolidated tasks."
@@ -662,24 +668,49 @@ def _consolidate_meeting_notes(job, partials, requested_language, *, summary_fac
                 )
                 schema = MEETING_CONSOLIDATION_SCHEMA
                 system_prompt = MEETING_CONSOLIDATION_SYSTEM_PROMPT
-                output_tokens = 3072 if final else 2048
-            result = generate_json(
-                f"{instruction} Notes are in chronological order. Write in {requested_language}.\n"
-                + "\n".join(json.dumps(item, ensure_ascii=False) for item in batch),
-                schema,
-                system_prompt=system_prompt,
-                max_output_tokens=output_tokens,
-            )
-            if summary_facts is not None and not final:
-                result = {"facts": _referenced_summary_facts(result, summary_facts)}
+                output_tokens = 4096
+            notes = "\n".join(json.dumps(item, ensure_ascii=False) for item in batch)
+            input_size = sum(len(json.dumps(item, ensure_ascii=False)) for item in batch)
+            # Retry only the batch that fails to shrink, always from its original notes.
+            for compression_attempt in range(2):
+                _ensure_job_active(job.pk, touch=True)
+                compression = ""
+                if not final:
+                    compression = (
+                        f" The serialized JSON output must be shorter than the {input_size} input characters."
+                        f" Aim for at most {int(input_size * 0.75)} characters, including keys and source IDs."
+                        " Shorten wording and merge repetition without dropping distinct facts, requirements,"
+                        " classifications, supporting references or required verbatim evidence."
+                    )
+                    if compression_attempt:
+                        compression += (
+                            " The previous attempt did not reduce the size enough. Apply stronger compression:"
+                            " use concise factual clauses, remove redundant explanations and repeated wording."
+                            " Do not expand the notes or remove distinct agreements to meet the target."
+                        )
+                result = generate_json(
+                    f"{instruction}{compression} Notes are in chronological order. Write in {requested_language}.\n"
+                    + notes,
+                    schema,
+                    system_prompt=system_prompt,
+                    max_output_tokens=output_tokens,
+                    # Larger meeting responses need time to finish on local hardware.
+                    request_timeout=1200,
+                )
+                if summary_facts is not None and not final:
+                    result = {"facts": _referenced_summary_facts(result, summary_facts)}
+                _ensure_job_active(job.pk, touch=True)
+                if final or len(json.dumps(result, ensure_ascii=False)) < input_size:
+                    break
+            else:
+                raise LMStudioError(
+                    "O modelo não reduziu o tamanho das notas da reunião após duas tentativas "
+                    "de compressão. Não foi possível avançar para o resumo final."
+                )
             reduced.append(result)
             _ensure_job_active(job.pk, touch=True)
         if final:
             return reduced[0]
-        previous_size = sum(len(json.dumps(item, ensure_ascii=False)) for item in partials)
-        reduced_size = sum(len(json.dumps(item, ensure_ascii=False)) for item in reduced)
-        if reduced_size >= previous_size:
-            raise LMStudioError("Não foi possível consolidar a reunião sem perder contexto.")
         partials = reduced
 
 
@@ -705,7 +736,9 @@ def _analyze_meeting_transcript(job, transcript, segments, prompt_label, languag
             f"Write in {requested_language}.\n{piece}",
             MEETING_ANALYSIS_SCHEMA,
             system_prompt=MEETING_ANALYSIS_SYSTEM_PROMPT,
-            max_output_tokens=2048,
+            # Preserve detailed task descriptions and evidence without cutting JSON.
+            max_output_tokens=4096,
+            request_timeout=1200,
         )
         partials.append({
             "part": index + 1,

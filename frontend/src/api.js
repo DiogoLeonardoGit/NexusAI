@@ -10,47 +10,67 @@ export async function getConfiguration() {
   return configuration;
 }
 
-export async function api(path, options = {}) {
+// Status stays available to callers so deleted content can be handled normally.
+export class ApiError extends Error {
+  constructor(message, status = 0) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+async function request(path, options = {}) {
   const config = await getConfiguration();
   const headers = new Headers(options.headers || {});
   headers.set("X-Local-Token", config.apiToken);
   if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
-  const response = await fetch(`${config.apiBase}${path}`, { ...options, headers });
-  if (!response.ok) {
-    const detail = await response.text();
-    let message = `API error ${response.status}`;
-    try {
-      const payload = JSON.parse(detail);
-      // Field validation errors belong beside the form, not as raw JSON.
-      message = payload.detail || Object.entries(payload).map(([field, errors]) => `${field}: ${Array.isArray(errors) ? errors.join(" ") : String(errors)}`).join("; ") || message;
-    } catch {
-      message = detail.startsWith("<") ? `API error ${response.status}. Verifica o backend.` : detail || message;
-    }
-    throw new Error(message);
+  let response;
+  try {
+    response = await fetch(`${config.apiBase}${path}`, { ...options, headers });
+  } catch (error) {
+    if (error.name === "AbortError") throw error;
+    throw new ApiError("Não foi possível ligar ao serviço local. Tenta novamente dentro de instantes.");
   }
+  if (!response.ok) {
+    const messages = {
+      401: "A ligação ao serviço local precisa de ser renovada. Reinicia a aplicação.",
+      403: "Não tens permissão para realizar esta ação.",
+      404: "Este conteúdo já não está disponível.",
+    };
+    let message = messages[response.status] || "Não foi possível concluir o pedido. Tenta novamente.";
+    if (response.status < 500 && !messages[response.status]) {
+      const payload = await response.json().catch(() => null);
+      if (typeof payload?.detail === "string") message = payload.detail;
+      else if (payload && typeof payload === "object") {
+        const errors = Object.values(payload).flat().filter((value) => typeof value === "string");
+        if (errors.length) message = errors.join(" ");
+      }
+    }
+    throw new ApiError(message, response.status);
+  }
+  return response;
+}
+
+export async function api(path, options = {}) {
+  const response = await request(path, options);
   if (response.status === 204) return null;
   return response.json();
 }
 
 export async function apiText(path) {
-  const config = await getConfiguration();
-  const response = await fetch(`${config.apiBase}${path}`, {
-    headers: { "X-Local-Token": config.apiToken },
-  });
-  if (!response.ok) throw new Error(await response.text());
+  const response = await request(path);
   return response.text();
+}
+
+// Authenticated blobs keep the local token out of player URLs.
+export async function apiAudio(path, { signal } = {}) {
+  const response = await request(path, { signal });
+  return URL.createObjectURL(await response.blob());
 }
 
 // Use authenticated fetch and a data URL compatible with the existing image CSP.
 export async function apiImage(path, { signal } = {}) {
-  const config = await getConfiguration();
-  const response = await fetch(`${config.apiBase}${path}`, {
-    signal, headers: { "X-Local-Token": config.apiToken },
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail || `Não foi possível carregar a imagem (${response.status}).`);
-  }
+  const response = await request(path, { signal });
   const blob = await response.blob();
   if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(blob.type) || blob.size > 15 * 1024 * 1024) {
     throw new Error("Formato ou tamanho de imagem não suportado.");
