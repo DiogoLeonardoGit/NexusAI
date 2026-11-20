@@ -786,7 +786,7 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
             {task.time_tracking?.uncertain_seconds > 0 && <small className="task-time-uncertain" role="alert">Envio de {formatTrackedTime(task.time_tracking.uncertain_seconds)} por confirmar. Verifica o GitLab.</small>}
           </div>
           <div className={`task-meta task-details ${isEditing ? "editing" : ""}`}>
-            {isEditing ? <TaskOwnerPicker value={editingTask} gitlabLinked={Boolean(task.gitlab)} onChange={(changes) => setEditingTask((current) => ({ ...current, ...changes }))} members={members} disabled={Boolean(busy) || Boolean(task.gitlab && (!task.gitlab.active || task.gitlab.hidden || !gitlabStatus?.enabled || !gitlabStatus?.has_token || membersLoading || membersError))}/> : <span>{task.gitlab?.assignees?.length ? task.gitlab.assignees.map((person) => person.name).join(", ") : task.owner === "self" ? "Eu" : task.owner_name || "Sem responsável"}</span>}
+            {!isEditing && <span>{task.gitlab?.assignees?.length ? task.gitlab.assignees.map((person) => person.name).join(", ") : task.owner === "self" ? "Eu" : task.owner_name || "Sem responsável"}</span>}
             {!isEditing && <span>· Criada a {new Date(task.created_at).toLocaleString()} {task.creation_source === "gitlab" ? "no GitLab" : task.creation_source === "system" ? "pelo Sistema" : "por ti"}</span>}
             {task.due_at && <span>· Limite: {new Date(task.due_at).toLocaleString()}</span>}
             {task.gitlab?.start_date && <span>· Início: {formatCalendarDate(task.gitlab.start_date)}</span>}
@@ -797,28 +797,33 @@ export function TaskList({ tasks, sections = [], showSections, refresh, onError,
           </div>
             {(task.evidence || task.source_segment || task.session) && <ReferenceInfo>{task.evidence && <span className="reference-text">{task.evidence}</span>}{(task.source_segment || task.session) && <button type="button" className="text-button" onClick={() => onOpenSource?.({ kind: "segment", meeting_id: task.source_meeting_id || task.session, segment_id: task.source_segment })}>Ver na reunião{task.source_start_ms != null ? ` · ${formatTranscriptTime(task.source_start_ms)}` : ""}</button>}</ReferenceInfo>}
           {isEditing && <fieldset className="task-edit-fields" disabled={Boolean(busy) || Boolean(task.gitlab && (!task.gitlab.active || task.gitlab.hidden))}>
-            {task.gitlab && <label className="milestone-field">Milestone<Select aria-label="Milestone da tarefa" value={editingTask.milestone_id ?? ""} disabled={milestonesLoading || Boolean(milestonesError)} onChange={(event) => setEditingTask((current) => ({ ...current, milestone_id: event.target.value ? Number(event.target.value) : null }))}>
-              <option value="">{milestonesLoading ? "A consultar milestones…" : milestonesError ? "Erro ao consultar milestones" : "Sem milestone"}</option>
-              {editingTask.milestone_id && !milestones.some((item) => item.id === editingTask.milestone_id) && <option value={editingTask.milestone_id}>{task.gitlab.milestone?.title || `#${editingTask.milestone_id}`}</option>}
-              {milestones.map((item) => <option key={item.id} value={item.id}>{item.title}{item.state === "closed" ? " (fechada)" : ""}</option>)}
-            </Select>
-              {milestonesLoading ? <small role="status">A consultar milestones…</small> : milestonesError ? <small className="field-error" role="alert">{milestonesError}</small> : !milestones.length && <small role="status">O GitLab não devolveu milestones disponíveis para este projeto.</small>}
-              {!milestonesLoading && (milestonesError || !milestones.length) && <button type="button" className="text-button" onClick={() => setMilestonesRetry((value) => value + 1)}>Tentar novamente</button>}
-            </label>}
-            <OrganizationFields item={editingTask} allowProject={false} showTags sessions={sessions} projects={projects}
-              tags={task.gitlab ? tags.filter((tag) => task.gitlab.available_tag_ids.includes(tag.id) || task.tags?.includes(tag.id)) : tags}
-              onSave={(changes) => setEditingTask((current) => ({ ...current, ...changes }))}/>
-            <div className="schedule-editor" role="group" aria-label="Data limite e lembrete">
-              <label>Data limite<input type="datetime-local" value={dueAt} disabled={Boolean(busy)} onChange={(event) => setDueAt(event.target.value)}/></label>
-              <label>Lembrete<Select value={minutesBefore} disabled={Boolean(busy)} onChange={(event) => setMinutesBefore(event.target.value)}>{REMINDER_OPTIONS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</Select></label>
+            <div className="task-edit-organization-row">
+              <TaskOwnerPicker value={editingTask} gitlabLinked={Boolean(task.gitlab)} onChange={(changes) => setEditingTask((current) => ({ ...current, ...changes }))} members={members} disabled={Boolean(busy) || Boolean(task.gitlab && (!task.gitlab.active || task.gitlab.hidden || !gitlabStatus?.enabled || !gitlabStatus?.has_token || membersLoading || membersError))}/>
+              {task.gitlab && <label className="milestone-field">Milestone<Select aria-label="Milestone da tarefa" value={editingTask.milestone_id ?? ""} disabled={milestonesLoading || Boolean(milestonesError)} onChange={(event) => setEditingTask((current) => ({ ...current, milestone_id: event.target.value ? Number(event.target.value) : null }))}>
+                <option value="">{milestonesLoading ? "A consultar milestones…" : milestonesError ? "Erro ao consultar milestones" : "Sem milestone"}</option>
+                {editingTask.milestone_id && !milestones.some((item) => item.id === editingTask.milestone_id) && <option value={editingTask.milestone_id}>{task.gitlab.milestone?.title || `#${editingTask.milestone_id}`}</option>}
+                {milestones.map((item) => <option key={item.id} value={item.id}>{item.title}{item.state === "closed" ? " (fechada)" : ""}</option>)}
+              </Select>
+                {milestonesLoading ? <small role="status">A consultar milestones…</small> : milestonesError ? <small className="field-error" role="alert">{milestonesError}</small> : !milestones.length && <small role="status">O GitLab não devolveu milestones disponíveis para este projeto.</small>}
+                {!milestonesLoading && (milestonesError || !milestones.length) && <button type="button" className="text-button" onClick={() => setMilestonesRetry((value) => value + 1)}>Tentar novamente</button>}
+              </label>}
+              <OrganizationFields item={editingTask} allowProject={false} showTags sessions={sessions} projects={projects}
+                tags={task.gitlab ? tags.filter((tag) => task.gitlab.available_tag_ids.includes(tag.id) || task.tags?.includes(tag.id)) : tags}
+                onSave={(changes) => setEditingTask((current) => ({ ...current, ...changes }))}/>
             </div>
-            <div className="task-time-fields">
-              <div className="task-time-editor" role="group" aria-label="Estimativa">
-                <label>Estimativa<input type="text" aria-label="Duração estimada" maxLength={256} value={estimateDuration} disabled={Boolean(busy)} onChange={(event) => setEstimateDuration(event.target.value)} placeholder="Ex.: 1w ou 1h 30m"/></label>
+            <div className="task-edit-schedule-row">
+              <div className="schedule-editor" role="group" aria-label="Data limite e lembrete">
+                <label>Data limite<input type="datetime-local" value={dueAt} disabled={Boolean(busy)} onChange={(event) => setDueAt(event.target.value)}/></label>
+                <label>Lembrete<Select value={minutesBefore} disabled={Boolean(busy)} onChange={(event) => setMinutesBefore(event.target.value)}>{REMINDER_OPTIONS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</Select></label>
               </div>
-              <div className="task-time-editor" role="group" aria-label="Registar tempo">
-                <label>Registar tempo<input type="text" aria-label="Duração a registar" maxLength={256} value={timeDuration} disabled={Boolean(busy) || !draftEstimateSeconds} onChange={(event) => setTimeDuration(event.target.value)} placeholder="Ex.: 1h 30m"/></label>
-                {!draftEstimateSeconds && <small>Define uma estimativa antes de registar tempo.</small>}
+              <div className="task-time-fields">
+                <div className="task-time-editor" role="group" aria-label="Estimativa">
+                  <label>Estimativa<input type="text" aria-label="Duração estimada" maxLength={256} value={estimateDuration} disabled={Boolean(busy)} onChange={(event) => setEstimateDuration(event.target.value)} placeholder="Ex.: 1w ou 1h 30m"/></label>
+                </div>
+                <div className="task-time-editor" role="group" aria-label="Registar tempo">
+                  <label>Registar tempo<input type="text" aria-label="Duração a registar" maxLength={256} value={timeDuration} disabled={Boolean(busy) || !draftEstimateSeconds} onChange={(event) => setTimeDuration(event.target.value)} placeholder="Ex.: 1h 30m"/></label>
+                  {!draftEstimateSeconds && <small>Define uma estimativa antes de registar tempo.</small>}
+                </div>
               </div>
             </div>
           </fieldset>}
@@ -1091,8 +1096,8 @@ function Meetings({ sessions, refresh, onError, target, onNotice, projects, tags
       disabled={busy === "retranscribe" || !selected.processing.retranscription_available || ["pending", "processing"].includes(selected.processing.state)}>
       {busy === "retranscribe" && <Spinner/>}Voltar a transcrever
     </button>
+    {!selected.processing.retranscription_available && <p className="processing-menu-note">Áudio indisponível para voltar a transcrever.</p>}
     <button onClick={verifyTranscriptions} disabled={Boolean(busy) || selected.status !== "complete" || ["pending", "processing"].includes(selected.processing.state)}>Verificar transcrições</button>
-    {!selected.processing.retranscription_available && <small>Não existem ficheiros de áudio disponíveis.</small>}
     <button onClick={regenerateSummary}
       disabled={busy === "summary" || ["pending", "processing"].includes(selected.processing.state)}>
       {busy === "summary" && <Spinner/>}Voltar a resumir

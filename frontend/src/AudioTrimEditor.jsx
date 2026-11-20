@@ -20,6 +20,7 @@ export function transcriptionNotice(result) {
 
 export default function AudioTrimEditor({ meeting, disabled, onApplied, onError, onNotice }) {
   const [chunks, setChunks] = useState([]);
+  const [chunksLoaded, setChunksLoaded] = useState(false);
   const [startTime, setStartTime] = useState(() => +new Date(meeting.started_at));
   const [endTime, setEndTime] = useState(() => +new Date(meeting.ended_at || meeting.started_at));
   const [source, setSource] = useState("system");
@@ -31,9 +32,11 @@ export default function AudioTrimEditor({ meeting, disabled, onApplied, onError,
   const player = useRef(null);
   const timeline = useRef(null);
   const seekTarget = useRef({ time: 0, play: false });
+  const sourceInitialized = useRef(false);
   const first = +new Date(meeting.started_at);
   const last = +new Date(meeting.ended_at || meeting.started_at);
   const tracks = chunks.filter((chunk) => chunk.source === source).sort((a, b) => +new Date(a.started_at) - +new Date(b.started_at));
+  const hasAvailableAudio = tracks.some((chunk) => chunk.available);
   const duration = Math.max(0, last - first);
   const blocked = busy || disabled;
   const valid = startTime >= first && endTime <= last && startTime < endTime;
@@ -42,7 +45,17 @@ export default function AudioTrimEditor({ meeting, disabled, onApplied, onError,
 
   useEffect(() => {
     const controller = new AbortController();
-    api(`/sessions/${meeting.id}/audio_chunks/`, { signal: controller.signal }).then(setChunks).catch((error) => {
+    api(`/sessions/${meeting.id}/audio_chunks/`, { signal: controller.signal }).then((items) => {
+      if (controller.signal.aborted) return;
+      setChunks(items);
+      setChunksLoaded(true);
+      // Prefer a playable source on first load, preserving later manual choices.
+      if (!sourceInitialized.current) {
+        sourceInitialized.current = true;
+        setSource((current) => items.some((chunk) => chunk.source === current && chunk.available)
+          ? current : items.find((chunk) => chunk.available)?.source || current);
+      }
+    }).catch((error) => {
       if (!controller.signal.aborted) onError(error.message);
     });
     return () => controller.abort();
@@ -136,13 +149,9 @@ export default function AudioTrimEditor({ meeting, disabled, onApplied, onError,
   };
   return <article className="card audio-trim">
     <h3>Cortar áudio</h3>
-    <p role="status">{meeting.processing.transcription_complete ? "Transcrição verificada: todos os blocos conservados foram processados." : "A transcrição ainda tem blocos por concluir. Usa Verificar transcrições quando terminar o processamento."}</p>
-    <p>Arrasta os dois marcadores para definir o intervalo a conservar. Usa o play para ouvir a seleção.</p>
+    <p className="trim-help" role="status">{meeting.processing.transcription_complete ? "Transcrição verificada: todos os blocos conservados foram processados." : "A transcrição ainda tem blocos por concluir. Usa Verificar transcrições quando terminar o processamento."}</p>
+    <p className="trim-help">Arrasta os marcadores ou usa as setas do teclado para definir o intervalo a conservar. Os tempos são relativos ao início da gravação.</p>
     <fieldset disabled={busy || disabled}>
-      <div className="trim-fields">
-        <label>Conservar desde<input readOnly value={elapsedTime(startTime - first)} aria-label="Conservar desde (tempo na gravação)"/></label>
-        <label>Até<input readOnly value={elapsedTime(endTime - first)} aria-label="Até (tempo na gravação)"/></label>
-      </div>
       <label>Ouvir<Select aria-label="Fonte de áudio" value={source} disabled={blocked} onChange={(event) => { setSource(event.target.value); seek(cursor, false, event.target.value); }}><option value="system">Áudio do sistema</option><option value="microphone">Microfone</option></Select></label>
       <div className="trim-timeline" ref={timeline} role="group" aria-label="Intervalo a conservar" style={{ "--trim-start": `${position(startTime)}%`, "--trim-end": `${position(endTime)}%`, "--trim-cursor": `${position(cursor)}%` }}>
         <div className="trim-seek-track" role="slider" tabIndex={blocked || !duration ? -1 : 0} aria-label="Posição na gravação" aria-disabled={blocked || !duration} aria-valuemin={0} aria-valuemax={duration / 1000} aria-valuenow={(cursor - first) / 1000} aria-valuetext={elapsedTime(cursor - first)}
@@ -163,12 +172,17 @@ export default function AudioTrimEditor({ meeting, disabled, onApplied, onError,
           onPointerUp={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); }}>
           <span aria-hidden="true"/>
         </button>)}
+        <output className="trim-boundary-time trim-boundary-time-start" aria-label="Início do corte" aria-live="off">{elapsedTime(startTime - first)}</output>
+        <output className="trim-boundary-time trim-boundary-time-end" aria-label="Fim do corte" aria-live="off">{elapsedTime(endTime - first)}</output>
       </div>
-      <div className="trim-time-scale" aria-hidden="true"><span>00:00:00</span><span>{elapsedTime(duration)}</span></div>
-      <div className="trim-playback"><button type="button" className="secondary-action trim-play-toggle" disabled={blocked || !valid || !tracks.some((chunk) => chunk.available)} onClick={togglePlayback} aria-label={playing ? "Pausar áudio" : "Reproduzir áudio"} title={playing ? "Pausar" : "Reproduzir"}>
+      <div className="trim-playback"><button type="button" className="secondary-action trim-play-toggle" disabled={blocked || !valid || !hasAvailableAudio} onClick={togglePlayback} aria-label={playing ? "Pausar áudio" : "Reproduzir áudio"} title={playing ? "Pausar" : "Reproduzir"}>
         <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">{playing ? <path d="M6 4h4v16H6zm8 0h4v16h-4z" fill="currentColor"/> : <path d="m8 4 12 8-12 8z" fill="currentColor"/>}</svg>
-      </button><output aria-live="off">{elapsedTime(cursor - first)} <span>/ {elapsedTime(duration)}</span></output><small>Seleção: {elapsedTime(endTime - startTime)}</small></div>
-      {chosen && !audioUrl && <small role="status">A carregar áudio…</small>}
+      </button><output aria-live="off">{elapsedTime(cursor - first)} <span>/ {elapsedTime(duration)}</span></output></div>
+      {chunksLoaded && !hasAvailableAudio && <p className="trim-help" role="status">{chunks.some((chunk) => chunk.available)
+        ? "Áudio indisponível nesta fonte. Escolhe outra fonte em Ouvir."
+        : "Áudio indisponível para reprodução. A transcrição mantém-se disponível."}</p>}
+      {hasAvailableAudio && tracks.some((chunk) => !chunk.available) && <p className="trim-help" role="status">Alguns blocos de áudio desta fonte estão indisponíveis.</p>}
+      {chosen && !audioUrl && <p className="trim-help" role="status">A carregar áudio…</p>}
       {audioUrl && chosen && <audio ref={player} src={audioUrl} onPlay={() => { seekTarget.current.play = false; setPlaying(true); }} onPause={() => setPlaying(false)} onLoadedMetadata={() => {
         player.current.currentTime = seekTarget.current.time;
         if (seekTarget.current.play) playAudio();
@@ -181,8 +195,7 @@ export default function AudioTrimEditor({ meeting, disabled, onApplied, onError,
         const next = tracks.find((chunk) => chunk.available && +new Date(chunk.started_at) > +new Date(chosen.started_at) && +new Date(chunk.started_at) < endTime);
         if (next) seek(+new Date(next.started_at), true);
       }} onError={() => { seekTarget.current.play = false; setPlaying(false); setChosen(null); setAudioUrl(""); onError("Não foi possível reproduzir este bloco de áudio."); }}/>} 
-      <small>Os tempos são relativos ao início da gravação. Ajusta os marcadores arrastando ou usando as setas do teclado.</small>
-      <p>{tracks.filter((chunk) => !chunk.available).length > 0 && "Existem ficheiros indisponíveis nesta fonte. "}O corte é definitivo e aplica-se às duas fontes de áudio.</p>
+      <p className="trim-help trim-cut-notice">O corte é definitivo e aplica-se às duas fontes de áudio.</p>
       {!valid && <p role="alert">Escolhe um intervalo válido dentro da reunião.</p>}
       <button type="button" className="secondary-action danger trim-apply" onClick={apply} disabled={!valid || busy || disabled}>{busy ? "A cortar…" : "Aplicar corte e verificar transcrição"}</button>
     </fieldset>
